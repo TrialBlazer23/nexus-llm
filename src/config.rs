@@ -27,6 +27,9 @@ pub struct NexusConfig {
 
     #[serde(default)]
     pub network: NetworkConfig,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl Default for NexusConfig {
@@ -35,6 +38,7 @@ impl Default for NexusConfig {
             node: NodeConfig::default(),
             hardware: HardwareConfig::default(),
             network: NetworkConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }
@@ -216,6 +220,37 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Cluster and distributed RPC layer offload configurations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterConfig {
+    #[serde(default = "default_true")]
+    pub enable_rpc: bool,
+
+    #[serde(default = "default_rpc_port")]
+    pub rpc_port: u16,
+
+    #[serde(default = "default_max_rpc_ram_mb")]
+    pub max_rpc_ram_mb: u64,
+
+    #[serde(default = "default_true")]
+    pub auto_offload: bool,
+
+    #[serde(default = "default_true")]
+    pub prefer_adb_tunnel: bool,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enable_rpc: true,
+            rpc_port: default_rpc_port(),
+            max_rpc_ram_mb: default_max_rpc_ram_mb(),
+            auto_offload: true,
+            prefer_adb_tunnel: true,
+        }
+    }
+}
+
 // Default helper functions
 fn default_auto() -> String {
     "auto".to_string()
@@ -275,6 +310,14 @@ fn default_broadcast_interval_ms() -> u64 {
 
 fn default_peer_timeout_ms() -> u64 {
     6000
+}
+
+fn default_rpc_port() -> u16 {
+    50052
+}
+
+fn default_max_rpc_ram_mb() -> u64 {
+    1800
 }
 
 /// Expand tilde prefix in paths to $HOME.

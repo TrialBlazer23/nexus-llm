@@ -97,10 +97,14 @@ impl ChatApp {
         self.stream_start_time = None;
     }
 
-    /// Prepare and render the UI frame.
+    /// Prepare and render the UI frame for full window.
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
+        self.render_in_area(frame, area);
+    }
 
+    /// Prepare and render the UI frame within a specified sub-area.
+    pub fn render_in_area(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -118,6 +122,96 @@ impl ChatApp {
         self.render_footer(frame, chunks[3]);
     }
 
+    /// Handle key event for input buffering, scrolling, or dispatching streaming requests.
+    pub fn handle_key_input(&mut self, key: crossterm::event::KeyEvent, tx: &mpsc::Sender<StreamMsg>) {
+        match key.code {
+            KeyCode::Char(c) => {
+                self.input_buffer.push(c);
+            }
+            KeyCode::Backspace => {
+                self.input_buffer.pop();
+            }
+            KeyCode::Up => {
+                let max = self.total_lines() as u16;
+                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                self.auto_scroll = false;
+                self.scroll_offset = current.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                if self.scroll_offset >= self.total_lines() as u16 {
+                    self.auto_scroll = true;
+                }
+            }
+            KeyCode::PageUp => {
+                let max = self.total_lines() as u16;
+                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                self.auto_scroll = false;
+                self.scroll_offset = current.saturating_sub(10);
+            }
+            KeyCode::PageDown | KeyCode::End => {
+                self.auto_scroll = true;
+            }
+            KeyCode::Home => {
+                self.auto_scroll = false;
+                self.scroll_offset = 0;
+            }
+            KeyCode::Enter => {
+                if !self.is_streaming && !self.input_buffer.trim().is_empty() {
+                    let prompt = std::mem::take(&mut self.input_buffer);
+                    self.messages.push(ChatMessage::user(&prompt));
+                    self.is_streaming = true;
+                    self.auto_scroll = true;
+                    self.status_message = None;
+                    self.streaming_response.clear();
+                    self.tokens_streamed = 0;
+                    self.tokens_per_sec = 0.0;
+                    self.stream_start_time = Some(Instant::now());
+
+                    let mut req_messages = Vec::new();
+                    if let Some(sys) = &self.system_prompt {
+                        req_messages.push(ChatMessage::system(sys));
+                    }
+                    req_messages.extend(self.messages.clone());
+
+                    let req = ChatCompletionRequest {
+                        model: self.model_name.clone(),
+                        messages: req_messages,
+                        temperature: Some(0.7),
+                        max_tokens: Some(2048),
+                        stream: true,
+                    };
+
+                    let client = self.client.clone();
+                    let tx_clone = tx.clone();
+
+                    tokio::spawn(async move {
+                        match client.stream_chat(req).await {
+                            Ok(mut stream) => {
+                                while let Some(chunk) = stream.next().await {
+                                    match chunk {
+                                        Ok(token) => {
+                                            let _ = tx_clone.send(StreamMsg::Token(token)).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = tx_clone.send(StreamMsg::Done).await;
+                            }
+                            Err(e) => {
+                                let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
+                            }
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let stream_info = if self.is_streaming {
             format!(" | Generating: {:.1} tokens/s", self.tokens_per_sec)
@@ -125,9 +219,16 @@ impl ChatApp {
             String::new()
         };
 
+        let transport_badge = if self.client.endpoint().contains("127.0.0.1") || self.client.endpoint().contains("localhost") {
+            "[USB Cable]"
+        } else {
+            "[Wi-Fi]"
+        };
+
         let title = format!(
-            " Nexus-LLM Terminal | Host: {} | Model: {}{}",
+            " Nexus-LLM Terminal | Host: {} {} | Model: {}{}",
             self.client.endpoint(),
+            transport_badge,
             self.model_name,
             stream_info
         );

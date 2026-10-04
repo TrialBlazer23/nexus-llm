@@ -71,6 +71,7 @@ impl StatusFlags {
     pub const INFERRING: Self = Self(0x0002);
     pub const VULKAN_ACTIVE: Self = Self(0x0004);
     pub const THERMAL_THROTTLE: Self = Self(0x0008);
+    pub const RPC_READY: Self = Self(0x0010);
 
     pub fn is_ready(&self) -> bool {
         (self.0 & Self::READY.0) != 0
@@ -87,6 +88,10 @@ impl StatusFlags {
     pub fn is_thermal_throttled(&self) -> bool {
         (self.0 & Self::THERMAL_THROTTLE.0) != 0
     }
+
+    pub fn is_rpc_ready(&self) -> bool {
+        (self.0 & Self::RPC_READY.0) != 0
+    }
 }
 
 /// Represents the decoded 64-byte beacon payload.
@@ -98,6 +103,7 @@ pub struct BeaconPacket {
     pub status: StatusFlags,
     pub uuid: Uuid,
     pub api_port: u16,
+    pub rpc_port: u16,
     pub total_ram_mb: u32,
     pub free_ram_mb: u32,
     pub backend: AccelerationBackend,
@@ -129,8 +135,8 @@ impl BeaconPacket {
         // 0x18 - 0x19: API Port (uint16 BE)
         buf[24..26].copy_from_slice(&self.api_port.to_be_bytes());
 
-        // 0x1A - 0x1B: Reserved (uint16 BE)
-        buf[26..28].copy_from_slice(&0u16.to_be_bytes());
+        // 0x1A - 0x1B: RPC Port (uint16 BE, previously reserved)
+        buf[26..28].copy_from_slice(&self.rpc_port.to_be_bytes());
 
         // 0x1C - 0x1F: Total RAM MB (uint32 BE)
         buf[28..32].copy_from_slice(&self.total_ram_mb.to_be_bytes());
@@ -204,6 +210,9 @@ impl BeaconPacket {
         // 0x18 - 0x19: API Port
         let api_port = u16::from_be_bytes([buf[24], buf[25]]);
 
+        // 0x1A - 0x1B: RPC Port
+        let rpc_port = u16::from_be_bytes([buf[26], buf[27]]);
+
         // 0x1C - 0x1F: Total RAM
         let total_ram_mb = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
 
@@ -233,6 +242,7 @@ impl BeaconPacket {
             status,
             uuid,
             api_port,
+            rpc_port,
             total_ram_mb,
             free_ram_mb,
             backend,
@@ -255,6 +265,7 @@ pub struct PeerNode {
     pub role: NodeRole,
     pub status: StatusFlags,
     pub api_port: u16,
+    pub rpc_port: u16,
     pub total_ram_mb: u32,
     pub free_ram_mb: u32,
     pub backend: AccelerationBackend,
@@ -268,6 +279,14 @@ impl PeerNode {
     pub fn api_endpoint(&self) -> String {
         format!("http://{}:{}", self.addr.ip(), self.api_port)
     }
+
+    pub fn is_rpc_ready(&self) -> bool {
+        self.status.is_rpc_ready() && self.rpc_port > 0
+    }
+
+    pub fn rpc_endpoint(&self) -> String {
+        format!("{}:{}", self.addr.ip(), self.rpc_port)
+    }
 }
 
 /// Autonomous UDP discovery and peer caching service.
@@ -277,6 +296,7 @@ pub struct DiscoveryService {
     peers: Arc<RwLock<HashMap<Uuid, PeerNode>>>,
     active_model: Arc<RwLock<String>>,
     status_flags: Arc<RwLock<StatusFlags>>,
+    rpc_port: Arc<RwLock<u16>>,
 }
 
 impl DiscoveryService {
@@ -294,6 +314,7 @@ impl DiscoveryService {
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_model: Arc::new(RwLock::new(String::new())),
             status_flags: Arc::new(RwLock::new(default_status)),
+            rpc_port: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -313,6 +334,21 @@ impl DiscoveryService {
     pub async fn set_status_flags(&self, flags: StatusFlags) {
         let mut s = self.status_flags.write().await;
         *s = flags;
+    }
+
+    pub async fn set_rpc_status(&self, rpc_ready: bool, port: u16) {
+        let mut s = self.status_flags.write().await;
+        if rpc_ready {
+            s.0 |= StatusFlags::RPC_READY.0;
+        } else {
+            s.0 &= !StatusFlags::RPC_READY.0;
+        }
+        let mut p = self.rpc_port.write().await;
+        *p = port;
+    }
+
+    pub async fn get_rpc_port(&self) -> u16 {
+        *self.rpc_port.read().await
     }
 
     pub fn config(&self) -> &NexusConfig {
@@ -393,6 +429,7 @@ impl DiscoveryService {
         let thermal_index = Self::probe_thermal_index();
         let active_model = self.active_model.read().await.clone();
         let status = *self.status_flags.read().await;
+        let rpc_port = *self.rpc_port.read().await;
 
         let beacon = BeaconPacket {
             magic: BEACON_MAGIC,
@@ -401,6 +438,7 @@ impl DiscoveryService {
             status,
             uuid: self.node_uuid,
             api_port: self.config.network.api_port,
+            rpc_port,
             total_ram_mb: profile.total_ram_mb as u32,
             free_ram_mb: profile.available_ram_mb as u32,
             backend: profile.detected_backend,
@@ -447,6 +485,7 @@ impl DiscoveryService {
                 let thermal_index = Self::probe_thermal_index();
                 let active_model = self.active_model.read().await.clone();
                 let status = *self.status_flags.read().await;
+                let rpc_port = *self.rpc_port.read().await;
 
                 let beacon = BeaconPacket {
                     magic: BEACON_MAGIC,
@@ -455,6 +494,7 @@ impl DiscoveryService {
                     status,
                     uuid: self.node_uuid,
                     api_port: self.config.network.api_port,
+                    rpc_port,
                     total_ram_mb: profile.total_ram_mb as u32,
                     free_ram_mb: profile.available_ram_mb as u32,
                     backend: profile.detected_backend,
@@ -507,6 +547,7 @@ impl DiscoveryService {
                                         role: beacon.role,
                                         status: beacon.status,
                                         api_port: beacon.api_port,
+                                        rpc_port: beacon.rpc_port,
                                         total_ram_mb: beacon.total_ram_mb,
                                         free_ram_mb: beacon.free_ram_mb,
                                         backend: beacon.backend,
@@ -530,6 +571,7 @@ impl DiscoveryService {
                                             status: *self.status_flags.read().await,
                                             uuid: self.node_uuid,
                                             api_port: self.config.network.api_port,
+                                            rpc_port: *self.rpc_port.read().await,
                                             total_ram_mb: profile.total_ram_mb as u32,
                                             free_ram_mb: profile.available_ram_mb as u32,
                                             backend: profile.detected_backend,
@@ -581,6 +623,15 @@ impl DiscoveryService {
                 score -= p.thermal_index as i64;
                 score
             })
+    }
+
+    /// Select the best RPC peer node currently available on the subnet (highest free RAM).
+    pub async fn find_best_rpc_peer(&self) -> Option<PeerNode> {
+        let active = self.get_active_peers().await;
+        active
+            .into_iter()
+            .filter(|p| p.is_rpc_ready())
+            .max_by_key(|p| p.free_ram_mb)
     }
 }
 

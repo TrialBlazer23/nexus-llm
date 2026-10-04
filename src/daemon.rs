@@ -37,6 +37,14 @@ struct Args {
     /// Path to llama-server binary
     #[arg(long, default_value = "llama-server")]
     binary: PathBuf,
+
+    /// Explicit RPC worker endpoint for layer offloading (e.g. 192.168.1.100:50052 or 127.0.0.1:50052)
+    #[arg(long)]
+    rpc: Option<String>,
+
+    /// Disable automatic RPC discovery when model exceeds Node A's memory budget
+    #[arg(long)]
+    no_rpc_auto: bool,
 }
 
 #[tokio::main]
@@ -90,6 +98,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             0
         };
 
+        // Determine if model exceeds standalone memory budget and requires cluster layer offloading
+        let model_metadata = tokio::fs::metadata(&model_path).await?;
+        let model_size_bytes = model_metadata.len();
+        let kv_bytes = SystemProfile::estimate_kv_cache_bytes(args.ctx);
+        let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
+        let host_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+
+        let mut extra_args = Vec::new();
+
+        if total_required_mb > host_cap_mb || total_required_mb > nexus::cluster::NODE_A_MAX_STANDALONE_MB {
+            info!(
+                "Model memory requirement ({} MB) exceeds Node A standalone budget ({} MB). Evaluating cluster offload...",
+                total_required_mb, host_cap_mb
+            );
+
+            let rpc_endpoint = if let Some(ep) = args.rpc {
+                Some(ep)
+            } else if !args.no_rpc_auto && config.cluster.auto_offload {
+                info!("Probing subnet for available RPC worker peer...");
+                discovery.send_probe().await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                discovery.find_best_rpc_peer().await.map(|p| p.rpc_endpoint())
+            } else {
+                None
+            };
+
+            let remote_ram = if rpc_endpoint.is_some() {
+                Some(config.cluster.max_rpc_ram_mb)
+            } else {
+                None
+            };
+
+            let budget = nexus::cluster::ClusterCoordinator::calculate_budget(profile.available_ram_mb, remote_ram);
+
+            let total_layers = if let Ok(gguf) = nexus::gguf::GgufMetadata::open(&model_path) {
+                gguf.block_count.unwrap_or(32) as u32
+            } else {
+                32
+            };
+
+            let split = nexus::cluster::ClusterCoordinator::plan_layer_split(
+                model_size_bytes,
+                kv_bytes,
+                total_layers,
+                &budget,
+                rpc_endpoint.as_deref(),
+            )?;
+
+            info!(
+                "Cluster Layer Pipelining: {} total layers -> {} Host layers (Vulkan), {} Remote layers (RPC endpoint: {:?}, split: {:?})",
+                split.total_layers,
+                split.host_layers,
+                split.remote_layers,
+                split.remote_endpoint,
+                split.tensor_split
+            );
+
+            extra_args = split.build_llama_args();
+        }
+
         let server_cfg = LlamaServerConfig {
             binary_path: args.binary,
             model_path: model_path.clone(),
@@ -98,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gpu_layers,
             threads,
             context_size: args.ctx,
+            extra_args,
         };
 
         info!("Launching model {:?} with context size {}", model_path, args.ctx);

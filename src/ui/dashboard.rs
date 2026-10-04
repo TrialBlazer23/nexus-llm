@@ -23,30 +23,48 @@ pub struct DashboardApp {
     pub local_profile: SystemProfile,
     pub thermal_index: u8,
     pub peers: Vec<PeerNode>,
+    pub transport_info: String,
 }
 
 impl DashboardApp {
     pub fn new(discovery: Arc<DiscoveryService>) -> Self {
         let local_profile = SystemProfile::probe();
         let thermal_index = DiscoveryService::probe_thermal_index();
+        let transport_info = Self::detect_transport();
 
         Self {
             discovery,
             local_profile,
             thermal_index,
             peers: Vec::new(),
+            transport_info,
         }
+    }
+
+    fn detect_transport() -> String {
+        if crate::tunnel::AdbTunnelSupervisor::is_adb_available() {
+            if let Ok(devices) = crate::tunnel::AdbTunnelSupervisor::list_devices() {
+                if let Some(dev) = devices.into_iter().find(|d| d.authorized) {
+                    return format!("USB Cable (ADB: {})", dev.serial);
+                }
+            }
+        }
+        "Wi-Fi Subnet".to_string()
     }
 
     pub async fn refresh(&mut self) {
         self.local_profile = SystemProfile::probe();
         self.thermal_index = DiscoveryService::probe_thermal_index();
         self.peers = self.discovery.get_active_peers().await;
+        self.transport_info = Self::detect_transport();
     }
 
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
+        self.render_in_area(frame, area);
+    }
 
+    pub fn render_in_area(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -66,9 +84,10 @@ impl DashboardApp {
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
         let title = format!(
-            " Nexus-LLM Heterogeneous Cluster Monitor | Local Arch: {} | Active Nodes: {}",
+            " Nexus-LLM Heterogeneous Cluster Monitor | Arch: {} | Active Nodes: {} | Transport: {}",
             std::env::consts::ARCH,
-            self.peers.len() + 1
+            self.peers.len() + 1,
+            self.transport_info
         );
 
         let header = Paragraph::new(Line::from(vec![
@@ -185,7 +204,13 @@ impl DashboardApp {
         let mut rows = Vec::new();
 
         for peer in &self.peers {
-            let role_str = if peer.role.is_host() { "Host" } else { "Client" };
+            let role_str = if peer.is_rpc_ready() {
+                "RPC Worker"
+            } else if peer.role.is_host() {
+                "Host"
+            } else {
+                "Client"
+            };
             let backend_str = match peer.backend {
                 AccelerationBackend::Vulkan => "Vulkan",
                 AccelerationBackend::ArmCpuDotProd => "ARM CPU",
@@ -193,15 +218,21 @@ impl DashboardApp {
                 AccelerationBackend::GenericCpu => "Generic",
             };
 
+            let endpoint_str = if peer.is_rpc_ready() {
+                format!("RPC: {}", peer.rpc_endpoint())
+            } else {
+                peer.api_endpoint()
+            };
+
             let model_display = if peer.active_model.is_empty() {
-                "—".to_string()
+                if peer.is_rpc_ready() { "RPC Ready".to_string() } else { "—".to_string() }
             } else {
                 peer.active_model.clone()
             };
 
             rows.push(Row::new(vec![
                 Cell::from(peer.uuid.to_string()),
-                Cell::from(peer.api_endpoint()),
+                Cell::from(endpoint_str),
                 Cell::from(role_str),
                 Cell::from(format!("{} MB", peer.free_ram_mb)),
                 Cell::from(backend_str),

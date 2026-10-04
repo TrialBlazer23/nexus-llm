@@ -196,39 +196,53 @@ adb forward tcp:8080 tcp:8080
 
 ## Interactive Interfaces & Tools
 
-### 1. Split-Screen Streaming Chat TUI
+### 1. Unified Interactive Hub (Default Experience)
+Starting `nexus` with no arguments launches the full-screen Ratatui Unified Hub:
 ```bash
-# Interactive TUI session
-./target/release/nexus client
+./target/release/nexus
+```
 
-# Apply a specialized persona preset (e.g., coder or general)
-./target/release/nexus client --preset coder
+**Global Navigation & Controls**:
+- `F1` - `F5` / `Tab` / `Shift+Tab`: Switch between views instantly:
+  - `[F1: 💬 Chat]`: Full-screen streaming conversation with auto-scroll and multi-turn history.
+  - `[F2: 📦 Models]`: Split-pane model browser with real-time zero-copy GGUF inspection, exact KV cache calculation, Android LMK memory badges (`[OK]`, `[RPC]`, `[OOM]`), and `[Enter]` to load & chat.
+  - `[F3: 🖥️ Dashboard]`: Cluster monitor showing GPU/Vulkan status, CPU temperature, RAM usage, and active peer nodes.
+  - `[F4: 🔗 USB Tunnel]`: Live ADB USB status monitor, one-key port forwarding (`F`), and teardown (`T`).
+  - `[F5: ⚙️ Settings]`: In-app settings editor for GPU offload, CPU threads, RAM ceiling, and RPC limits. Toggle with `Space`, adjust with `Left`/`Right`, save with `S`.
+- `Ctrl+C`: Gracefully shut down active model supervisors and exit.
+
+**Safe Model Hot-Swapping**:
+When a model is already active, selecting another model and pressing `Enter` displays an in-app confirmation dialog (`[Y / N]`). Confirming safely terminates the active process, re-evaluates memory headroom, and loads the new model without needing to restart the application.
+
+---
+
+### 2. Standalone Subcommands (Scripting & Automation)
+
+For headless servers, automated scripts, or dedicated workstations:
+
+```bash
+# Direct TUI Chat Client
+./target/release/nexus client
 
 # Batch execution (pipes or script automation)
 ./target/release/nexus client --prompt "Explain Rust lifetimes in two sentences."
-```
 
-**TUI Navigation Shortcuts**:
-- `Enter`: Submit prompt
-- `Up` / `Down` / `PageUp` / `PageDown`: Scroll conversation history
-- `Esc` / `Ctrl+C`: Exit chat
-
-### 2. Cluster Performance Dashboard
-Monitor Node A's GPU status, temperature, and RAM usage in real time:
-```bash
+# Cluster Performance Dashboard
 ./target/release/nexus dashboard
-```
 
-### 3. Local Model Explorer
-Inspect all `.gguf` models in your models directory (`~/nexus-models`):
-```bash
+# Local Model Directory Scanner
 ./target/release/nexus models
-```
 
-### 4. Zero-Copy GGUF Inspection
-Inspect any `.gguf` file without loading its multi-gigabyte weights into RAM:
-```bash
+# Zero-Copy GGUF Inspection
 ./target/release/nexus inspect -m ~/nexus-models/model.gguf -c 4096
+
+# RPC Compute Worker on Node B (MacBook)
+./target/release/nexus rpc --port 50052 --mem 1800
+
+# ADB USB Tunnel Management
+./target/release/nexus tunnel setup
+./target/release/nexus tunnel status
+./target/release/nexus tunnel teardown
 ```
 
 ---
@@ -248,39 +262,49 @@ Inspect any `.gguf` file without loading its multi-gigabyte weights into RAM:
 │   ├── coder.yaml           # Systems programming persona (ChatML)
 │   └── general.yaml         # Conversational assistant persona (Llama-3)
 ├── src/
-│   ├── main.rs              # CLI router & workstation client entry point
+│   ├── main.rs              # CLI router, default Unified Hub entry point
 │   ├── daemon.rs            # Headless supervisor daemon (nexusd)
 │   ├── config.rs            # TOML configuration engine (~/.nexus/config.toml)
 │   ├── sysinfo.rs           # /proc parser & Android LMK memory guard
 │   ├── supervisor.rs        # Asynchronous llama-server process manager
 │   ├── discovery.rs         # 64-byte UDP beacon protocol & peer cache
 │   ├── client.rs            # OpenAI HTTP/SSE streaming client
+│   ├── cluster.rs           # Distributed RPC layer pipelining coordinator
+│   ├── tunnel.rs            # ADB USB port forwarding & reverse supervisor
 │   ├── gguf.rs              # Zero-copy GGUF v2/v3 metadata parser
 │   ├── downloader.rs        # Chunked HTTP resume downloader with SHA-256
 │   ├── preset.rs            # YAML persona & prompt formatting templates
 │   └── ui/
-│       ├── chat.rs          # Ratatui split-screen streaming chat TUI
+│       ├── hub.rs           # Unified interactive Ratatui Hub controller
+│       ├── chat.rs          # Ratatui split-screen streaming chat view
+│       ├── models_view.rs   # Split-pane model browser & GGUF inspector
+│       ├── settings_view.rs # In-app configuration editor
+│       ├── tunnel_view.rs   # Interactive USB ADB tunnel monitor
 │       ├── dashboard.rs     # Cluster performance monitor TUI
 │       └── models.rs        # Local model directory scanner
 └── tests/
     ├── test_phase1.rs       # System profiling & memory guard test suite
     ├── test_discovery.rs    # UDP 9999 beacon & SSE stream test suite
+    ├── test_cluster_rpc.rs  # Distributed RPC layer offload & ADB tests
     ├── test_gguf_metadata.rs# GGUF parsing & persona templates test suite
-    └── test_ui.rs           # Headless Ratatui widget render test suite
+    ├── test_ui.rs           # Headless Ratatui widget render test suite
+    └── test_hub_ui.rs       # Unified Hub, navigation, and settings test suite
 ```
 
 ---
 
 ## Running the Automated Test Suite
 
-All 28 tests can be run at any time to verify system integrity:
+All 44 automated tests can be run at any time to verify system integrity across both platforms:
 
 ```bash
 # Run all phase verification suites
 cargo test --test test_phase1
 cargo test --test test_discovery
+cargo test --test test_cluster_rpc
 cargo test --test test_gguf_metadata
 cargo test --test test_ui
+cargo test --test test_hub_ui
 ```
 
 ---

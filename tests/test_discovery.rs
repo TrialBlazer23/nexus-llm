@@ -19,6 +19,7 @@ fn test_beacon_packet_encoding_and_crc() {
         status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
         uuid,
         api_port: 8080,
+        rpc_port: 0,
         total_ram_mb: 12000,
         free_ram_mb: 5000,
         backend: AccelerationBackend::Vulkan,
@@ -43,11 +44,40 @@ fn test_beacon_packet_encoding_and_crc() {
     assert!(decoded.status.is_vulkan_active());
     assert_eq!(decoded.uuid, uuid);
     assert_eq!(decoded.api_port, 8080);
+    assert_eq!(decoded.rpc_port, 0);
     assert_eq!(decoded.total_ram_mb, 12000);
     assert_eq!(decoded.free_ram_mb, 5000);
     assert_eq!(decoded.backend, AccelerationBackend::Vulkan);
     assert_eq!(decoded.thermal_index, 35);
     assert_eq!(decoded.active_model, "llama-3-8b");
+}
+
+#[test]
+fn test_beacon_rpc_flags_and_port() {
+    let uuid = Uuid::new_v4();
+    let packet = BeaconPacket {
+        magic: BEACON_MAGIC,
+        version: BEACON_VERSION,
+        role: NodeRole::CLIENT,
+        status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
+        uuid,
+        api_port: 8080,
+        rpc_port: 50052,
+        total_ram_mb: 3600,
+        free_ram_mb: 1800,
+        backend: AccelerationBackend::X86Baseline,
+        thermal_index: 20,
+        active_model: "".to_string(),
+    };
+
+    let encoded = packet.encode();
+    assert_eq!(encoded.len(), BEACON_PACKET_SIZE);
+
+    let decoded = BeaconPacket::decode(&encoded).expect("Failed to decode RPC beacon");
+    assert!(decoded.status.is_rpc_ready());
+    assert_eq!(decoded.rpc_port, 50052);
+    assert_eq!(decoded.backend, AccelerationBackend::X86Baseline);
+    assert_eq!(decoded.free_ram_mb, 1800);
 }
 
 #[test]
@@ -59,6 +89,7 @@ fn test_beacon_corruption_rejection() {
         status: StatusFlags::READY,
         uuid: Uuid::new_v4(),
         api_port: 8080,
+        rpc_port: 0,
         total_ram_mb: 8000,
         free_ram_mb: 3000,
         backend: AccelerationBackend::ArmCpuDotProd,
@@ -114,6 +145,7 @@ async fn test_peer_cache_expiry_and_pruning() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
+                rpc_port: 0,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
@@ -144,6 +176,7 @@ async fn test_find_best_host_scoring() {
 
     let host1_uuid = Uuid::new_v4();
     let host2_uuid = Uuid::new_v4();
+    let rpc_worker_uuid = Uuid::new_v4();
 
     {
         let peers_lock = discovery.peers();
@@ -158,6 +191,7 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
+                rpc_port: 0,
                 total_ram_mb: 4000,
                 free_ram_mb: 2000,
                 backend: AccelerationBackend::ArmCpuDotProd,
@@ -176,6 +210,7 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
                 api_port: 8080,
+                rpc_port: 0,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
@@ -184,11 +219,35 @@ async fn test_find_best_host_scoring() {
                 last_seen: Instant::now(),
             },
         );
+
+        // RPC Worker node: Client role, RPC_READY, 1800 MB free
+        peers.insert(
+            rpc_worker_uuid,
+            PeerNode {
+                uuid: rpc_worker_uuid,
+                addr: SocketAddr::from(([192, 168, 1, 103], 8080)),
+                role: NodeRole::CLIENT,
+                status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
+                api_port: 8080,
+                rpc_port: 50052,
+                total_ram_mb: 3600,
+                free_ram_mb: 1800,
+                backend: AccelerationBackend::X86Baseline,
+                thermal_index: 10,
+                active_model: "".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
     }
 
     let best = discovery.find_best_host().await.expect("Must find a host");
     assert_eq!(best.uuid, host2_uuid, "Host 2 (Vulkan, more RAM, cooler) must score higher");
     assert_eq!(best.api_endpoint(), "http://192.168.1.102:8080");
+
+    let rpc_peer = discovery.find_best_rpc_peer().await.expect("Must find RPC peer");
+    assert_eq!(rpc_peer.uuid, rpc_worker_uuid);
+    assert_eq!(rpc_peer.rpc_endpoint(), "192.168.1.103:50052");
+    assert!(rpc_peer.is_rpc_ready());
 }
 
 #[test]

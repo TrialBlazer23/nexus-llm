@@ -153,6 +153,7 @@ fn test_supervisor_command_args_builder() {
         gpu_layers: 99,
         threads: 6,
         context_size: 4096,
+        extra_args: Vec::new(),
     };
 
     // Test Vulkan offload args (-ngl 99)
@@ -177,6 +178,7 @@ async fn test_supervisor_preflight_binary_not_found() {
         gpu_layers: 0,
         threads: 2,
         context_size: 512,
+        extra_args: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -205,6 +207,7 @@ async fn test_supervisor_preflight_model_not_found() {
         gpu_layers: 0,
         threads: 2,
         context_size: 512,
+        extra_args: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -244,6 +247,7 @@ async fn test_supervisor_memory_cap_rejection() {
         gpu_layers: 0,
         threads: 2,
         context_size: insane_context,
+        extra_args: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;

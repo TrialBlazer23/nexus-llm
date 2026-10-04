@@ -7,8 +7,10 @@ use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
 use nexus::sysinfo::SystemProfile;
+use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
 use nexus::ui::chat::{run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
+use nexus::ui::hub::{run_hub_tui, HubApp};
 use nexus::ui::models::scan_models_dir;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,7 +22,7 @@ use std::time::Duration;
 #[command(about = "Nexus-LLM CLI Orchestrator & Client")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -88,11 +90,45 @@ enum Commands {
         dir: Option<PathBuf>,
     },
 
+    /// Run as an RPC compute worker on Node B (MacBook) to receive offloaded model layers
+    Rpc {
+        /// TCP port to bind rpc-server (default: 50052)
+        #[arg(short, long, default_value_t = 50052)]
+        port: u16,
+
+        /// Maximum RAM allocation in Megabytes (default: 1800 MB limit for Node B safety)
+        #[arg(short, long, default_value_t = 1800)]
+        mem: u64,
+
+        /// Path to llama.cpp rpc-server binary
+        #[arg(long, default_value = "rpc-server")]
+        binary: PathBuf,
+    },
+
+    /// Inspect or manage ADB USB port forwarding and reverse tunnels to phone
+    Tunnel {
+        /// Action to perform: status, setup, teardown
+        #[arg(default_value = "status")]
+        action: String,
+
+        /// API port (default: 8080)
+        #[arg(long, default_value_t = 8080)]
+        api_port: u16,
+
+        /// RPC port (default: 50052)
+        #[arg(long, default_value_t = 50052)]
+        rpc_port: u16,
+    },
+
     /// Connect to compute host and execute chat generation (interactive TUI or CLI stream)
     Client {
         /// Optional host endpoint (e.g. http://192.168.1.100:8080). If omitted, auto-discovers host.
         #[arg(long)]
         host: Option<String>,
+
+        /// Preferred transport mode: auto (USB priority with Wi-Fi fallback), usb (force ADB), wifi (subnet only)
+        #[arg(short = 't', long, default_value = "auto")]
+        transport: String,
 
         /// User prompt to send (if omitted, starts interactive split-screen TUI)
         #[arg(short, long)]
@@ -112,7 +148,33 @@ enum Commands {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            let config = NexusConfig::load().unwrap_or_default();
+            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let _listener = discovery.clone().start_listener();
+
+            // Determine default client endpoint
+            let host = if let Some(dh) = &config.network.default_host {
+                dh.clone()
+            } else if let (Some(usb_ep), _) = AdbTunnelSupervisor::resolve_transport_endpoint(
+                TransportMode::Auto,
+                config.network.api_port,
+                config.cluster.rpc_port,
+            ) {
+                usb_ep
+            } else {
+                format!("http://127.0.0.1:{}", config.network.api_port)
+            };
+
+            let client = NexusClient::new(host);
+            let hub = HubApp::new(config, client, discovery);
+            return run_hub_tui(hub).await;
+        }
+    };
+
+    match command {
         Commands::Info => {
             let profile = SystemProfile::probe();
             let max_allowed_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
@@ -279,15 +341,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Client { host, prompt, model, preset } => {
+        Commands::Rpc { port, mem, binary } => {
+            println!("=== Nexus-LLM RPC Compute Worker (Node B) ===");
+            if mem > 1800 {
+                eprintln!("WARNING: RAM allocation ({} MB) exceeds recommended 1800 MB limit for Node B safety!", mem);
+            }
+            println!("Binding rpc-server on port {} with max memory {} MB...", port, mem);
+
+            let mut config = NexusConfig::load().unwrap_or_default();
+            config.node.role = "client".to_string();
+
+            // Start discovery service advertising RPC worker readiness
+            let discovery = Arc::new(DiscoveryService::new(config, None));
+            discovery.set_rpc_status(true, port).await;
+            let _broadcaster = discovery.clone().start_broadcaster();
+            let _listener = discovery.clone().start_listener();
+
+            println!("Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)", port);
+
+            let child = tokio::process::Command::new(&binary)
+                .args(["-H", "0.0.0.0", "-p", &port.to_string(), "-m", &mem.to_string()])
+                .spawn();
+
+            match child {
+                Ok(mut proc) => {
+                    println!("rpc-server active (PID: {:?}). Waiting for layer offload connections from Node A...", proc.id());
+                    println!("Press Ctrl+C to terminate worker.");
+
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("\nShutdown signal received. Stopping rpc-server...");
+                            let _ = proc.kill().await;
+                        }
+                        exit = proc.wait() => {
+                            println!("rpc-server exited: {:?}", exit);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", binary, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::Tunnel { action, api_port, rpc_port } => {
+            println!("=== ADB USB Tunnel Supervisor ===");
+            match action.to_lowercase().as_str() {
+                "setup" | "start" => {
+                    match AdbTunnelSupervisor::setup_tunnel(api_port, rpc_port, None) {
+                        Ok(status) => {
+                            println!("ADB Tunnel established successfully!");
+                            println!("  API Forward:  127.0.0.1:{} -> Device:{}", status.api_port, status.api_port);
+                            println!("  RPC Reverse:  Device:{} -> 127.0.0.1:{}", status.rpc_port, status.rpc_port);
+                            if let Some(dev) = status.device {
+                                println!("  Device:       {} ({:?})", dev.serial, dev.model.unwrap_or_default());
+                            }
+                        }
+                        Err(e) => eprintln!("Tunnel setup failed: {}", e),
+                    }
+                }
+                "teardown" | "stop" => {
+                    let _ = AdbTunnelSupervisor::teardown_tunnel(api_port, rpc_port);
+                    println!("ADB tunnels removed.");
+                }
+                _ => {
+                    if !AdbTunnelSupervisor::is_adb_available() {
+                        println!("ADB binary: Not found in PATH");
+                    } else {
+                        println!("ADB binary: Available");
+                        match AdbTunnelSupervisor::list_devices() {
+                            Ok(devices) => {
+                                println!("Connected USB Devices ({}):", devices.len());
+                                for d in devices {
+                                    println!("  - Serial: {}, State: {}, Model: {:?}", d.serial, if d.authorized { "Authorized" } else { "Unauthorized" }, d.model);
+                                }
+                            }
+                            Err(e) => eprintln!("Failed to list devices: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Client { host, transport, prompt, model, preset } => {
             let config = NexusConfig::load().unwrap_or_default();
-            let client = match host.or(config.network.default_host.clone()) {
-                Some(h) => NexusClient::new(h),
+            let trans_mode = transport.parse::<TransportMode>().unwrap_or(TransportMode::Auto);
+
+            let (usb_endpoint, is_usb) = if host.is_none() {
+                AdbTunnelSupervisor::resolve_transport_endpoint(trans_mode, 8080, 50052)
+            } else {
+                (None, false)
+            };
+
+            let client = match host.or(config.network.default_host.clone()).or(usb_endpoint) {
+                Some(h) => {
+                    if is_usb {
+                        println!("Connected via low-latency USB Cable (ADB Tunnel localhost:8080)");
+                    }
+                    NexusClient::new(h)
+                }
                 None => {
                     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
                     let _listener = discovery.clone().start_listener();
                     discovery.send_probe().await;
-                    println!("Auto-discovering compute host on subnet...");
+                    println!("Auto-discovering compute host on subnet (Wi-Fi)...");
                     NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10)).await?
                 }
             };

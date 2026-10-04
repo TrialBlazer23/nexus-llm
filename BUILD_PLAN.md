@@ -126,3 +126,56 @@ cargo run --bin nexusd
 cargo run --bin nexus -- client
 
 
+<!-- STREAMING_CHUNK:Specifying Phase 5 Distributed RPC Pipelining and ADB Tunneling -->
+Phase 5: Distributed RPC Layer Pipelining & ADB Tunneling
+Antigravity Directive
+antigravity run --task "Phase 5: Distributed RPC Pipelining & ADB Tunneling"
+
+
+Objectives
+Implement src/cluster.rs:
+- Calculate cluster memory budgets (Node A max 8.5 GB standalone / 75% available RAM; Node B capped at 1800 MB).
+- Greedy host-first layer watermarking with sequential layer pipelining (--split-mode layer).
+- Automatic generation of --rpc <PEER:PORT> and --tensor-split arguments.
+- Early rejection of models exceeding total cluster budget.
+Implement src/tunnel.rs:
+- Automated USB device detection and management via adb forward tcp:8080 tcp:8080 and adb reverse tcp:50052 tcp:50052.
+- Transport mode selection: auto (USB priority with Wi-Fi fallback), usb (force ADB), wifi (subnet only).
+Extend Discovery Beacon Protocol:
+- Add StatusFlags::RPC_READY bit (0x0010) and rpc_port field in bytes 0x1A..0x1B.
+- Provide find_best_rpc_peer() for autonomous offload targeting.
+Implement Subcommands:
+- nexus rpc: Worker process manager for Node B with 1800 MB hard cap and beacon broadcaster.
+- nexus tunnel: Status, setup, and teardown of ADB USB tunnels.
+- Update nexus client and nexus dashboard with transport badges and RPC worker status.
+Verification Command
+cargo test --test test_cluster_rpc
+
+
+<!-- STREAMING_CHUNK:Specifying Phase 6 Unified Hub and Quick-Start UX -->
+Phase 6: Unified Hub & Quick-Start UX
+Antigravity Directive
+antigravity run --task "Phase 6: Unified Hub & Quick-Start UX"
+
+
+Objectives
+Implement src/ui/hub.rs:
+- Default execution of `nexus` (with no CLI subcommands) launches a full-screen interactive Ratatui Unified Hub.
+- Persistent top navigation bar with function keys and tab cycling: `[F1: 💬 Chat]`, `[F2: 📦 Models]`, `[F3: 🖥️ Dashboard]`, `[F4: 🔗 Tunnel]`, `[F5: ⚙️ Settings]`.
+- Asynchronous non-blocking event stream multiplexing keyboard input, periodic 500 ms status refresh ticks, and token streaming `mpsc` receiver.
+- Safe in-app model hot-swapping with confirmation modal (`[Y / N]`) terminating running server, revalidating memory headroom, and spawning new model.
+Implement src/ui/models_view.rs:
+- Split-pane model browser with list navigation, zero-copy GGUF architecture inspection, and real-time KV cache calculation.
+- Android LMK 75% memory health badges (`[OK]`, `[RPC]`, `[OOM]`).
+- One-click `[Enter]` to load model and automatically switch to Chat.
+Implement src/ui/settings_view.rs:
+- In-app configuration editor displaying categorized settings (Hardware & Acceleration, Memory & LMK Safeguards, Network, Cluster RPC).
+- Interactive boolean toggling (`Space`), numeric adjustment (`Left` / `Right`), and atomic persistence to `~/.nexus/config.toml` (`S`).
+Implement src/ui/tunnel_view.rs:
+- Interactive USB ADB device monitor, one-key port forward and reverse tunnel setup (`F`) and teardown (`T`).
+Verification Command
+cargo test --test test_hub_ui
+
+
+
+

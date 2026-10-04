@@ -45,6 +45,7 @@ pub struct LlamaServerConfig {
     pub gpu_layers: u32, // 99 for Vulkan offload, 0 for CPU
     pub threads: usize,
     pub context_size: usize,
+    pub extra_args: Vec<String>,
 }
 
 impl LlamaServerConfig {
@@ -62,12 +63,18 @@ impl LlamaServerConfig {
             gpu_layers: 99,
             threads: 6,
             context_size: 4096,
+            extra_args: Vec::new(),
         }
+    }
+
+    /// Check if RPC distributed layer offloading is enabled in configuration.
+    pub fn is_distributed(&self) -> bool {
+        self.extra_args.iter().any(|arg| arg == "--rpc")
     }
 
     /// Construct command-line argument list for llama-server.
     pub fn build_args(&self, effective_gpu_layers: u32) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "--host".to_string(),
             self.host.clone(),
             "--port".to_string(),
@@ -80,7 +87,9 @@ impl LlamaServerConfig {
             self.threads.to_string(),
             "-ngl".to_string(),
             effective_gpu_layers.to_string(),
-        ]
+        ];
+        args.extend(self.extra_args.clone());
+        args
     }
 }
 
@@ -120,19 +129,21 @@ impl ProcessSupervisor {
             return Err(SupervisorError::ModelNotFound(config.model_path));
         }
 
-        // Pre-flight check: Android LMK 75% memory ceiling guard
-        let model_metadata = tokio::fs::metadata(&config.model_path).await?;
-        let model_size_bytes = model_metadata.len();
-        let sys_profile = SystemProfile::probe();
+        // Pre-flight check: Android LMK 75% memory ceiling guard (for standalone mode)
+        if !config.is_distributed() {
+            let model_metadata = tokio::fs::metadata(&config.model_path).await?;
+            let model_size_bytes = model_metadata.len();
+            let sys_profile = SystemProfile::probe();
 
-        if !sys_profile.can_safely_load(model_size_bytes, config.context_size) {
-            let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
-            let total_required = model_size_bytes + kv_bytes;
-            return Err(SupervisorError::MemoryCapExceeded {
-                required_mb: total_required / (1024 * 1024),
-                available_mb: sys_profile.available_ram_mb,
-                max_allowed_mb: sys_profile.max_allowed_memory_bytes() / (1024 * 1024),
-            });
+            if !sys_profile.can_safely_load(model_size_bytes, config.context_size) {
+                let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
+                let total_required = model_size_bytes + kv_bytes;
+                return Err(SupervisorError::MemoryCapExceeded {
+                    required_mb: total_required / (1024 * 1024),
+                    available_mb: sys_profile.available_ram_mb,
+                    max_allowed_mb: sys_profile.max_allowed_memory_bytes() / (1024 * 1024),
+                });
+            }
         }
 
         let http_client = reqwest::Client::builder()

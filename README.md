@@ -170,7 +170,17 @@ If subnet UDP broadcast is blocked by your Wi-Fi router (common on guest network
 ./target/release/nexus client --host http://<PHONE_IP>:8080
 ```
 
-#### Method 3: USB Cable / ADB Port Forwarding (Ultra Low-Latency)
+#### Method 3: Persistent Static Host or Peer in config.toml
+If your Wi-Fi router isolates clients from receiving UDP broadcasts, you can configure your phone's IP once in `~/.nexus/config.toml` on your Mac:
+```toml
+[network]
+default_host = "http://<PHONE_IP>:8080"
+# or add to static peers fallback list:
+static_peers = ["<PHONE_IP>"]
+```
+Then simply launch `./target/release/nexus client` without any flags.
+
+#### Method 4: USB Cable / ADB Port Forwarding (Ultra Low-Latency)
 Connect your S23 Ultra to your MacBook via USB cable with USB Debugging enabled:
 
 On your Mac:

@@ -197,6 +197,9 @@ pub struct NetworkConfig {
 
     #[serde(default)]
     pub static_peers: Vec<String>,
+
+    #[serde(default)]
+    pub default_host: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -208,6 +211,7 @@ impl Default for NetworkConfig {
             broadcast_interval_ms: default_broadcast_interval_ms(),
             peer_timeout_ms: default_peer_timeout_ms(),
             static_peers: Vec::new(),
+            default_host: None,
         }
     }
 }

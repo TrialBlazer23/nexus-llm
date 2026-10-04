@@ -281,13 +281,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Client { host, prompt, model, preset } => {
             let config = NexusConfig::load().unwrap_or_default();
-            let client = match host {
+            let client = match host.or(config.network.default_host.clone()) {
                 Some(h) => NexusClient::new(h),
                 None => {
                     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
                     let _listener = discovery.clone().start_listener();
+                    discovery.send_probe().await;
                     println!("Auto-discovering compute host on subnet...");
-                    NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(6)).await?
+                    NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10)).await?
                 }
             };
 

@@ -150,6 +150,23 @@ impl NexusClient {
                 );
                 return Ok(Self::new(host.api_endpoint()));
             }
+
+            // Probe any configured static peers via HTTP /health if UDP broadcast was blocked
+            for peer in &discovery.config().network.static_peers {
+                let endpoint = if peer.starts_with("http://") || peer.starts_with("https://") {
+                    peer.clone()
+                } else if peer.contains(':') {
+                    format!("http://{}", peer)
+                } else {
+                    format!("http://{}:{}", peer, discovery.config().network.api_port)
+                };
+                let test_client = Self::new(&endpoint);
+                if let Ok(true) = test_client.health().await {
+                    info!("Discovered active host via static peer health check: {}", endpoint);
+                    return Ok(test_client);
+                }
+            }
+
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 

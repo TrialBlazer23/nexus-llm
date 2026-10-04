@@ -230,3 +230,34 @@ fn test_chat_request_serialization() {
     assert!(json.contains("\"model\":\"llama-3\""));
     assert!(json.contains("\"role\":\"system\""));
 }
+
+#[test]
+fn test_get_broadcast_addresses_and_targets() {
+    let bcast_addrs = nexus::discovery::get_broadcast_addresses();
+    println!("Detected interface broadcast addresses: {:?}", bcast_addrs);
+
+    let mut config = NexusConfig::default();
+    config.network.static_peers = vec!["10.0.0.99".to_string()];
+    let targets = DiscoveryService::get_broadcast_targets(&config);
+    println!("Broadcast targets: {:?}", targets);
+
+    // Must include 255.255.255.255
+    let limited_bcast: SocketAddr = format!("255.255.255.255:{}", config.network.discovery_port).parse().unwrap();
+    assert!(targets.contains(&limited_bcast));
+
+    // Must include 127.0.0.1
+    let loopback: SocketAddr = format!("127.0.0.1:{}", config.network.discovery_port).parse().unwrap();
+    assert!(targets.contains(&loopback));
+
+    // Must include static peer
+    let static_peer: SocketAddr = format!("10.0.0.99:{}", config.network.discovery_port).parse().unwrap();
+    assert!(targets.contains(&static_peer));
+
+    // Must include detected interface broadcast addresses
+    for bcast in bcast_addrs {
+        let expected = SocketAddr::new(std::net::IpAddr::V4(bcast), config.network.discovery_port);
+        assert!(targets.contains(&expected));
+    }
+}
+
+

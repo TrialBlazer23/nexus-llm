@@ -315,6 +315,10 @@ impl DiscoveryService {
         *s = flags;
     }
 
+    pub fn config(&self) -> &NexusConfig {
+        &self.config
+    }
+
     /// Read thermal index from Linux thermal zone (0 to 100 scale).
     pub fn probe_thermal_index() -> u8 {
         // Read /sys/class/thermal/thermal_zone0/temp (in millidegrees C)
@@ -333,13 +337,87 @@ impl DiscoveryService {
         0 // Nominal fallback if thermal zone unreadable
     }
 
+    /// Compute all target addresses (global broadcast, subnet broadcasts, static peers, loopback).
+    pub fn get_broadcast_targets(config: &NexusConfig) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+
+        // 1. Global limited broadcast (255.255.255.255)
+        if let Ok(addr) = format!("255.255.255.255:{}", config.network.discovery_port).parse() {
+            targets.push(addr);
+        }
+
+        // 2. Subnet directed broadcast addresses (e.g. 192.168.6.255)
+        for bcast_ip in get_broadcast_addresses() {
+            let addr = SocketAddr::new(std::net::IpAddr::V4(bcast_ip), config.network.discovery_port);
+            if !targets.contains(&addr) {
+                targets.push(addr);
+            }
+        }
+
+        // 3. Loopback (127.0.0.1)
+        if let Ok(addr) = format!("127.0.0.1:{}", config.network.discovery_port).parse() {
+            if !targets.contains(&addr) {
+                targets.push(addr);
+            }
+        }
+
+        // 4. Configured static peers
+        for peer in &config.network.static_peers {
+            if let Ok(addr) = peer.parse::<SocketAddr>() {
+                if !targets.contains(&addr) {
+                    targets.push(addr);
+                }
+            } else if let Ok(ip) = peer.parse::<std::net::IpAddr>() {
+                let addr = SocketAddr::new(ip, config.network.discovery_port);
+                if !targets.contains(&addr) {
+                    targets.push(addr);
+                }
+            }
+        }
+
+        targets
+    }
+
+    /// Transmit an immediate discovery probe across all broadcast and peer targets.
+    pub async fn send_probe(&self) {
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Failed to bind UDP probe socket: {}", e);
+                return;
+            }
+        };
+        let _ = socket.set_broadcast(true);
+
+        let profile = SystemProfile::probe();
+        let thermal_index = Self::probe_thermal_index();
+        let active_model = self.active_model.read().await.clone();
+        let status = *self.status_flags.read().await;
+
+        let beacon = BeaconPacket {
+            magic: BEACON_MAGIC,
+            version: BEACON_VERSION,
+            role: NodeRole::from_str_role(&self.config.node.role),
+            status,
+            uuid: self.node_uuid,
+            api_port: self.config.network.api_port,
+            total_ram_mb: profile.total_ram_mb as u32,
+            free_ram_mb: profile.available_ram_mb as u32,
+            backend: profile.detected_backend,
+            thermal_index,
+            active_model,
+        };
+
+        let packet_bytes = beacon.encode();
+        let targets = Self::get_broadcast_targets(&self.config);
+        for target in targets {
+            let _ = socket.send_to(&packet_bytes, target).await;
+        }
+    }
+
     /// Spawn asynchronous UDP beacon broadcaster task.
     pub fn start_broadcaster(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let broadcast_addr: SocketAddr = format!("255.255.255.255:{}", self.config.network.discovery_port)
-                .parse()
-                .expect("Valid broadcast address");
-
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -353,9 +431,10 @@ impl DiscoveryService {
                 return;
             }
 
+            let initial_targets = Self::get_broadcast_targets(&self.config);
             info!(
-                "Discovery broadcaster active: transmitting beacons to {} every {} ms",
-                broadcast_addr, self.config.network.broadcast_interval_ms
+                "Discovery broadcaster active: transmitting beacons to {:?} every {} ms",
+                initial_targets, self.config.network.broadcast_interval_ms
             );
 
             let interval = Duration::from_millis(self.config.network.broadcast_interval_ms);
@@ -384,20 +463,13 @@ impl DiscoveryService {
                 };
 
                 let packet_bytes = beacon.encode();
-                if let Err(e) = socket.send_to(&packet_bytes, broadcast_addr).await {
-                    debug!("UDP beacon broadcast failed: {}", e);
-                } else {
-                    trace!("Sent discovery beacon ({} bytes)", packet_bytes.len());
-                }
-
-                // Send to loopback so local cluster clients or tests receive beacons
-                let loopback_addr = format!("127.0.0.1:{}", self.config.network.discovery_port);
-                let _ = socket.send_to(&packet_bytes, loopback_addr).await;
-
-                // Send to any configured static peers
-                for peer in &self.config.network.static_peers {
-                    let peer_addr = format!("{}:{}", peer, self.config.network.discovery_port);
-                    let _ = socket.send_to(&packet_bytes, peer_addr).await;
+                let targets = Self::get_broadcast_targets(&self.config);
+                for target in targets {
+                    if let Err(e) = socket.send_to(&packet_bytes, target).await {
+                        debug!("UDP beacon send to {} failed: {}", target, e);
+                    } else {
+                        trace!("Sent discovery beacon to {}", target);
+                    }
                 }
             }
         })
@@ -445,6 +517,28 @@ impl DiscoveryService {
 
                                     let mut peers = self.peers.write().await;
                                     peers.insert(beacon.uuid, peer);
+
+                                    // If this node is a host and received a client beacon/probe, reply unicast immediately
+                                    let is_host_node = NodeRole::from_str_role(&self.config.node.role).is_host();
+                                    if is_host_node && beacon.role.is_client() {
+                                        let reply_addr = SocketAddr::new(peer_addr.ip(), self.config.network.discovery_port);
+                                        let profile = SystemProfile::probe();
+                                        let reply_beacon = BeaconPacket {
+                                            magic: BEACON_MAGIC,
+                                            version: BEACON_VERSION,
+                                            role: NodeRole::HOST,
+                                            status: *self.status_flags.read().await,
+                                            uuid: self.node_uuid,
+                                            api_port: self.config.network.api_port,
+                                            total_ram_mb: profile.total_ram_mb as u32,
+                                            free_ram_mb: profile.available_ram_mb as u32,
+                                            backend: profile.detected_backend,
+                                            thermal_index: Self::probe_thermal_index(),
+                                            active_model: self.active_model.read().await.clone(),
+                                        };
+                                        let reply_bytes = reply_beacon.encode();
+                                        let _ = socket.send_to(&reply_bytes, reply_addr).await;
+                                    }
                                 }
                                 Err(e) => {
                                     trace!("Discarding invalid discovery packet from {}: {}", peer_addr, e);
@@ -499,6 +593,7 @@ pub fn create_listener_socket(port: u16) -> Result<UdpSocket, std::io::Error> {
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
+    let _ = socket.set_broadcast(true);
 
     #[cfg(unix)]
     unsafe {
@@ -518,4 +613,70 @@ pub fn create_listener_socket(port: u16) -> Result<UdpSocket, std::io::Error> {
 
     UdpSocket::from_std(socket.into())
 }
+
+/// Query the local system network interfaces using getifaddrs to find all active IPv4 broadcast addresses.
+#[cfg(unix)]
+pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
+    let mut addrs = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return addrs;
+        }
+        let mut curr = ifap;
+        while !curr.is_null() {
+            let item = &*curr;
+            let flags = item.ifa_flags as i32;
+            let is_up = (flags & libc::IFF_UP) != 0;
+            let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
+            let is_broadcast = (flags & libc::IFF_BROADCAST) != 0;
+
+            if is_up && !is_loopback && is_broadcast && !item.ifa_addr.is_null() {
+                if (*item.ifa_addr).sa_family as i32 == libc::AF_INET {
+                    let mut bcast = None;
+                    if !item.ifa_ifu.is_null() {
+                        let bcast_in = &*(item.ifa_ifu as *const libc::sockaddr_in);
+                        let bcast_bytes = bcast_in.sin_addr.s_addr.to_ne_bytes();
+                        let addr = std::net::Ipv4Addr::from(bcast_bytes);
+                        if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
+                            bcast = Some(addr);
+                        }
+                    }
+
+                    if bcast.is_none() && !item.ifa_netmask.is_null() {
+                        let sock_in = &*(item.ifa_addr as *const libc::sockaddr_in);
+                        let mask_in = &*(item.ifa_netmask as *const libc::sockaddr_in);
+                        let ip = sock_in.sin_addr.s_addr.to_ne_bytes();
+                        let mask = mask_in.sin_addr.s_addr.to_ne_bytes();
+                        let bcast_octets = [
+                            ip[0] | !mask[0],
+                            ip[1] | !mask[1],
+                            ip[2] | !mask[2],
+                            ip[3] | !mask[3],
+                        ];
+                        let addr = std::net::Ipv4Addr::from(bcast_octets);
+                        if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
+                            bcast = Some(addr);
+                        }
+                    }
+
+                    if let Some(addr) = bcast {
+                        if !addrs.contains(&addr) {
+                            addrs.push(addr);
+                        }
+                    }
+                }
+            }
+            curr = item.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    addrs
+}
+
+#[cfg(not(unix))]
+pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
+    Vec::new()
+}
+
 

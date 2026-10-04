@@ -125,7 +125,8 @@ impl NexusClient {
         Self {
             endpoint,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(300))
                 .build()
                 .expect("Valid reqwest client"),
         }

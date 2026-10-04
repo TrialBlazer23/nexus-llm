@@ -33,6 +33,7 @@ pub struct ChatApp {
     pub is_streaming: bool,
     pub input_buffer: String,
     pub scroll_offset: u16,
+    pub auto_scroll: bool,
     pub tokens_streamed: usize,
     pub tokens_per_sec: f64,
     pub stream_start_time: Option<Instant>,
@@ -50,11 +51,27 @@ impl ChatApp {
             is_streaming: false,
             input_buffer: String::new(),
             scroll_offset: 0,
+            auto_scroll: true,
             tokens_streamed: 0,
             tokens_per_sec: 0.0,
             stream_start_time: None,
             status_message: None,
         }
+    }
+
+    /// Calculate approximate total line count across current conversation.
+    pub fn total_lines(&self) -> usize {
+        let mut count = 0;
+        if self.system_prompt.is_some() {
+            count += 2;
+        }
+        for msg in &self.messages {
+            count += 1 + msg.content.lines().count() + 1;
+        }
+        if self.is_streaming || !self.streaming_response.is_empty() {
+            count += 1 + self.streaming_response.lines().count();
+        }
+        count
     }
 
     /// Process a stream chunk received from background worker.
@@ -173,6 +190,16 @@ impl ChatApp {
             }
         }
 
+        let total_lines = lines.len() as u16;
+        let viewport_height = area.height.saturating_sub(2);
+        let max_scroll = total_lines.saturating_sub(viewport_height);
+
+        let scroll_y = if self.auto_scroll {
+            max_scroll
+        } else {
+            self.scroll_offset.min(max_scroll)
+        };
+
         let history = Paragraph::new(lines)
             .block(
                 Block::default()
@@ -180,7 +207,7 @@ impl ChatApp {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue)),
             )
-            .scroll((self.scroll_offset, 0))
+            .scroll((scroll_y, 0))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(history, area);
@@ -206,14 +233,22 @@ impl ChatApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let text = if let Some(status) = &self.status_message {
-            status.clone()
+        let (text, style) = if let Some(status) = &self.status_message {
+            let color = if status.to_lowercase().contains("error") {
+                Color::LightRed
+            } else {
+                Color::Yellow
+            };
+            (status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD))
         } else {
-            "[Enter] Submit  |  [Esc / Ctrl+C] Exit  |  [Up/Down] Scroll".to_string()
+            (
+                "[Enter] Submit  |  [Esc / Ctrl+C] Exit  |  [Up/Down/PgUp/PgDn] Scroll".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
         };
 
         let footer = Paragraph::new(Line::from(vec![
-            Span::styled(text, Style::default().fg(Color::DarkGray)),
+            Span::styled(text, style),
         ]));
 
         frame.render_widget(footer, area);
@@ -268,16 +303,37 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                 app.input_buffer.pop();
                             }
                             KeyCode::Up => {
-                                app.scroll_offset = app.scroll_offset.saturating_add(1);
+                                let max = app.total_lines() as u16;
+                                let current = if app.auto_scroll { max } else { app.scroll_offset };
+                                app.auto_scroll = false;
+                                app.scroll_offset = current.saturating_sub(1);
                             }
                             KeyCode::Down => {
-                                app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                                app.scroll_offset = app.scroll_offset.saturating_add(1);
+                                if app.scroll_offset >= app.total_lines() as u16 {
+                                    app.auto_scroll = true;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                let max = app.total_lines() as u16;
+                                let current = if app.auto_scroll { max } else { app.scroll_offset };
+                                app.auto_scroll = false;
+                                app.scroll_offset = current.saturating_sub(10);
+                            }
+                            KeyCode::PageDown | KeyCode::End => {
+                                app.auto_scroll = true;
+                            }
+                            KeyCode::Home => {
+                                app.auto_scroll = false;
+                                app.scroll_offset = 0;
                             }
                             KeyCode::Enter => {
                                 if !app.is_streaming && !app.input_buffer.trim().is_empty() {
                                     let prompt = std::mem::take(&mut app.input_buffer);
                                     app.messages.push(ChatMessage::user(&prompt));
                                     app.is_streaming = true;
+                                    app.auto_scroll = true;
+                                    app.status_message = None;
                                     app.streaming_response.clear();
                                     app.tokens_streamed = 0;
                                     app.tokens_per_sec = 0.0;
@@ -337,13 +393,17 @@ async fn event_loop<B: ratatui::backend::Backend>(
                 match msg {
                     StreamMsg::Token(token) => {
                         app.handle_stream_token(token);
+                        app.auto_scroll = true;
                     }
                     StreamMsg::Done => {
                         app.finalize_stream();
+                        app.auto_scroll = true;
                     }
                     StreamMsg::Error(err) => {
                         app.finalize_stream();
+                        app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}", err)));
                         app.status_message = Some(format!("Error: {}", err));
+                        app.auto_scroll = true;
                     }
                 }
                 terminal.draw(|f| app.render(f))?;

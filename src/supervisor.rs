@@ -5,7 +5,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 #[derive(Error, Debug)]
 pub enum SupervisorError {
@@ -156,6 +156,7 @@ impl ProcessSupervisor {
                     match vulkan_result {
                         Ok(()) => {
                             info!("Vulkan acceleration successfully initialized.");
+                            Self::spawn_drain_tasks(stdout_reader, stderr_reader);
                             let mut supervisor = Self {
                                 child: Some(child),
                                 config: config.clone(),
@@ -186,7 +187,8 @@ impl ProcessSupervisor {
 
         // Attempt 2: CPU fallback
         info!("Spawning llama-server in CPU mode (-ngl 0, threads: {})", config.threads);
-        let (child, _, _) = Self::try_spawn(&config, 0).await?;
+        let (child, stdout_reader, stderr_reader) = Self::try_spawn(&config, 0).await?;
+        Self::spawn_drain_tasks(stdout_reader, stderr_reader);
 
         let mut supervisor = Self {
             child: Some(child),
@@ -206,6 +208,34 @@ impl ProcessSupervisor {
 
         info!("llama-server successfully running on CPU backend.");
         Ok(supervisor)
+    }
+
+    /// Spawn background tasks to drain child stdout/stderr so pipes never block or trigger SIGPIPE.
+    fn spawn_drain_tasks(
+        mut stdout_reader: BufReader<tokio::process::ChildStdout>,
+        mut stderr_reader: BufReader<tokio::process::ChildStderr>,
+    ) {
+        tokio::spawn(async move {
+            let mut line = String::new();
+            while let Ok(n) = stdout_reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                trace!("[llama-server stdout] {}", line.trim_end());
+                line.clear();
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut line = String::new();
+            while let Ok(n) = stderr_reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                debug!("[llama-server stderr] {}", line.trim_end());
+                line.clear();
+            }
+        });
     }
 
     /// Helper to spawn child with piped stdout and stderr.
@@ -332,6 +362,15 @@ impl ProcessSupervisor {
                 resp.status().is_success()
             }
             Err(_) => false,
+        }
+    }
+
+    /// Wait asynchronously for child process to exit.
+    pub async fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
+        if let Some(child) = &mut self.child {
+            child.wait().await
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No child process running"))
         }
     }
 

@@ -61,6 +61,35 @@ fn test_chat_tui_headless_render() {
     assert!(content.contains("Response from model"), "Buffer should contain assistant reply");
 }
 
+#[test]
+fn test_chat_tui_multi_turn_auto_scroll() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+
+    // Simulate 15 turns of conversation (well over 50 lines)
+    for i in 1..=15 {
+        app.messages.push(ChatMessage::user(format!("Question {}", i)));
+        app.messages.push(ChatMessage::assistant(format!("Answer {}", i)));
+    }
+    app.messages.push(ChatMessage::user("Followup question 16"));
+    app.messages.push(ChatMessage::assistant("Latest answer 16"));
+
+    assert!(app.total_lines() > 50, "Total lines should exceed terminal height");
+    assert!(app.auto_scroll, "Auto-scroll should be enabled by default");
+
+    let backend = TestBackend::new(100, 20); // Small 20-row terminal
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
+
+    terminal.draw(|f| app.render(f)).expect("Failed to render frame");
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    // With auto-scroll active, the bottom messages MUST be visible in the buffer
+    assert!(content.contains("Followup question 16"), "Auto-scroll must render latest user followup");
+    assert!(content.contains("Latest answer 16"), "Auto-scroll must render latest assistant reply");
+}
+
 #[tokio::test]
 async fn test_dashboard_tui_headless_render() {
     let config = NexusConfig::default();

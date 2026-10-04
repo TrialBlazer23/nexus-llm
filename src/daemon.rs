@@ -105,8 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mut supervisor) => {
                 info!("Server supervisor active on backend: {}", supervisor.active_backend());
                 info!("Listening for termination signal (Ctrl+C)...");
-                tokio::signal::ctrl_c().await?;
-                info!("Termination signal received. Shutting down llama-server...");
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(e) = res {
+                            error!("Error listening for Ctrl+C: {}", e);
+                        } else {
+                            info!("Termination signal received. Shutting down llama-server...");
+                        }
+                    }
+                    exit_res = supervisor.wait() => {
+                        error!("llama-server process exited unexpectedly: {:?}", exit_res);
+                    }
+                }
                 supervisor.stop().await?;
                 info!("Shutdown complete.");
             }

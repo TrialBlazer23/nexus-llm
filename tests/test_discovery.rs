@@ -1,0 +1,232 @@
+use nexus::client::{ChatCompletionChunk, ChatMessage, ChatCompletionRequest};
+use nexus::config::NexusConfig;
+use nexus::discovery::{
+    BeaconPacket, DiscoveryError, DiscoveryService, NodeRole, PeerNode, StatusFlags,
+    BEACON_MAGIC, BEACON_PACKET_SIZE, BEACON_VERSION,
+};
+use nexus::sysinfo::AccelerationBackend;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+#[test]
+fn test_beacon_packet_encoding_and_crc() {
+    let uuid = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8").unwrap();
+    let packet = BeaconPacket {
+        magic: BEACON_MAGIC,
+        version: BEACON_VERSION,
+        role: NodeRole::HOST,
+        status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
+        uuid,
+        api_port: 8080,
+        total_ram_mb: 12000,
+        free_ram_mb: 5000,
+        backend: AccelerationBackend::Vulkan,
+        thermal_index: 35,
+        active_model: "llama-3-8b".to_string(),
+    };
+
+    let encoded = packet.encode();
+    assert_eq!(encoded.len(), BEACON_PACKET_SIZE, "Beacon must be exactly 64 bytes");
+
+    // Verify magic signature bytes ("NXUS" = 0x4E, 0x58, 0x55, 0x53)
+    assert_eq!(&encoded[0..4], &[0x4E, 0x58, 0x55, 0x53]);
+    assert_eq!(encoded[4], 1); // Version 1
+    assert_eq!(encoded[5], 1); // Role Host
+
+    // Verify successful decode
+    let decoded = BeaconPacket::decode(&encoded).expect("Beacon decoding failed");
+    assert_eq!(decoded.magic, BEACON_MAGIC);
+    assert_eq!(decoded.version, BEACON_VERSION);
+    assert_eq!(decoded.role, NodeRole::HOST);
+    assert!(decoded.status.is_ready());
+    assert!(decoded.status.is_vulkan_active());
+    assert_eq!(decoded.uuid, uuid);
+    assert_eq!(decoded.api_port, 8080);
+    assert_eq!(decoded.total_ram_mb, 12000);
+    assert_eq!(decoded.free_ram_mb, 5000);
+    assert_eq!(decoded.backend, AccelerationBackend::Vulkan);
+    assert_eq!(decoded.thermal_index, 35);
+    assert_eq!(decoded.active_model, "llama-3-8b");
+}
+
+#[test]
+fn test_beacon_corruption_rejection() {
+    let packet = BeaconPacket {
+        magic: BEACON_MAGIC,
+        version: BEACON_VERSION,
+        role: NodeRole::HOST,
+        status: StatusFlags::READY,
+        uuid: Uuid::new_v4(),
+        api_port: 8080,
+        total_ram_mb: 8000,
+        free_ram_mb: 3000,
+        backend: AccelerationBackend::ArmCpuDotProd,
+        thermal_index: 20,
+        active_model: "qwen-2.5-7b".to_string(),
+    };
+
+    let mut encoded = packet.encode();
+
+    // 1. Corrupted checksum rejection
+    encoded[62] ^= 0xFF;
+    match BeaconPacket::decode(&encoded) {
+        Err(DiscoveryError::ChecksumMismatch { .. }) => (),
+        other => panic!("Expected ChecksumMismatch, got {:?}", other),
+    }
+    encoded[62] ^= 0xFF; // Restore checksum
+
+    // 2. Corrupted magic signature rejection
+    encoded[0] = 0x00;
+    // Fix checksum for modified magic to ensure magic check specifically fails
+    let new_crc = nexus::discovery::compute_crc16(&encoded[0..62]);
+    encoded[62..64].copy_from_slice(&new_crc.to_be_bytes());
+    match BeaconPacket::decode(&encoded) {
+        Err(DiscoveryError::InvalidMagic(m)) => assert_ne!(m, BEACON_MAGIC),
+        other => panic!("Expected InvalidMagic, got {:?}", other),
+    }
+
+    // 3. Packet size rejection
+    let short_buf = [0u8; 32];
+    match BeaconPacket::decode(&short_buf) {
+        Err(DiscoveryError::PacketSizeMismatch { expected: 64, actual: 32 }) => (),
+        other => panic!("Expected PacketSizeMismatch, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_peer_cache_expiry_and_pruning() {
+    let mut config = NexusConfig::default();
+    config.network.peer_timeout_ms = 50; // 50ms timeout for fast unit testing
+
+    let discovery = DiscoveryService::new(config, None);
+    let peer_uuid = Uuid::new_v4();
+
+    // Insert peer into cache
+    {
+        let peers_lock = discovery.peers();
+        let mut peers = peers_lock.write().await;
+        peers.insert(
+            peer_uuid,
+            PeerNode {
+                uuid: peer_uuid,
+                addr: SocketAddr::from(([192, 168, 1, 100], 8080)),
+                role: NodeRole::HOST,
+                status: StatusFlags::READY,
+                api_port: 8080,
+                total_ram_mb: 12000,
+                free_ram_mb: 6000,
+                backend: AccelerationBackend::Vulkan,
+                thermal_index: 30,
+                active_model: "llama-3".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    // Should be present immediately
+    let active_before = discovery.get_active_peers().await;
+    assert_eq!(active_before.len(), 1);
+    assert_eq!(active_before[0].uuid, peer_uuid);
+
+    // Sleep past the 50ms peer timeout
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Must be pruned after timeout
+    let active_after = discovery.get_active_peers().await;
+    assert_eq!(active_after.len(), 0, "Stale peer must be pruned from active peers");
+}
+
+#[tokio::test]
+async fn test_find_best_host_scoring() {
+    let config = NexusConfig::default();
+    let discovery = DiscoveryService::new(config, None);
+
+    let host1_uuid = Uuid::new_v4();
+    let host2_uuid = Uuid::new_v4();
+
+    {
+        let peers_lock = discovery.peers();
+        let mut peers = peers_lock.write().await;
+
+        // Host 1: CPU, 2000 MB free, thermal 50
+        peers.insert(
+            host1_uuid,
+            PeerNode {
+                uuid: host1_uuid,
+                addr: SocketAddr::from(([192, 168, 1, 101], 8080)),
+                role: NodeRole::HOST,
+                status: StatusFlags::READY,
+                api_port: 8080,
+                total_ram_mb: 4000,
+                free_ram_mb: 2000,
+                backend: AccelerationBackend::ArmCpuDotProd,
+                thermal_index: 50,
+                active_model: "qwen".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+
+        // Host 2: Vulkan, 6000 MB free, thermal 25
+        peers.insert(
+            host2_uuid,
+            PeerNode {
+                uuid: host2_uuid,
+                addr: SocketAddr::from(([192, 168, 1, 102], 8080)),
+                role: NodeRole::HOST,
+                status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
+                api_port: 8080,
+                total_ram_mb: 12000,
+                free_ram_mb: 6000,
+                backend: AccelerationBackend::Vulkan,
+                thermal_index: 25,
+                active_model: "llama".to_string(),
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    let best = discovery.find_best_host().await.expect("Must find a host");
+    assert_eq!(best.uuid, host2_uuid, "Host 2 (Vulkan, more RAM, cooler) must score higher");
+    assert_eq!(best.api_endpoint(), "http://192.168.1.102:8080");
+}
+
+#[test]
+fn test_sse_chunk_deserialization() {
+    let sample_chunk = r#"{
+        "id": "chatcmpl-123",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "Hello world!"
+                },
+                "finish_reason": null
+            }
+        ]
+    }"#;
+
+    let chunk: ChatCompletionChunk = serde_json::from_str(sample_chunk).expect("Failed to deserialize chunk");
+    assert_eq!(chunk.choices.len(), 1);
+    assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello world!"));
+}
+
+#[test]
+fn test_chat_request_serialization() {
+    let req = ChatCompletionRequest {
+        model: "llama-3".to_string(),
+        messages: vec![
+            ChatMessage::system("You are Nexus."),
+            ChatMessage::user("Hello!"),
+        ],
+        temperature: Some(0.8),
+        max_tokens: Some(256),
+        stream: true,
+    };
+
+    let json = serde_json::to_string(&req).expect("Failed to serialize request");
+    assert!(json.contains("\"stream\":true"));
+    assert!(json.contains("\"model\":\"llama-3\""));
+    assert!(json.contains("\"role\":\"system\""));
+}

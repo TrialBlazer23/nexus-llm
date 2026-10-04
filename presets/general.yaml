@@ -1,0 +1,8 @@
+name: "general"
+description: "Balanced conversational assistant"
+template: "llama3"
+temperature: 0.7
+top_p: 0.90
+max_tokens: 2048
+system_prompt: |
+  You are Nexus, a helpful, precise, and concise AI assistant running on a distributed heterogeneous edge cluster.

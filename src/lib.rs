@@ -1,0 +1,9 @@
+pub mod client;
+pub mod config;
+pub mod discovery;
+pub mod downloader;
+pub mod gguf;
+pub mod preset;
+pub mod supervisor;
+pub mod sysinfo;
+pub mod ui;

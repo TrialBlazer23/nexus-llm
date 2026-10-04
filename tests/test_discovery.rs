@@ -9,6 +9,10 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[test]
 fn test_beacon_packet_encoding_and_crc() {
     let uuid = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8").unwrap();
@@ -123,6 +127,32 @@ fn test_beacon_corruption_rejection() {
         Err(DiscoveryError::PacketSizeMismatch { expected: 64, actual: 32 }) => (),
         other => panic!("Expected PacketSizeMismatch, got {:?}", other),
     }
+}
+
+#[test]
+fn test_udp_v1_fixture_is_stable() {
+    let uuid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let packet = BeaconPacket {
+        magic: BEACON_MAGIC,
+        version: BEACON_VERSION,
+        role: NodeRole::HOST,
+        status: StatusFlags::READY,
+        uuid,
+        api_port: 8080,
+        rpc_port: 0,
+        total_ram_mb: 8192,
+        free_ram_mb: 4096,
+        backend: AccelerationBackend::ArmCpuDotProd,
+        thermal_index: 12,
+        active_model: "tiny".to_string(),
+    };
+
+    let encoded = packet.encode();
+    assert_eq!(
+        hex_bytes(&encoded),
+        "4e58555301010001000000000000000000000000000000011f9000000000200000001000020c74696e790000000000000000000000000000000000000000c5ba"
+    );
+    assert_eq!(BeaconPacket::decode(&encoded).unwrap(), packet);
 }
 
 #[tokio::test]
@@ -318,5 +348,3 @@ fn test_get_broadcast_addresses_and_targets() {
         assert!(targets.contains(&expected));
     }
 }
-
-

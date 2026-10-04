@@ -141,6 +141,19 @@ fn test_transport_mode_parsing() {
 }
 
 #[test]
+fn test_wifi_transport_preserves_discovery_fallback() {
+    let (endpoint, uses_usb) =
+        nexus::tunnel::AdbTunnelSupervisor::resolve_transport_endpoint(
+            TransportMode::Wifi,
+            8080,
+            50052,
+        );
+
+    assert_eq!(endpoint, None);
+    assert!(!uses_usb);
+}
+
+#[test]
 fn test_config_cluster_defaults() {
     let config = NexusConfig::default();
     assert!(config.cluster.enable_rpc);

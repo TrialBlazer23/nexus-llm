@@ -138,6 +138,44 @@ api_port = 9090
 }
 
 #[test]
+fn test_config_network_fallbacks_round_trip() {
+    let custom_toml = r#"
+[network]
+static_peers = ["10.0.0.99", "http://127.0.0.1:8080"]
+default_host = "http://10.0.0.1:8080"
+"#;
+
+    let parsed: NexusConfig = toml::from_str(custom_toml).expect("Failed to parse fallback config");
+    assert_eq!(
+        parsed.network.static_peers,
+        vec!["10.0.0.99".to_string(), "http://127.0.0.1:8080".to_string()]
+    );
+    assert_eq!(
+        parsed.network.default_host.as_deref(),
+        Some("http://10.0.0.1:8080")
+    );
+
+    let serialized = toml::to_string(&parsed).expect("Failed to serialize fallback config");
+    let round_trip: NexusConfig =
+        toml::from_str(&serialized).expect("Failed to deserialize fallback config");
+    assert_eq!(round_trip.network.static_peers, parsed.network.static_peers);
+    assert_eq!(round_trip.network.default_host, parsed.network.default_host);
+}
+
+#[test]
+fn test_node_identity_baseline_is_explicit_until_persistence() {
+    let mut config = NexusConfig::default();
+    config.node.id = "baseline-node-id".to_string();
+
+    let serialized = toml::to_string(&config).expect("Failed to serialize node identity");
+    let restored: NexusConfig =
+        toml::from_str(&serialized).expect("Failed to deserialize node identity");
+
+    assert_eq!(restored.node.id, "baseline-node-id");
+    assert_eq!(restored.node.id, config.node.id);
+}
+
+#[test]
 fn test_tilde_expansion() {
     let expanded = expand_tilde("~/models");
     assert!(!expanded.to_string_lossy().starts_with("~"));

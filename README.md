@@ -196,6 +196,39 @@ adb forward tcp:8080 tcp:8080
 
 ## Interactive Interfaces & Tools
 
+### Phase 0 Compatibility Baseline
+
+Before changing discovery or peer identity, validate the existing behavior on the
+actual target devices. Host-side Rust tests cover deterministic protocol and
+fallback behavior:
+
+```bash
+cargo test --test test_discovery
+cargo test --test test_cluster_rpc
+cargo test --test test_phase1
+```
+
+Record the following device matrix separately from host CI results:
+
+| Check | Node A: Termux ARM64 | Node B: Debian x86-64 | Secondary Termux | Linux peer |
+| :--- | :---: | :---: | :---: | :---: |
+| UDP beacon receive/send | required | required | required | required |
+| Wi-Fi client isolation/filtering | required | required | required | observe |
+| Multiple interfaces | required | required | observe | observe |
+| IPv4 and scoped IPv6 | required | required | observe | required |
+| Concurrent local listener | required | required | required | required |
+
+For each run, record the interface, subnet, discovery port, peer UUID, packet
+counts, and whether static/ADB fallback was required. Do not treat cross
+compilation as proof of Android multicast behavior.
+
+Capture release binary size and idle RSS/CPU after a fixed settle interval for
+`nexusd` on Node A and `nexus`/the RPC worker on Node B. Record the target triple
+and compiler flags, and verify the Penryn build does not enable AVX, AVX2, FMA,
+F16C, POPCNT, or SSE4.2. An actual llama.cpp smoke test is optional and must use
+a tiny checksum-verified GGUF built with the same architecture-safe flags; the
+deterministic Rust tests do not require llama.cpp to be installed.
+
 ### 1. Unified Interactive Hub (Default Experience)
 Starting `nexus` with no arguments launches the full-screen Ratatui Unified Hub:
 ```bash

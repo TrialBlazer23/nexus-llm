@@ -30,6 +30,7 @@ Workspace Directory Layout
 ├── .cargo/
 │   └── config.toml
 ├── AGENTS.md
+├── AGENT_LEARNINGS.md
 ├── DESIGN_SPEC.md
 ├── BUILD_PLAN.md
 ├── src/
@@ -77,4 +78,50 @@ cargo test
 # Run interactive TUI client connecting to Node A
 cargo run --release -- client --host <NODE_A_IP>:8080
 
+# Maintainability and Quality Standards
 
+Keep changes small, cohesive, and easy to review. Prefer clear, idiomatic Rust and
+existing project patterns over clever abstractions or speculative generalization.
+Before adding code, search for an existing helper, module, dependency, or documented
+decision that already solves the problem; extend or reuse it when appropriate rather
+than duplicating behavior.
+
+Treat 250 lines as a maintainability guideline for source files, not a hard
+requirement. When a file grows beyond that guideline, split it along meaningful
+responsibility boundaries without scattering closely related logic across arbitrary
+files. Keep public interfaces narrow, preserve type safety, validate inputs at
+boundaries, and make failures explicit and actionable.
+
+Every behavior change should include or update focused tests for the success path,
+important edge cases, and failure behavior. Run the smallest relevant formatter,
+lint, build, and test commands, then record the validation performed. Update
+directly related documentation and configuration examples when behavior or
+operator workflows change.
+
+Do not introduce unrelated refactors, duplicate existing functionality, or leave
+dead code, temporary workarounds, ignored errors, or unverified assumptions behind.
+If a limitation or design trade-off must remain, document the reason and the
+follow-up needed. Before marking work complete, review the diff for clarity,
+backward compatibility, target-specific constraints, and maintainability.
+
+# Agent Learnings
+
+Record durable lessons in [AGENT_LEARNINGS.md](AGENT_LEARNINGS.md). Add an entry
+when a bug, failed command, environment-specific behavior, research finding, or
+design decision could prevent future agents from repeating the same mistake.
+Keep entries concise, factual, and actionable. Do not record secrets, credentials,
+tokens, personal data, or noisy one-off status updates.
+
+Use this structure for each entry:
+
+```text
+## YYYY-MM-DD — Short title
+- Category: bug | failed-command | research | design-decision | environment
+- Context: What was being attempted and where.
+- Finding: What happened or what was learned.
+- Action: The fix, workaround, or rule to follow.
+- Verification: How the result was confirmed, or what remains unverified.
+```
+
+Prefer updating an existing entry when new evidence clarifies it. Otherwise append
+new entries in reverse chronological order.

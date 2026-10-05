@@ -289,3 +289,47 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     assert!(content.contains("llama-3.2-3b.gguf"), "Must display target model filename in modal");
     assert!(content.contains("[Y / N]"), "Must display confirmation prompt");
 }
+
+#[tokio::test]
+async fn test_hub_app_target_node_selection_modal() {
+    use nexus::ui::hub::TargetExecutionNode;
+    use uuid::Uuid;
+
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    let model_path = PathBuf::from("/models/qwen2.5-coder-7b.gguf");
+    hub.open_target_selection(model_path.clone()).await;
+
+    assert!(hub.pending_target_selection.is_some());
+    let state = hub.pending_target_selection.as_mut().unwrap();
+    assert_eq!(state.model_name, "qwen2.5-coder-7b");
+    assert_eq!(state.candidates.len(), 1); // At least Local machine
+    assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
+
+    // Add a simulated remote peer candidate
+    let peer_id = Uuid::new_v4();
+    state.candidates.push(TargetExecutionNode::Remote {
+        uuid: peer_id,
+        name: "Galaxy-S23".to_string(),
+        endpoint: "http://192.168.1.100:8080".to_string(),
+        free_ram_mb: 8500,
+        backend: "Vulkan".to_string(),
+    });
+    assert_eq!(state.candidates.len(), 2);
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal.draw(|f| hub.render(f)).expect("Failed to render target selection modal");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(content.contains("Target Node Selection"), "Must render modal title");
+    assert!(content.contains("qwen2.5-coder-7b"), "Must render target model name");
+    assert!(content.contains("Local Machine"), "Must list Local Machine option");
+    assert!(content.contains("Galaxy-S23"), "Must list remote peer candidate");
+}
+

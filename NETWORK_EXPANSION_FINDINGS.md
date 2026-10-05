@@ -1,5 +1,10 @@
 # Nexus-LLM Network Expansion Findings
 
+> [!NOTE]
+> **Status:** Research & Analysis Archive (October 2026).
+> The service discovery (`mdns-sd`), UDP beacon evolution, and dynamic peer registry findings from this document have been formally integrated into [`DESIGN_SPEC.md`](DESIGN_SPEC.md) and [`BUILD_PLAN.md`](BUILD_PLAN.md). 
+> For active system architecture, protocols, and implementation directives, refer to [`DESIGN_SPEC.md`](DESIGN_SPEC.md) as the authoritative Single Source of Truth.
+
 **Scope:** Current architecture and a staged design for a decentralized, local-Wi-Fi N-node network, with Node A (Galaxy S23 Ultra / Termux / ARM64) and Node B (Debian x86_64 MacBook) retained as the primary compute and client anchors. The same Nexus binary should also support additional Termux devices, native Windows PowerShell, and Windows WSL by selecting a runtime role at startup.
 
 **Research checked:** October 4, 2026. This is an analysis and implementation plan only; it does not change runtime behavior or add dependencies.

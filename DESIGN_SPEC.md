@@ -1,191 +1,147 @@
-<!-- STREAMING_CHUNK:Documenting header and metadata -->
-Nexus-LLM: System Architecture & Technical Specification
-Document ID: SPEC-NEXUS-2026-REV4 Target Nodes: Node A (Samsung Galaxy S23 Ultra / Termux ARM64) & Node B (MacBook / Debian 13 Trixie x86-64) Lead Architect: Evan Hyland
-<!-- STREAMING_CHUNK:Defining system overview and hardware target comparison table -->
-1. System Overview & Architectural Topology
-Nexus-LLM is an autonomous, cross-platform terminal orchestrator and local inference daemon designed for heterogeneous edge devices. It prioritizes GPU acceleration via Vulkan on modern ARM platforms, provides transparent CPU fallback, automates local network discovery, enforces memory bounds to protect against OS process terminations (Android LMK), and serves interactive terminal UIs to lightweight client machines.
-Hardware Targets
-Parameter
-Node A: Primary Compute Host
-Node B: Control & Workstation Node
-Physical Device
-Samsung Galaxy S23 Ultra (SM-S918U)
-Apple MacBook (macrowave)
-Processor
-Qualcomm Snapdragon 8 Gen 2 (SM8550-AB)
-Intel Core 2 Duo P7550 @ 2.26 GHz (2 Cores / 2 Threads)
-Microarchitecture
-Cortex-X3 + Cortex-A715/A710 + Cortex-A510
-Intel Penryn (45nm, 3MB L2 Cache)
-Operating System
-Android 14+ via Termux (Bionic libc)
-Debian GNU/Linux 13 (Trixie), Kernel 6.12.111-amd64
-Desktop / Shell
-Headless CLI / zsh in Termux
-Xfce 4.20 / X11 / bash
-Installed RAM
-12 GB LPDDR5X (Unified Memory)
-3.6 GiB Usable DDR3
-Primary Acceleration
-Adreno 740 GPU via Vulkan (GGML_VULKAN=1)
-None (CPU only; model inference disabled by default)
-CPU Fallback
-ARMv8.2-A dotprod + i8mm (Cortex-X3/A715)
-MMX, SSE, SSE2, SSE3, SSSE3, SSE4.1
-Strict Prohibitions
-Over-allocating beyond 75% available RAM
-AVX, AVX2, FMA, F16C, POPCNT, SSE4.2 (causes SIGILL)
-Designated Role
-Autonomous Inference Host (nexusd)
-Interactive TUI Client & Dashboard (nexus)
+# Nexus-LLM: System Architecture & Technical Specification
 
-<!-- STREAMING_CHUNK:Defining GPU offload hierarchy and fallback rules -->
-2. Compute Hierarchy & Acceleration Policy
-Nexus-LLM enforces an explicit acceleration waterfall on the compute host:
-[Model Load Request]
-         │
-         ▼
-[Memory Safety Check: Model Size + KV Cache < 0.75 * MemAvailable]
-         │
-         ├───► FAIL: Reject with MemoryCapExceeded error
-         │
-         ▼ PASS
+**Document ID:** SPEC-NEXUS-2026-REV5  
+**Topology:** Symmetric N-Node Peer Mesh  
+**Supported Platforms:** Android Termux (ARM64), Debian 13 / Linux (x86-64), macOS, Windows PowerShell, Windows WSL2  
+
+---
+
+## 1. System Overview & Architectural Topology
+
+Nexus-LLM is an autonomous, cross-platform terminal orchestrator and distributed LLM runtime for heterogeneous edge devices. Instead of hardcoding static roles to specific physical machines, Nexus-LLM implements a **symmetric peer mesh**:
+- **Any connected device** can serve as an **Inference Host**, an **RPC Worker**, or an **Interactive TUI Client**.
+- **Hardware safety bounds** are strictly enforced dynamically on each individual node (e.g. Android LMK 75% available RAM limit on Termux, Penryn SSE4.1 instruction safety on older x86 machines, and user-configured memory ceilings).
+- **Target Node Selection**: An operator can launch models on any connected device directly from the TUI Hub and chat with the active model from any node.
+
+```mermaid
+flowchart TD
+    subgraph DiscoveryControlPlane["Control Plane & Discovery (Zero-Config)"]
+        MDNS["mDNS-SD Service Discovery (_nexus._tcp.local.)"]
+        BEACON["Advisory UDP 9999 Heartbeat (NXUS v1)"]
+        REGISTRY["Dynamic PeerRegistry (Discovered, Healthy, Stale, Removed)"]
+        CTRL["Control-Plane Handshake & Remote Model Dispatch"]
+        MDNS --> REGISTRY
+        BEACON --> REGISTRY
+        REGISTRY --> CTRL
+    end
+
+    subgraph Nodes["Heterogeneous Node Mesh"]
+        N1["Device 1 (e.g. S23 Ultra)<br/>Snapdragon 8 Gen 2 / Vulkan<br/>Capabilities: Host, Worker, TUI"]
+        N2["Device 2 (e.g. Mac Core 2 Duo)<br/>Penryn x86 / Debian 13<br/>Capabilities: TUI Client, RPC Worker"]
+        N3["Device 3 (e.g. PC / Laptop)<br/>Windows / WSL2 / Linux<br/>Capabilities: Host, Worker, TUI"]
+    end
+
+    CTRL <--> N1
+    CTRL <--> N2
+    CTRL <--> N3
+
+    subgraph DataPlane["Inference & Offload Data Plane"]
+        HTTP["OpenAI-Compatible HTTP / SSE (/v1/chat/completions)"]
+        RPC["llama.cpp RPC Layer Pipelining (--split-mode layer)"]
+    end
+
+    N2 -. Chat Streaming .-> N1
+    N3 -. Chat Streaming .-> N1
+    N1 == Sequential Layer Offload ==> N2
+```
+
+---
+
+## 2. Dynamic Node Capability Matrix
+
+| Runtime Target | Primary Acceleration | Memory Safety Mechanism | Typical Roles |
+|---|---|---|---|
+| **Android Termux (ARM64)** | Adreno GPU via Vulkan (`GGML_VULKAN=1`) or ARM CPU (`dotprod` + `i8mm`) | `/proc/meminfo` dynamic LMK guard (`Model + KV < 0.75 * MemAvailable`) | Compute Host, RPC Worker, TUI Client |
+| **Legacy x86 Workstations (e.g. Core 2 Duo)** | CPU (MMX, SSE, SSE2, SSE3, SSSE3, SSE4.1) | Strict Penryn flag enforcement (`-avx,-avx2,-fma,-sse4.2`); user-configured RAM cap (e.g. 1800 MB) | Interactive TUI Client, RPC Worker |
+| **Modern x86 / ARM Workstations (Windows / WSL2 / Linux)** | GPU (CUDA/Vulkan) or Multi-Threaded CPU | OS available memory probing; configured allocation caps | Compute Host, RPC Worker, Interactive TUI Client |
+
+---
+
+## 3. Acceleration Hierarchy & Memory Safety
+
+Nexus-LLM enforces an explicit acceleration and memory waterfall whenever a model is scheduled on an execution node:
+
+```text
+[Model Execution Request (Local or Remote)]
+                 │
+                 ▼
+[Memory Safety Check: Model Size + KV Cache < 0.75 * MemAvailable (or configured cap)]
+                 │
+                 ├───► INSUFFICIENT RAM:
+                 │         │
+                 │         ├───► RPC Worker Available?
+                 │         │         │
+                 │         │         ├───► YES: Plan sequential layer split (--split-mode layer)
+                 │         │         └───► NO:  Reject with MemoryCapExceeded error
+                 │
+                 ▼ WITHIN BUDGET
 [Hardware Capability Probe]
-         │
-         ├───► Vulkan Runtime Available?
-         │         │
-         │         ├───► YES: Launch llama-server with -ngl 99 (Full GPU Offload)
-         │         │          Verify device init in stdout/stderr.
-         │         │          If Vulkan initialization fails at runtime:
-         │         │          Fallback automatically to CPU Mode.
-         │         │
-         │         └───► NO (e.g. Minimal Termux environment):
-         │                    Launch llama-server with -ngl 0 (CPU Mode)
-         │                    Use optimized flags: -t 6 --threads-batch 6
+                 │
+                 ├───► Vulkan Runtime Available?
+                 │         ├───► YES: Launch llama-server with -ngl 99 (Full GPU Offload)
+                 │         └───► Runtime Init Failed? Fallback automatically to CPU Mode (-ngl 0)
+                 │
+                 └───► CPU Only:
+                           Launch llama-server with -ngl 0 and recommended thread count
+```
 
+---
 
-Vulkan Integration Notes for Termux (Node A)
-Unified LPDDR5X architecture on Snapdragon 8 Gen 2 allows zero-copy or high-bandwidth host-to-device tensor transfers.
-When compiled with -DGGML_VULKAN=ON, llama.cpp dynamically binds to /system/lib64/libvulkan.so or the Termux packaged Vulkan loader.
-Full offload (-ngl 99 or matching layer count) places weights directly into Adreno GPU buffers, drastically reducing CPU core thermal stress and battery drain.
-<!-- STREAMING_CHUNK:Specifying network port allocation and binary beacon layout -->
-3. Network Topology & Discovery Protocol
-Port Allocation
-Port 8080 (TCP) - Inference & Management API: Serves the OpenAI-compatible HTTP REST and Server-Sent Events (SSE) streaming API (/v1/chat/completions, /v1/models, /health).
-Port 9999 (UDP) - Cluster Discovery & Heartbeat: Transmits autonomous binary telemetry packets across the subnet broadcast address (255.255.255.255).
-Binary Beacon Packet Structure (64 Bytes Fixed)
-Byte Offset
-Field
-Type
-Description
-0x00 - 0x03
-Magic Header
-uint32 (BE)
-Fixed signature 0x4E585553 (ASCII "NXUS").
-0x04
-Version
-uint8
-Protocol version (0x01).
-0x05
-Node Role
-uint8
-Bitmask: 0x01 = Host, 0x02 = Client, 0x04 = Standalone.
-0x06 - 0x07
-Status Flags
-uint16 (BE)
-Bit 0: Ready, Bit 1: Inferring, Bit 2: Vulkan Active, Bit 3: Thermal Throttle, Bit 4: RPC Ready.
-0x08 - 0x17
-Node UUID
-uint8[16]
-RFC 4122 unique node identifier.
-0x18 - 0x19
-API Port
-uint16 (BE)
-Active HTTP port (default 8080).
-0x1A - 0x1B
-RPC Port
-uint16 (BE)
-Active sequential layer-pipeline RPC port; zero when unavailable.
-0x1C - 0x1F
-Total RAM
-uint32 (BE)
-Physical memory in Megabytes.
-0x20 - 0x23
-Free RAM
-uint32 (BE)
-MemAvailable in Megabytes.
-0x24
-Acceleration Tier
-uint8
-0x01 = Vulkan (Adreno 740), 0x02 = ARM CPU DotProd/I8MM, 0x03 = Legacy x86 SSE4.1.
-0x25
-Thermal Index
-uint8
-0 (nominal, <40°C) to 100 (critical, >80°C).
-0x26 - 0x3D
-Active Model
-char[24]
-Null-padded ASCII model family name.
-0x3E - 0x3F
-Checksum
-uint16 (BE)
-CRC-16-CCITT computed over bytes 0x00 through 0x3D.
+## 4. Control-Plane Protocol & Model Dispatch
 
-The UDP beacon is advisory telemetry. A runtime must verify the stable node
-identity, protocol version, readiness, capabilities, and policy-capped
-allocatable memory through the Nexus control plane before using a peer for
-privileged inference or RPC work. The control plane is separate from
-llama-server's inference and SSE data plane.
+In addition to the advisory 64-byte UDP beacon (port 9999) and mDNS-SD browsing, the Nexus control plane handles verified state synchronization and remote process dispatch over HTTP.
 
-<!-- STREAMING_CHUNK:Configuring build flags and compiler constraints for ARM and Penryn -->
-4. Hardware Compilation & Runtime Flags
-Node A: Samsung Galaxy S23 Ultra (Termux ARM64) - Vulkan Enabled
-pkg update && pkg install -y clang cmake ninja git libllvm
+### Endpoints
+- **`GET /cluster/state`**: Returns verified node identity, protocol version, active role, current model, and allocatable memory budget.
+- **`POST /cluster/model/load`**: Dispatches a model execution request to the target node.
+  ```json
+  {
+    "model_path": "qwen2.5-coder-7b.gguf",
+    "context_size": 4096,
+    "gpu_layers": 99,
+    "rpc_workers": ["192.168.1.105:50052"]
+  }
+  ```
+- **`POST /cluster/model/unload`**: Gracefully terminates the running `llama-server` process on that node.
 
-# Check Vulkan availability
-which vulkaninfo || pkg install -y vulkan-tools vulkan-loader-generic
+---
 
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
+## 5. TUI Target Node Selection & Dynamic Chat Routing
 
-# Build with Vulkan compute acceleration
-cmake -B build-vulkan \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_VULKAN=ON \
-  -DCMAKE_C_FLAGS="-O3 -march=armv8.2-a+dotprod+i8mm -mtune=cortex-x3" \
-  -DCMAKE_CXXFLAGS="-O3 -march=armv8.2-a+dotprod+i8mm -mtune=cortex-x3"
+### Target Node Selector Modal (`[F2: Models]`)
+When an operator selects a model in the Models view:
+1. The TUI queries `PeerRegistry` for all active, healthy nodes capable of inference.
+2. A selector modal is presented:
+   - `[1] Local Machine (Host)`
+   - `[2] Samsung Galaxy S23 (Termux - Vulkan, 8.5 GB allocatable)`
+   - `[3] Linux PC (CUDA, 16.0 GB allocatable)`
+3. On selection, the local TUI either spawns `ProcessSupervisor` directly (if Local) or transmits `POST /cluster/model/load` to the remote peer.
 
-ninja -C build-vulkan llama-server
+### Dynamic Chat Routing (`[F1: Chat]`)
+- The chat engine dynamically binds to whichever node is actively hosting the loaded model.
+- If the model is loaded on the phone, all connected TUI clients (on Mac, PC, or another phone) automatically update their chat client base URL to point to the phone's inference endpoint (`http://<PHONE_IP>:8080`).
+- Token streaming is delivered via standard Server-Sent Events (SSE).
 
+---
 
-For secondary Termux installations lacking Vulkan libraries, compile without -DGGML_VULKAN=ON to utilize the ARM NEON/DotProd CPU pipeline.
-Node B: Apple MacBook (macrowave, Debian 13 Intel Core 2 Duo P7550) - Client Only
-# Node B runs the Rust TUI client (nexus). Model inference is disabled.
-sudo apt-get update && sudo apt-get install -y cargo rustc build-essential git
+## 6. Configuration Specification (`~/.nexus/config.toml`)
 
-
-<!-- STREAMING_CHUNK:Defining configuration schema for nexus daemon -->
-5. Configuration Specification
-Global Config: ~/.nexus/config.toml
+```toml
 [node]
-id = "auto"
-name = "auto"
-role = "host" # "host" on S23 Ultra, "client" on Mac
-runtime_role = "host" # host, client, worker, or member
-capabilities = ["discovery"]
+id = "auto"                         # Persisted UUID generated on first run
+name = "auto"                       # Human-readable hostname
+role = "host"                       # Default role: host, client, worker, or member
 models_dir = "~/nexus-models"
 presets_dir = "~/.nexus/presets"
 
 [hardware.acceleration]
-prefer_gpu = true           # Prioritize Vulkan on Adreno 740
-gpu_layers = 99             # Offload all layers to Vulkan when available
-fallback_to_cpu = true      # Seamlessly drop to ARM CPU if Vulkan init fails
-cpu_threads = 6             # Optimal for Snapdragon 8 Gen 2 (1x X3 + 4x A715/A710)
-cpu_threads_batch = 6
+prefer_gpu = true                   # Prioritize Vulkan / GPU
+gpu_layers = 99                     # Max layer offload
+fallback_to_cpu = true              # Drop to CPU if GPU initialization fails
+cpu_threads = 6                     # Node-specific thread count
 
 [hardware.safety]
-max_ram_usage_percent = 75  # Guard against Android LMK SIGKILL (Signal 9)
+max_ram_usage_percent = 75          # Dynamic LMK ceiling on Android
 mmap = true
 mlock = false
 
@@ -196,7 +152,6 @@ discovery_port = 9999
 broadcast_interval_ms = 2000
 peer_timeout_ms = 6000
 static_peers = []
-# default_host = "http://127.0.0.1:8080"
 
 [network.discovery]
 enabled = true
@@ -206,7 +161,7 @@ peer_timeout_ms = 6000
 max_peers = 64
 
 [network.discovery.mdns]
-enabled = false # opt in on Android/Termux until real-device validation
+enabled = true
 service_type = "_nexus._tcp.local."
 
 [network.security]
@@ -214,7 +169,9 @@ protocol_version = 1
 require_pairing = false
 allowed_peer_ids = []
 
-[network.anchors]
-# Operator-controlled UUIDs; leave unset until the two anchors are paired.
-# primary_compute_id = "00000000-0000-0000-0000-000000000000"
-# primary_client_id = "00000000-0000-0000-0000-000000000000"
+[cluster]
+rpc_port = 50052
+max_rpc_ram_mb = 1800               # Default local ceiling if acting as an RPC worker
+auto_offload = true
+prefer_adb_tunnel = false
+```

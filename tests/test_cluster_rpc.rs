@@ -1,42 +1,53 @@
 use nexus::cluster::{
-    ClusterCoordinator, ClusterError, NODE_A_MAX_STANDALONE_MB, NODE_B_MAX_RPC_RAM_MB,
+    ClusterCoordinator, ClusterError, NodeBudget,
 };
 use nexus::config::NexusConfig;
 use nexus::tunnel::TransportMode;
+use uuid::Uuid;
 
 #[test]
 fn test_cluster_budget_calculation() {
-    // Case 1: Node A has plenty of RAM (16000 MB available) -> 75% is 12000 MB, capped at 8500 MB
+    // Dynamic budget: 75% of available RAM
+    // Case 1: Standalone host with 16000 MB available -> 75% is 12000 MB
     let budget_standalone = ClusterCoordinator::calculate_budget(16000, None);
-    assert_eq!(budget_standalone.host_max_mb, NODE_A_MAX_STANDALONE_MB);
+    assert_eq!(budget_standalone.host_max_mb, 12000);
     assert_eq!(budget_standalone.remote_max_mb, 0);
-    assert_eq!(budget_standalone.total_cluster_mb, NODE_A_MAX_STANDALONE_MB);
+    assert_eq!(budget_standalone.total_cluster_mb, 12000);
 
-    // Case 2: Node A has lower RAM (8000 MB available) -> 75% is 6000 MB
+    // Case 2: Host with lower RAM (8000 MB available) -> 75% is 6000 MB
     let budget_low_ram = ClusterCoordinator::calculate_budget(8000, None);
     assert_eq!(budget_low_ram.host_max_mb, 6000);
     assert_eq!(budget_low_ram.total_cluster_mb, 6000);
 
-    // Case 3: Node A (8500 MB cap) + Node B (3000 MB free) -> Node B capped at 1800 MB
-    let budget_cluster = ClusterCoordinator::calculate_budget(16000, Some(3000));
-    assert_eq!(budget_cluster.host_max_mb, NODE_A_MAX_STANDALONE_MB);
-    assert_eq!(budget_cluster.remote_max_mb, NODE_B_MAX_RPC_RAM_MB);
-    assert_eq!(budget_cluster.total_cluster_mb, NODE_A_MAX_STANDALONE_MB + NODE_B_MAX_RPC_RAM_MB);
+    // Case 3: Host with explicit cap (e.g., 8500 MB)
+    let budget_capped = ClusterCoordinator::calculate_dynamic_budget(16000, Some(8500), Some(1800));
+    assert_eq!(budget_capped.host_max_mb, 8500);
+    assert_eq!(budget_capped.remote_max_mb, 1800);
+    assert_eq!(budget_capped.total_cluster_mb, 10300);
 
-    // Case 4: Node B has less than 1800 MB (e.g. 1200 MB free)
-    let budget_cluster_constrained = ClusterCoordinator::calculate_budget(16000, Some(1200));
-    assert_eq!(budget_cluster_constrained.remote_max_mb, 1200);
-    assert_eq!(budget_cluster_constrained.total_cluster_mb, NODE_A_MAX_STANDALONE_MB + 1200);
+    // Case 4: Host + Remote worker with custom allocatable budget
+    let budget_cluster = ClusterCoordinator::calculate_budget(16000, Some(4000));
+    assert_eq!(budget_cluster.host_max_mb, 12000);
+    assert_eq!(budget_cluster.remote_max_mb, 4000);
+    assert_eq!(budget_cluster.total_cluster_mb, 16000);
+
+    // Case 5: NodeBudget profile calculation
+    let host_node = NodeBudget::new(Uuid::new_v4(), "host-node", 9000);
+    let worker_node = NodeBudget::new(Uuid::new_v4(), "worker-node", 3500);
+    let budget_from_nodes = ClusterCoordinator::calculate_from_nodes(&host_node, Some(&worker_node));
+    assert_eq!(budget_from_nodes.host_max_mb, 9000);
+    assert_eq!(budget_from_nodes.remote_max_mb, 3500);
+    assert_eq!(budget_from_nodes.total_cluster_mb, 12500);
 }
 
 #[test]
 fn test_cluster_layer_split_standalone_fit() {
-    let budget = ClusterCoordinator::calculate_budget(12000, Some(1800)); // Host cap: 8500 MB
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800));
     let model_size = 4000 * 1024 * 1024; // 4000 MB
     let kv_cache = 500 * 1024 * 1024;    // 500 MB
     let total_layers = 32;
 
-    // Fits in 8500 MB host budget -> 100% on Node A
+    // Fits in 8500 MB host budget -> 100% on Host
     let split = ClusterCoordinator::plan_layer_split(
         model_size,
         kv_cache,
@@ -55,7 +66,7 @@ fn test_cluster_layer_split_standalone_fit() {
 
 #[test]
 fn test_cluster_layer_split_overflow_offload() {
-    let budget = ClusterCoordinator::calculate_budget(12000, Some(1800)); // Host: 8500 MB, Remote: 1800 MB, Total: 10300 MB
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800)); // Host: 8500 MB, Remote: 1800 MB, Total: 10300 MB
     let model_size = 8500 * 1024 * 1024; // 8500 MB
     let kv_cache = 1000 * 1024 * 1024;   // 1000 MB (Total required: 9500 MB)
     let total_layers = 32;
@@ -86,7 +97,7 @@ fn test_cluster_layer_split_overflow_offload() {
 
 #[test]
 fn test_cluster_memory_cap_exceeded_rejection() {
-    let budget = ClusterCoordinator::calculate_budget(12000, Some(1800)); // Max 10300 MB
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800)); // Max 10300 MB
     let model_size = 11000 * 1024 * 1024; // 11000 MB
     let kv_cache = 1000 * 1024 * 1024;   // 1000 MB (Total 12000 MB)
 
@@ -109,7 +120,7 @@ fn test_cluster_memory_cap_exceeded_rejection() {
 
 #[test]
 fn test_cluster_missing_rpc_peer_rejection() {
-    let budget = ClusterCoordinator::calculate_budget(12000, None); // Standalone only (0 remote)
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), None); // Standalone only (0 remote)
     let model_size = 8500 * 1024 * 1024;
     let kv_cache = 1000 * 1024 * 1024; // Total 9500 MB (exceeds 8500 MB host)
 

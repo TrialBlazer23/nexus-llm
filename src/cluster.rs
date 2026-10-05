@@ -1,14 +1,19 @@
 use crate::gguf::GgufMetadata;
 use thiserror::Error;
+use uuid::Uuid;
 
-/// Maximum standalone RAM budget for Node A (Galaxy S23 Ultra) in Megabytes.
+/// Safety multiplier to guard against Out-Of-Memory (OOM) and Android Low Memory Killer (LMK).
+pub const LMK_SAFETY_PERCENT: f64 = 0.75;
+
+/// Default standalone RAM budget guideline in Megabytes.
+/// Deprecated: Memory budgets are now determined dynamically via SystemProfile.
+#[deprecated(note = "use dynamic host budget resolution")]
 pub const NODE_A_MAX_STANDALONE_MB: u64 = 8500;
 
-/// Strict maximum RAM allocation for rpc-server on Node B (Mac Core 2 Duo) in Megabytes.
+/// Default RAM allocation cap for constrained RPC workers in Megabytes.
+/// Deprecated: Worker caps are now configured via config.cluster.max_rpc_ram_mb or dynamic policy.
+#[deprecated(note = "use dynamic worker allocatable budget")]
 pub const NODE_B_MAX_RPC_RAM_MB: u64 = 1800;
-
-/// Safety multiplier to guard against Android Low Memory Killer (LMK).
-pub const LMK_SAFETY_PERCENT: f64 = 0.75;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ClusterError {
@@ -20,7 +25,7 @@ pub enum ClusterError {
         remote_max_mb: u64,
     },
 
-    #[error("No RPC worker available to offload {overflow_mb} MB beyond Node A's {host_max_mb} MB budget")]
+    #[error("No RPC worker available to offload {overflow_mb} MB beyond host's {host_max_mb} MB budget")]
     NoRpcWorkerAvailable {
         overflow_mb: u64,
         host_max_mb: u64,
@@ -30,7 +35,25 @@ pub enum ClusterError {
     InvalidLayerCount,
 }
 
-/// Represents the memory budget available across the heterogeneous cluster.
+/// Dynamic budget profile for an individual node in the cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeBudget {
+    pub node_id: Uuid,
+    pub name: String,
+    pub allocatable_mb: u64,
+}
+
+impl NodeBudget {
+    pub fn new(node_id: Uuid, name: impl Into<String>, allocatable_mb: u64) -> Self {
+        Self {
+            node_id,
+            name: name.into(),
+            allocatable_mb,
+        }
+    }
+}
+
+/// Represents the memory budget available across the cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterBudget {
     pub host_max_mb: u64,
@@ -38,7 +61,7 @@ pub struct ClusterBudget {
     pub total_cluster_mb: u64,
 }
 
-/// Resulting layer allocation decision between Node A and Node B.
+/// Resulting layer allocation decision between host and remote worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerSplitDecision {
     pub total_layers: u32,
@@ -76,13 +99,22 @@ impl LayerSplitDecision {
 pub struct ClusterCoordinator;
 
 impl ClusterCoordinator {
-    /// Calculate the available memory budget for the cluster.
-    /// Node A is capped at min(0.75 * host_available_mb, 8500 MB).
-    /// Node B is capped at min(remote_peer_available_mb, 1800 MB).
-    pub fn calculate_budget(host_avail_mb: u64, remote_peer_avail_mb: Option<u64>) -> ClusterBudget {
-        let host_lmk_ceiling = (host_avail_mb as f64 * LMK_SAFETY_PERCENT) as u64;
-        let host_max_mb = host_lmk_ceiling.min(NODE_A_MAX_STANDALONE_MB);
-        let remote_max_mb = remote_peer_avail_mb.map_or(0, |avail| avail.min(NODE_B_MAX_RPC_RAM_MB));
+    /// Calculate the available memory budget dynamically for a host and optional RPC worker(s).
+    ///
+    /// - `host_avail_mb`: Available physical RAM on the host node.
+    /// - `host_cap_mb`: Optional explicit allocation cap on the host. If None, 75% safety limit is used.
+    /// - `remote_peer_avail_mb`: Optional allocatable RAM on the chosen remote RPC worker.
+    pub fn calculate_dynamic_budget(
+        host_avail_mb: u64,
+        host_cap_mb: Option<u64>,
+        remote_peer_avail_mb: Option<u64>,
+    ) -> ClusterBudget {
+        let host_safety_budget = (host_avail_mb as f64 * LMK_SAFETY_PERCENT) as u64;
+        let host_max_mb = match host_cap_mb {
+            Some(cap) => host_safety_budget.min(cap),
+            None => host_safety_budget,
+        };
+        let remote_max_mb = remote_peer_avail_mb.unwrap_or(0);
         let total_cluster_mb = host_max_mb + remote_max_mb;
 
         ClusterBudget {
@@ -90,6 +122,27 @@ impl ClusterCoordinator {
             remote_max_mb,
             total_cluster_mb,
         }
+    }
+
+    /// Calculate memory budget for a target host and candidate RPC workers using NodeBudget profiles.
+    pub fn calculate_from_nodes(
+        host: &NodeBudget,
+        worker: Option<&NodeBudget>,
+    ) -> ClusterBudget {
+        let host_max_mb = host.allocatable_mb;
+        let remote_max_mb = worker.map_or(0, |w| w.allocatable_mb);
+        let total_cluster_mb = host_max_mb + remote_max_mb;
+
+        ClusterBudget {
+            host_max_mb,
+            remote_max_mb,
+            total_cluster_mb,
+        }
+    }
+
+    /// Calculate budget dynamically from host available RAM (scaled to 75% safety) and remote worker RAM.
+    pub fn calculate_budget(host_avail_mb: u64, remote_peer_avail_mb: Option<u64>) -> ClusterBudget {
+        Self::calculate_dynamic_budget(host_avail_mb, None, remote_peer_avail_mb)
     }
 
     /// Plan layer splitting using greedy host-first watermarking.
@@ -106,7 +159,7 @@ impl ClusterCoordinator {
 
         let total_required_mb = (model_size_bytes + exact_kv_bytes) / (1024 * 1024);
 
-        // Rule 1: Fits entirely within Node A's memory budget -> 100% on Node A
+        // Rule 1: Fits entirely within host's memory budget -> 100% local on host
         if total_required_mb <= budget.host_max_mb {
             return Ok(LayerSplitDecision {
                 total_layers,
@@ -117,7 +170,7 @@ impl ClusterCoordinator {
             });
         }
 
-        // Rule 2: Exceeds Node A -> Must have an RPC worker available
+        // Rule 2: Exceeds host -> Must have an RPC worker available
         let endpoint = match rpc_endpoint {
             Some(ep) if !ep.is_empty() && budget.remote_max_mb > 0 => ep.to_string(),
             _ => {
@@ -129,7 +182,7 @@ impl ClusterCoordinator {
             }
         };
 
-        // Rule 3: Exceeds total cluster capacity (Node A + Node B max) -> Reject early
+        // Rule 3: Exceeds total cluster capacity -> Reject early
         if total_required_mb > budget.total_cluster_mb {
             return Err(ClusterError::ClusterMemoryCapExceeded {
                 required_mb: total_required_mb,
@@ -148,7 +201,7 @@ impl ClusterCoordinator {
             remote_layers = 1;
         }
         if remote_layers >= total_layers {
-            remote_layers = total_layers - 1; // Node A must run at least 1 layer (greedy host)
+            remote_layers = total_layers - 1; // Host must run at least 1 layer (greedy host)
         }
         let host_layers = total_layers - remote_layers;
 

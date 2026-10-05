@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubTab {
@@ -50,6 +51,44 @@ impl HubTab {
     }
 }
 
+/// Target execution node option for running model weights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetExecutionNode {
+    Local {
+        allocatable_mb: u64,
+        backend: String,
+    },
+    Remote {
+        uuid: Uuid,
+        name: String,
+        endpoint: String,
+        free_ram_mb: u32,
+        backend: String,
+    },
+}
+
+impl TargetExecutionNode {
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Local { allocatable_mb, backend } => {
+                format!("🖥️  Local Machine (This Device) - {} MB allocatable | {}", allocatable_mb, backend)
+            }
+            Self::Remote { name, endpoint, free_ram_mb, backend, .. } => {
+                format!("📱 {} ({}) - {} MB free | {}", name, endpoint, free_ram_mb, backend)
+            }
+        }
+    }
+}
+
+/// Active state when the Target Node Selection modal is visible.
+#[derive(Debug, Clone)]
+pub struct TargetSelectionState {
+    pub model_path: PathBuf,
+    pub model_name: String,
+    pub candidates: Vec<TargetExecutionNode>,
+    pub selected_idx: usize,
+}
+
 pub struct HubApp {
     pub config: NexusConfig,
     pub discovery: Arc<DiscoveryService>,
@@ -62,6 +101,7 @@ pub struct HubApp {
     pub supervisor: Option<ProcessSupervisor>,
     pub active_model_name: String,
     pub pending_hot_swap_path: Option<PathBuf>,
+    pub pending_target_selection: Option<TargetSelectionState>,
     pub status_message: Option<(String, Color)>,
 }
 
@@ -85,6 +125,7 @@ impl HubApp {
             supervisor: None,
             active_model_name: "None (Idle)".to_string(),
             pending_hot_swap_path: None,
+            pending_target_selection: None,
             status_message: None,
         }
     }
@@ -124,6 +165,106 @@ impl HubApp {
         });
     }
 
+    /// Open target execution device selector modal for a model.
+    pub async fn open_target_selection(&mut self, model_path: PathBuf) {
+        let model_name = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let profile = SystemProfile::probe();
+        let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+        let mut candidates = vec![TargetExecutionNode::Local {
+            allocatable_mb: local_cap_mb,
+            backend: profile.detected_backend.to_string(),
+        }];
+
+        let peers = self.discovery.get_active_peers().await;
+        for p in peers {
+            if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
+                let short_id = p.uuid.to_string();
+                let name = format!("Node-{}", &short_id[..8]);
+                candidates.push(TargetExecutionNode::Remote {
+                    uuid: p.uuid,
+                    name,
+                    endpoint: p.api_endpoint(),
+                    free_ram_mb: p.free_ram_mb,
+                    backend: p.backend.to_string(),
+                });
+            }
+        }
+
+        self.pending_target_selection = Some(TargetSelectionState {
+            model_path,
+            model_name,
+            candidates,
+            selected_idx: 0,
+        });
+    }
+
+    /// Confirm and execute the selected target node.
+    pub async fn execute_target_selection(&mut self) {
+        if let Some(state) = self.pending_target_selection.take() {
+            if let Some(target) = state.candidates.get(state.selected_idx) {
+                match target {
+                    TargetExecutionNode::Local { .. } => {
+                        self.request_model_load(state.model_path).await;
+                    }
+                    TargetExecutionNode::Remote { endpoint, name, .. } => {
+                        let client = reqwest::Client::new();
+                        let req = crate::control_plane::ModelLoadRequest {
+                            protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
+                            requester_id: self.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
+                            model_path: state.model_name.clone(),
+                            context_size: 4096,
+                            gpu_layers: if self.config.hardware.acceleration.prefer_gpu { 99 } else { 0 },
+                            threads: self.config.hardware.acceleration.cpu_threads,
+                            rpc_workers: Vec::new(),
+                        };
+
+                        info!("Dispatching remote model load to {}: {:?}", endpoint, req);
+                        match crate::control_plane::dispatch_load_model(&client, endpoint, &req).await {
+                            Ok(resp) if resp.success => {
+                                self.active_model_name = state.model_name.clone();
+                                let target_api = if !resp.api_endpoint.is_empty() {
+                                    resp.api_endpoint
+                                } else {
+                                    endpoint.clone()
+                                };
+                                self.chat.client = NexusClient::new(target_api.clone());
+                                self.chat.model_name = state.model_name.clone();
+                                self.chat.messages.clear();
+                                self.chat.messages.push(ChatMessage::assistant(format!(
+                                    "Connected to remote model '{}' running on {}. Ready for inference.",
+                                    state.model_name, name
+                                )));
+                                self.status_message = Some((
+                                    format!("Active on {}: {}", name, state.model_name),
+                                    Color::Green,
+                                ));
+                                self.set_tab(HubTab::Chat);
+                            }
+                            Ok(resp) => {
+                                let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
+                                self.status_message = Some((
+                                    format!("Remote load failed on {}: {}", name, err),
+                                    Color::Red,
+                                ));
+                            }
+                            Err(e) => {
+                                self.status_message = Some((
+                                    format!("Remote dispatch failed to {}: {}", name, e),
+                                    Color::Red,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Request to launch a model. If a model is already active, prompts for hot-swap confirmation.
     pub async fn request_model_load(&mut self, model_path: PathBuf) {
         if self.supervisor.is_some() {
@@ -133,7 +274,7 @@ impl HubApp {
         }
     }
 
-    /// Stop any active supervisor and load the new model process.
+    /// Stop any active supervisor and load the new model process locally.
     pub async fn execute_model_load(&mut self, model_path: PathBuf) {
         if let Some(mut old_sup) = self.supervisor.take() {
             info!("Unloading active model supervisor...");
@@ -154,7 +295,7 @@ impl HubApp {
             0
         };
 
-        // Check if model overflows Node A's memory budget
+        // Check if model overflows local host memory budget
         let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
         let kv_bytes = SystemProfile::estimate_kv_cache_bytes(4096);
         let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
@@ -162,9 +303,7 @@ impl HubApp {
 
         let mut extra_args = Vec::new();
 
-        if total_required_mb > host_cap_mb
-            || total_required_mb > crate::cluster::NODE_A_MAX_STANDALONE_MB
-        {
+        if total_required_mb > host_cap_mb {
             let rpc_peer = self
                 .discovery
                 .select_rpc_candidate(crate::discovery::RpcSelectionPolicy {
@@ -275,6 +414,11 @@ impl HubApp {
         if let Some(target_path) = &self.pending_hot_swap_path {
             self.render_hot_swap_modal(frame, area, target_path);
         }
+
+        // Render target node selection modal if triggered
+        if let Some(target_state) = &self.pending_target_selection {
+            self.render_target_selection_modal(frame, area, target_state);
+        }
     }
 
     fn render_top_tabs(&self, frame: &mut Frame, area: Rect) {
@@ -322,6 +466,8 @@ impl HubApp {
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(active_str, Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [C] Connect Peer ", Style::default().fg(Color::Cyan)),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(" [Ctrl+C] Quit", Style::default().fg(Color::Red)),
         ]);
 
@@ -368,6 +514,62 @@ impl HubApp {
                 .title(" Hot-Swap ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
+        );
+
+        frame.render_widget(block, modal_area);
+    }
+
+    fn render_target_selection_modal(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        state: &TargetSelectionState,
+    ) {
+        let modal_area = centered_rect(75, 45, area);
+        frame.render_widget(Clear, modal_area);
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                " Select Target Execution Device ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(
+                format!("Model: {} | Choose device to run weights:\n", state.model_name),
+                Style::default().fg(Color::White),
+            )]),
+        ];
+
+        for (i, candidate) in state.candidates.iter().enumerate() {
+            let is_sel = i == state.selected_idx;
+            let prefix = if is_sel { " > " } else { "   " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(format!("[{}] {}", i, candidate.display_label()), style),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            " [↑ / ↓] Navigate  |  [Enter] Confirm & Launch  |  [Esc] Cancel ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+
+        let block = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Target Node Selection ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
         );
 
         frame.render_widget(block, modal_area);
@@ -423,6 +625,38 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         break;
                     }
 
+                    // Target Selection modal handling
+                    if let Some(target_state) = &mut hub.pending_target_selection {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if target_state.selected_idx > 0 {
+                                    target_state.selected_idx -= 1;
+                                } else if !target_state.candidates.is_empty() {
+                                    target_state.selected_idx = target_state.candidates.len() - 1;
+                                }
+                                continue;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !target_state.candidates.is_empty() {
+                                    target_state.selected_idx = (target_state.selected_idx + 1) % target_state.candidates.len();
+                                }
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                hub.execute_target_selection().await;
+                                continue;
+                            }
+                            KeyCode::Esc => {
+                                hub.pending_target_selection = None;
+                                hub.status_message = Some(("Target selection cancelled".to_string(), Color::DarkGray));
+                                continue;
+                            }
+                            _ => {
+                                continue;
+                            }
+                        }
+                    }
+
                     // Hot-Swap modal handling
                     if let Some(target_path) = hub.pending_hot_swap_path.take() {
                         match key.code {
@@ -456,6 +690,25 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.next_tab();
                             } else if key.code == KeyCode::BackTab {
                                 hub.previous_tab();
+                            } else if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C') {
+                                let peers = hub.discovery.get_active_peers().await;
+                                if let Some(active_peer) = peers.iter().find(|p| !p.active_model.is_empty() || p.status.is_ready()) {
+                                    let ep = active_peer.api_endpoint();
+                                    let model = if !active_peer.active_model.is_empty() {
+                                        active_peer.active_model.clone()
+                                    } else {
+                                        "cluster-model".to_string()
+                                    };
+                                    hub.chat.client = NexusClient::new(ep.clone());
+                                    hub.chat.model_name = model.clone();
+                                    hub.active_model_name = model.clone();
+                                    hub.status_message = Some((format!("Connected to cluster host at {}", ep), Color::Green));
+                                    hub.chat.messages.push(ChatMessage::assistant(format!(
+                                        "Connected to active cluster host at {}. Ready for chat.", ep
+                                    )));
+                                } else {
+                                    hub.status_message = Some(("No active cluster host found".to_string(), Color::Yellow));
+                                }
                             } else {
                                 hub.chat.handle_key_input(key, &tx);
                             }
@@ -468,7 +721,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 KeyCode::Enter => {
                                     if let Some(m) = hub.models_view.selected_model() {
                                         let path = m.path.clone();
-                                        hub.request_model_load(path).await;
+                                        hub.open_target_selection(path).await;
                                     }
                                 }
                                 KeyCode::Tab => hub.next_tab(),

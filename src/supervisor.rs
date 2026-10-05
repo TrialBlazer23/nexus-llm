@@ -479,6 +479,62 @@ impl Drop for ProcessSupervisor {
     }
 }
 
+/// Shared thread-safe handle to manage an active ProcessSupervisor instance.
+#[derive(Clone, Default)]
+pub struct SupervisorManager {
+    inner: std::sync::Arc<tokio::sync::Mutex<Option<ProcessSupervisor>>>,
+}
+
+impl SupervisorManager {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Check if a supervisor child process is currently running and healthy.
+    pub async fn is_healthy(&self) -> bool {
+        let lock = self.inner.lock().await;
+        if let Some(sup) = lock.as_ref() {
+            sup.is_healthy().await
+        } else {
+            false
+        }
+    }
+
+    /// Return the active model path/name if currently running.
+    pub async fn active_model(&self) -> Option<String> {
+        let lock = self.inner.lock().await;
+        lock.as_ref().map(|sup| {
+            sup.config()
+                .model_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "active_model".to_string())
+        })
+    }
+
+    /// Spawn a new model supervisor, stopping any previously running instance.
+    pub async fn spawn(&self, config: LlamaServerConfig) -> Result<(), SupervisorError> {
+        let mut lock = self.inner.lock().await;
+        if let Some(mut existing) = lock.take() {
+            let _ = existing.stop().await;
+        }
+        let sup = ProcessSupervisor::spawn_with_fallback(config).await?;
+        *lock = Some(sup);
+        Ok(())
+    }
+
+    /// Stop the active model supervisor.
+    pub async fn stop(&self) -> Result<(), SupervisorError> {
+        let mut lock = self.inner.lock().await;
+        if let Some(mut existing) = lock.take() {
+            existing.stop().await?;
+        }
+        Ok(())
+    }
+}
+
 /// Helper to check if binary is in PATH
 fn is_in_path<P: AsRef<Path>>(binary: P) -> bool {
     let binary = binary.as_ref();

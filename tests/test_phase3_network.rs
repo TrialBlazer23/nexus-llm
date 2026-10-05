@@ -1,4 +1,4 @@
-use nexus::config::NexusConfig;
+ use nexus::config::NexusConfig;
 use nexus::control_plane::{validate_state, ControlPlaneState, CONTROL_PLANE_VERSION};
 use nexus::discovery::{
     DiscoveryEvent, DiscoveryService, NodeRole, RpcSelectionPolicy, ServiceEndpoint, StatusFlags,
@@ -158,7 +158,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         })
         .await
         .unwrap();
-    assert_eq!(candidate.allocatable_mb, 1800);
+    assert_eq!(candidate.allocatable_mb, 2200);
     assert_eq!(candidate.peer.uuid, worker_id);
 
     beacon_peer.thermal_index = 90;
@@ -203,4 +203,45 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
     );
 
     assert!(discovery.resolve_primary_compute_anchor().await.is_none());
+}
+
+#[tokio::test]
+async fn control_plane_model_dispatch_serialization_and_handling() {
+    use nexus::control_plane::{
+        handle_load_model, handle_unload_model, ModelLoadRequest, ModelUnloadRequest,
+        CONTROL_PLANE_VERSION,
+    };
+    use nexus::supervisor::SupervisorManager;
+
+    let requester_id = Uuid::new_v4();
+    let load_req = ModelLoadRequest {
+        protocol_version: CONTROL_PLANE_VERSION,
+        requester_id,
+        model_path: "non_existent_model.gguf".to_string(),
+        context_size: 4096,
+        gpu_layers: 99,
+        threads: 4,
+        rpc_workers: vec!["192.168.1.50:50052".to_string()],
+    };
+
+    // Serialize and deserialize round-trip
+    let json = serde_json::to_string(&load_req).expect("Serialization failed");
+    let deserialized: ModelLoadRequest = serde_json::from_str(&json).expect("Deserialization failed");
+    assert_eq!(load_req, deserialized);
+
+    // Test server handler with SupervisorManager (expect model not found error for non-existent model)
+    let manager = SupervisorManager::new();
+    let response = handle_load_model(&manager, &load_req, "127.0.0.1", 8080).await;
+    assert_eq!(response.protocol_version, CONTROL_PLANE_VERSION);
+    assert!(!response.success);
+    assert!(response.error_message.is_some());
+
+    // Test unload handler
+    let unload_req = ModelUnloadRequest {
+        protocol_version: CONTROL_PLANE_VERSION,
+        requester_id,
+        model_path: None,
+    };
+    let unload_resp = handle_unload_model(&manager, &unload_req).await;
+    assert!(unload_resp.success);
 }

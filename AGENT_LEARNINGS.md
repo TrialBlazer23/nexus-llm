@@ -24,3 +24,19 @@ avoid repeating known mistakes.
 - Action: The fix, workaround, or rule to follow.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
+
+---
+
+## 2026-10-05 — Windows Host Tooling: Cargo Only Available in WSL
+- Category: environment
+- Context: Running build and test verification on Windows host.
+- Finding: Native Windows PowerShell does not have `cargo` in PATH. Attempting `cargo test` in PowerShell fails with `CommandNotFoundException`. However, WSL has Rust 1.99 and full build tooling installed in `/home/hylan/.cargo/bin`.
+- Action: Always invoke Cargo tooling inside WSL using a login shell: `wsl bash -l -c "cd /mnt/c/nexus-llm && cargo <command>"`.
+- Verification: Ran `wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"` and verified all 58 tests passed.
+
+## 2026-10-05 — Transition from Asymmetric Anchors to Symmetric N-Node Mesh
+- Category: design-decision
+- Context: Planning network expansion and multi-device usability.
+- Finding: Hardcoding Node A (S23 Ultra) and Node B (MacBook) as fixed anchors limited flexibility when adding new devices or when the operator wants to choose execution targets and chat from any connected node.
+- Action: Transitioned system architecture to a symmetric N-node peer mesh where any node can be an Inference Host, an RPC Worker, or a TUI Client based on dynamic capability advertisement and local memory constraints. Updated `AGENTS.md`, `DESIGN_SPEC.md`, and `BUILD_PLAN.md` to reflect this Single Source of Truth.
+- Verification: Confirmed documentation hierarchy is aligned; code changes staged across Phases B through D.

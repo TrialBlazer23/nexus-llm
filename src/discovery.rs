@@ -816,8 +816,7 @@ impl DiscoveryService {
             })
             .map(|peer| {
                 let allocatable_mb = u64::from(peer.free_ram_mb)
-                    .min(policy.max_allocatable_mb)
-                    .min(crate::cluster::NODE_B_MAX_RPC_RAM_MB);
+                    .min(policy.max_allocatable_mb);
                 RpcCandidate {
                     rationale: format!(
                         "healthy RPC-ready peer; allocatable budget capped at {} MB",

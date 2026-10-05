@@ -117,11 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut extra_args = Vec::new();
 
-        if total_required_mb > host_cap_mb
-            || total_required_mb > nexus::cluster::NODE_A_MAX_STANDALONE_MB
-        {
+        if total_required_mb > host_cap_mb {
             info!(
-                "Model memory requirement ({} MB) exceeds Node A standalone budget ({} MB). Evaluating cluster offload...",
+                "Model memory requirement ({} MB) exceeds host standalone budget ({} MB). Evaluating cluster offload...",
                 total_required_mb, host_cap_mb
             );
 

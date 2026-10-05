@@ -135,3 +135,168 @@ pub async fn fetch_state(
     serde_json::from_slice(&bytes)
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelLoadRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub model_path: String,
+    pub context_size: usize,
+    pub gpu_layers: u32,
+    pub threads: usize,
+    pub rpc_workers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelLoadResponse {
+    pub protocol_version: u16,
+    pub success: bool,
+    pub active_model: String,
+    pub api_endpoint: String,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelUnloadRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub model_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelUnloadResponse {
+    pub protocol_version: u16,
+    pub success: bool,
+    pub message: String,
+}
+
+pub async fn dispatch_load_model(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &ModelLoadRequest,
+) -> Result<ModelLoadResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/model/load");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(10))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_unload_model(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &ModelUnloadRequest,
+) -> Result<ModelUnloadResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/model/unload");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(5))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn handle_load_model(
+    manager: &crate::supervisor::SupervisorManager,
+    request: &ModelLoadRequest,
+    api_host: &str,
+    api_port: u16,
+) -> ModelLoadResponse {
+    let raw_path = std::path::PathBuf::from(&request.model_path);
+    let model_path = if raw_path.exists() {
+        raw_path
+    } else {
+        let filename = raw_path.file_name().unwrap_or(raw_path.as_os_str());
+        let default_models_dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("nexus-models"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("models"));
+        let candidate = default_models_dir.join(filename);
+        if candidate.exists() {
+            candidate
+        } else {
+            raw_path
+        }
+    };
+    let model_name = model_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| request.model_path.clone());
+
+    let mut extra_args = Vec::new();
+    for worker in &request.rpc_workers {
+        extra_args.push("--rpc".to_string());
+        extra_args.push(worker.clone());
+        extra_args.push("--split-mode".to_string());
+        extra_args.push("layer".to_string());
+    }
+
+    let config = crate::supervisor::LlamaServerConfig {
+        binary_path: std::path::PathBuf::from("llama-server"),
+        model_path,
+        host: api_host.to_string(),
+        port: api_port,
+        gpu_layers: request.gpu_layers,
+        threads: request.threads,
+        context_size: request.context_size,
+        extra_args,
+    };
+
+    match manager.spawn(config).await {
+        Ok(()) => ModelLoadResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: true,
+            active_model: model_name,
+            api_endpoint: format!("http://{}:{}", api_host, api_port),
+            error_message: None,
+        },
+        Err(e) => ModelLoadResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            active_model: String::new(),
+            api_endpoint: String::new(),
+            error_message: Some(e.to_string()),
+        },
+    }
+}
+
+pub async fn handle_unload_model(
+    manager: &crate::supervisor::SupervisorManager,
+    _request: &ModelUnloadRequest,
+) -> ModelUnloadResponse {
+    match manager.stop().await {
+        Ok(()) => ModelUnloadResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: true,
+            message: "Model unloaded successfully".to_string(),
+        },
+        Err(e) => ModelUnloadResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            message: format!("Failed to unload model: {}", e),
+        },
+    }
+}

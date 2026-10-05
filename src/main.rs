@@ -7,6 +7,7 @@ use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
 use nexus::sysinfo::SystemProfile;
+use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
 use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
 use nexus::ui::chat::{run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
@@ -27,6 +28,29 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run the local inference host and advertise it on the network
+    Host {
+        /// Path to GGUF model file to load
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// API host address to bind
+        #[arg(long)]
+        host: Option<String>,
+
+        /// API port to listen on
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Context size in tokens
+        #[arg(short = 'c', long, default_value_t = 4096)]
+        ctx: usize,
+
+        /// Path to llama-server binary
+        #[arg(long, default_value = "llama-server")]
+        binary: PathBuf,
+    },
+
     /// Probe hardware and display memory and acceleration profile
     Info,
 
@@ -91,7 +115,8 @@ enum Commands {
     },
 
     /// Run as an RPC compute worker on Node B (MacBook) to receive offloaded model layers
-    Rpc {
+    #[command(name = "worker", alias = "rpc")]
+    Worker {
         /// TCP port to bind rpc-server (default: 50052)
         #[arg(short, long, default_value_t = 50052)]
         port: u16,
@@ -126,6 +151,10 @@ enum Commands {
         #[arg(long)]
         host: Option<String>,
 
+        /// Discovered node UUID or configured node name
+        #[arg(long)]
+        node: Option<String>,
+
         /// Preferred transport mode: auto (USB priority with Wi-Fi fallback), usb (force ADB), wifi (subnet only)
         #[arg(short = 't', long, default_value = "auto")]
         transport: String,
@@ -151,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
-            let config = NexusConfig::load().unwrap_or_default();
+            let config = NexusConfig::load()?;
             let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
             let _listener = discovery.clone().start_listener();
 
@@ -175,6 +204,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match command {
+        Commands::Host { model, host, port, ctx, binary } => {
+            let config = NexusConfig::load()?;
+            let profile = SystemProfile::probe();
+            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let _broadcaster = discovery.clone().start_broadcaster();
+            let _listener = discovery.clone().start_listener();
+            let server_cfg = LlamaServerConfig {
+                binary_path: binary,
+                model_path: model,
+                host: host.unwrap_or(config.network.api_host),
+                port: port.unwrap_or(config.network.api_port),
+                gpu_layers: if config.hardware.acceleration.prefer_gpu {
+                    config.hardware.acceleration.gpu_layers
+                } else {
+                    0
+                },
+                threads: profile.recommended_threads,
+                context_size: ctx,
+                extra_args: Vec::new(),
+            };
+            let mut supervisor = ProcessSupervisor::spawn_with_fallback(server_cfg).await?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = supervisor.wait() => {}
+            }
+            supervisor.stop().await?;
+        }
+
         Commands::Info => {
             let profile = SystemProfile::probe();
             let max_allowed_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
@@ -341,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Rpc { port, mem, binary } => {
+        Commands::Worker { port, mem, binary } => {
             println!("=== Nexus-LLM RPC Compute Worker (Node B) ===");
             if mem > 1800 {
                 eprintln!("WARNING: RAM allocation ({} MB) exceeds recommended 1800 MB limit for Node B safety!", mem);
@@ -424,8 +481,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Client { host, transport, prompt, model, preset } => {
-            let config = NexusConfig::load().unwrap_or_default();
+        Commands::Client { host, node, transport, prompt, model, preset } => {
+            let config = NexusConfig::load()?;
             let trans_mode = transport.parse::<TransportMode>().unwrap_or(TransportMode::Auto);
 
             let (usb_endpoint, is_usb) = if host.is_none() {
@@ -446,7 +503,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _listener = discovery.clone().start_listener();
                     discovery.send_probe().await;
                     println!("Auto-discovering compute host on subnet (Wi-Fi)...");
-                    NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10)).await?
+                    if let Some(node_selector) = node {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let selector = node_selector.to_lowercase();
+                        let peer = discovery
+                            .get_active_peers()
+                            .await
+                            .into_iter()
+                            .find(|peer| {
+                                peer.uuid.to_string().to_lowercase() == selector
+                            })
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("No discovered node matches '{}'", node_selector),
+                                )
+                            })?;
+                        NexusClient::new(peer.api_endpoint())
+                    } else {
+                        NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10)).await?
+                    }
                 }
             };
 

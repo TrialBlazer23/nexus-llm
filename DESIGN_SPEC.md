@@ -166,6 +166,8 @@ Global Config: ~/.nexus/config.toml
 id = "auto"
 name = "auto"
 role = "host" # "host" on S23 Ultra, "client" on Mac
+runtime_role = "host" # host, client, worker, or member
+capabilities = ["discovery"]
 models_dir = "~/nexus-models"
 presets_dir = "~/.nexus/presets"
 
@@ -188,5 +190,25 @@ discovery_port = 9999
 broadcast_interval_ms = 2000
 peer_timeout_ms = 6000
 static_peers = []
+# default_host = "http://127.0.0.1:8080"
 
+[network.discovery]
+enabled = true
+protocol_version = 1
+broadcast_interval_ms = 2000
+peer_timeout_ms = 6000
+max_peers = 64
 
+[network.discovery.mdns]
+enabled = false # opt in on Android/Termux until real-device validation
+service_type = "_nexus._tcp.local."
+
+[network.security]
+protocol_version = 1
+require_pairing = false
+allowed_peer_ids = []
+
+[network.anchors]
+# Operator-controlled UUIDs; leave unset until the two anchors are paired.
+# primary_compute_id = "00000000-0000-0000-0000-000000000000"
+# primary_client_id = "00000000-0000-0000-0000-000000000000"

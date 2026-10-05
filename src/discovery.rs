@@ -11,6 +11,36 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+pub const NEXUS_MDNS_SERVICE_TYPE: &str = "_nexus._tcp.local.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHealth {
+    Started,
+    Healthy,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEndpoint {
+    pub node_id: Uuid,
+    pub cluster_id: Option<Uuid>,
+    pub protocol_version: u16,
+    pub role: NodeRole,
+    pub capabilities: Vec<String>,
+    pub addresses: Vec<SocketAddr>,
+    pub api_port: u16,
+    pub rpc_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveryEvent {
+    ServiceFound(ServiceEndpoint),
+    ServiceUpdated(ServiceEndpoint),
+    ServiceRemoved { node_id: Uuid },
+    BackendHealth { backend: &'static str, health: BackendHealth },
+}
+
 pub const BEACON_MAGIC: u32 = 0x4E585553; // "NXUS"
 pub const BEACON_VERSION: u8 = 0x01;
 pub const BEACON_PACKET_SIZE: usize = 64;
@@ -287,6 +317,19 @@ impl PeerNode {
     pub fn rpc_endpoint(&self) -> String {
         format!("{}:{}", self.addr.ip(), self.rpc_port)
     }
+
+    pub fn service_endpoint(&self) -> ServiceEndpoint {
+        ServiceEndpoint {
+            node_id: self.uuid,
+            cluster_id: None,
+            protocol_version: 1,
+            role: self.role,
+            capabilities: Vec::new(),
+            addresses: vec![self.addr],
+            api_port: self.api_port,
+            rpc_port: self.rpc_port,
+        }
+    }
 }
 
 /// Autonomous UDP discovery and peer caching service.
@@ -301,7 +344,9 @@ pub struct DiscoveryService {
 
 impl DiscoveryService {
     pub fn new(config: NexusConfig, custom_uuid: Option<Uuid>) -> Self {
-        let node_uuid = custom_uuid.unwrap_or_else(Uuid::new_v4);
+        let node_uuid = custom_uuid
+            .or_else(|| config.node_uuid().ok())
+            .unwrap_or_else(Uuid::new_v4);
         let default_status = if config.hardware.acceleration.prefer_gpu {
             StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0)
         } else {
@@ -456,6 +501,10 @@ impl DiscoveryService {
     /// Spawn asynchronous UDP beacon broadcaster task.
     pub fn start_broadcaster(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if !self.config.network.discovery.enabled {
+                info!("Discovery broadcaster disabled by configuration");
+                return;
+            }
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -517,16 +566,51 @@ impl DiscoveryService {
 
     /// Spawn asynchronous UDP listener task to receive and record beacons.
     pub fn start_listener(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        Self::start_listener_inner(self, None)
+    }
+
+    pub fn start_listener_with_events(
+        self: Arc<Self>,
+    ) -> (tokio::sync::mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        let task = Self::start_listener_inner(self, Some(sender));
+        (receiver, task)
+    }
+
+    fn start_listener_inner(
+        self: Arc<Self>,
+        events: Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if !self.config.network.discovery.enabled {
+                info!("Discovery listener disabled by configuration");
+                return;
+            }
             let socket = match create_listener_socket(self.config.network.discovery_port) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to bind discovery listener to port {}: {}", self.config.network.discovery_port, e);
+                    if let Some(sender) = &events {
+                        let _ = sender
+                            .send(DiscoveryEvent::BackendHealth {
+                                backend: "udp",
+                                health: BackendHealth::Failed,
+                            })
+                            .await;
+                    }
                     return;
                 }
             };
 
             info!("Discovery listener active on port {}", self.config.network.discovery_port);
+            if let Some(sender) = &events {
+                let _ = sender
+                    .send(DiscoveryEvent::BackendHealth {
+                        backend: "udp",
+                        health: BackendHealth::Healthy,
+                    })
+                    .await;
+            }
             let mut buf = [0u8; 128];
 
             loop {
@@ -557,7 +641,16 @@ impl DiscoveryService {
                                     };
 
                                     let mut peers = self.peers.write().await;
+                                    let event = if peers.contains_key(&beacon.uuid) {
+                                        DiscoveryEvent::ServiceUpdated(peer.service_endpoint())
+                                    } else {
+                                        DiscoveryEvent::ServiceFound(peer.service_endpoint())
+                                    };
                                     peers.insert(beacon.uuid, peer);
+                                    drop(peers);
+                                    if let Some(sender) = &events {
+                                        let _ = sender.send(event).await;
+                                    }
 
                                     // If this node is a host and received a client beacon/probe, reply unicast immediately
                                     let is_host_node = NodeRole::from_str_role(&self.config.node.role).is_host();
@@ -729,5 +822,3 @@ pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
 pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
     Vec::new()
 }
-
-

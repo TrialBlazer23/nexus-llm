@@ -1,9 +1,11 @@
 use nexus::config::{expand_tilde, NexusConfig};
+use nexus::discovery::DiscoveryService;
 use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor, SupervisorError};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::io::Write;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
+use uuid::Uuid;
 
 #[test]
 fn test_sysinfo_probing() {
@@ -160,6 +162,48 @@ default_host = "http://10.0.0.1:8080"
         toml::from_str(&serialized).expect("Failed to deserialize fallback config");
     assert_eq!(round_trip.network.static_peers, parsed.network.static_peers);
     assert_eq!(round_trip.network.default_host, parsed.network.default_host);
+}
+
+#[test]
+fn test_config_persists_identity_on_first_load() {
+    let file = NamedTempFile::new().expect("temporary config file");
+    std::fs::write(file.path(), "[node]\nrole = \"client\"\n").expect("write legacy config");
+
+    let loaded = NexusConfig::load_from_path(file.path()).expect("load config");
+    assert_ne!(loaded.node.id, "auto");
+    assert!(Uuid::parse_str(&loaded.node.id).is_ok());
+
+    let reloaded = NexusConfig::load_from_path(file.path()).expect("reload config");
+    assert_eq!(loaded.node.id, reloaded.node.id);
+}
+
+#[test]
+fn test_config_discovery_security_defaults_are_backward_compatible() {
+    let parsed: NexusConfig = toml::from_str("[network]\napi_port = 9090\n")
+        .expect("parse legacy network config");
+    assert!(parsed.network.discovery.enabled);
+    assert_eq!(parsed.network.discovery.protocol_version, 1);
+    assert_eq!(parsed.network.security.protocol_version, 1);
+    assert!(!parsed.network.security.require_pairing);
+    assert!(!parsed.network.discovery.mdns.enabled);
+}
+
+#[test]
+fn test_config_rejects_invalid_loaded_role() {
+    let file = NamedTempFile::new().expect("temporary config file");
+    std::fs::write(file.path(), "[node]\nrole = \"invalid\"\n")
+        .expect("write invalid config");
+    let result = NexusConfig::load_from_path(file.path());
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_discovery_uses_configured_identity() {
+    let expected = Uuid::new_v4();
+    let mut config = NexusConfig::default();
+    config.node.id = expected.to_string();
+    let discovery = DiscoveryService::new(config, None);
+    assert_eq!(discovery.node_uuid(), expected);
 }
 
 #[test]

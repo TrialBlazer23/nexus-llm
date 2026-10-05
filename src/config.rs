@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -14,6 +15,9 @@ pub enum ConfigError {
 
     #[error("Failed to serialize TOML configuration: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
+
+    #[error("Invalid configuration: {0}")]
+    Invalid(String),
 }
 
 /// Root configuration representation for ~/.nexus/config.toml
@@ -55,7 +59,9 @@ impl NexusConfig {
 
         if !path.exists() {
             info!("Configuration file not found at {:?}. Generating default configuration.", path);
-            let default_cfg = Self::default();
+            let mut default_cfg = Self::default();
+            default_cfg.ensure_identity()?;
+            default_cfg.validate()?;
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -68,10 +74,57 @@ impl NexusConfig {
 
     /// Load configuration from a specified file path.
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = fs::read_to_string(path)?;
-        let config: NexusConfig = toml::from_str(&content)?;
+        let content = fs::read_to_string(path.as_ref())?;
+        let mut config: NexusConfig = toml::from_str(&content)?;
+        config.ensure_identity()?;
+        config.validate()?;
+        if config.node.id != config.original_id_from_content(&content)? {
+            config.save_to_path(path.as_ref())?;
+        }
         debug!("Loaded configuration: {:?}", config);
         Ok(config)
+    }
+
+    fn original_id_from_content(&self, content: &str) -> Result<String, ConfigError> {
+        let raw: NexusConfig = toml::from_str(content)?;
+        Ok(raw.node.id)
+    }
+
+    fn ensure_identity(&mut self) -> Result<(), ConfigError> {
+        if self.node.id.trim().is_empty() || self.node.id == "auto" {
+            self.node.id = Uuid::new_v4().to_string();
+        }
+        Uuid::parse_str(&self.node.id)
+            .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))?;
+        Ok(())
+    }
+
+    pub fn node_uuid(&self) -> Result<Uuid, ConfigError> {
+        Uuid::parse_str(&self.node.id)
+            .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !matches!(self.node.role.as_str(), "host" | "client" | "worker" | "member" | "standalone") {
+            return Err(ConfigError::Invalid(format!(
+                "node.role must be host, client, worker, member, or standalone (got {})",
+                self.node.role
+            )));
+        }
+        self.network.validate()?;
+        if self.network.anchors.primary_compute_id.is_some()
+            && self.network.anchors.primary_compute_id == self.network.anchors.primary_client_id
+        {
+            return Err(ConfigError::Invalid(
+                "network.anchors.primary_compute_id and primary_client_id must be distinct".to_string(),
+            ));
+        }
+        if self.cluster.max_rpc_ram_mb > 1800 {
+            return Err(ConfigError::Invalid(
+                "cluster.max_rpc_ram_mb cannot exceed 1800 MB".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Save configuration to a specified file path.
@@ -100,6 +153,12 @@ pub struct NodeConfig {
     #[serde(default = "default_role")]
     pub role: String, // "host" on S23 Ultra, "client" on Mac
 
+    #[serde(default)]
+    pub runtime_role: RuntimeRole,
+
+    #[serde(default)]
+    pub capabilities: Vec<NodeCapability>,
+
     #[serde(default = "default_models_dir")]
     pub models_dir: PathBuf,
 
@@ -113,6 +172,8 @@ impl Default for NodeConfig {
             id: default_auto(),
             name: default_auto(),
             role: default_role(),
+            runtime_role: RuntimeRole::default(),
+            capabilities: vec![NodeCapability::Discovery],
             models_dir: default_models_dir(),
             presets_dir: default_presets_dir(),
         }
@@ -204,6 +265,15 @@ pub struct NetworkConfig {
 
     #[serde(default)]
     pub default_host: Option<String>,
+
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+
+    #[serde(default)]
+    pub security: SecurityConfig,
+
+    #[serde(default)]
+    pub anchors: AnchorConfig,
 }
 
 impl Default for NetworkConfig {
@@ -216,8 +286,148 @@ impl Default for NetworkConfig {
             peer_timeout_ms: default_peer_timeout_ms(),
             static_peers: Vec::new(),
             default_host: None,
+            discovery: DiscoveryConfig::default(),
+            security: SecurityConfig::default(),
+            anchors: AnchorConfig::default(),
         }
     }
+}
+
+impl NetworkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.api_port == 0 || self.discovery_port == 0 || self.discovery_port == self.api_port {
+            return Err(ConfigError::Invalid(
+                "network API and discovery ports must be non-zero and distinct".to_string(),
+            ));
+        }
+        if self.discovery.broadcast_interval_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "network.discovery.broadcast_interval_ms must be greater than zero".to_string(),
+            ));
+        }
+        if self.discovery.peer_timeout_ms < self.discovery.broadcast_interval_ms {
+            return Err(ConfigError::Invalid(
+                "network.discovery.peer_timeout_ms must be at least the broadcast interval".to_string(),
+            ));
+        }
+        if self.discovery.max_peers == 0 {
+            return Err(ConfigError::Invalid(
+                "network.discovery.max_peers must be greater than zero".to_string(),
+            ));
+        }
+        if !self.discovery.mdns.service_type.ends_with("._tcp.local.")
+            && !self.discovery.mdns.service_type.ends_with("._udp.local.")
+        {
+            return Err(ConfigError::Invalid(
+                "network.discovery.mdns.service_type must end with ._tcp.local. or ._udp.local."
+                    .to_string(),
+            ));
+        }
+        if self.security.protocol_version == 0 {
+            return Err(ConfigError::Invalid(
+                "network.security.protocol_version must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeRole {
+    Host,
+    Client,
+    Worker,
+    Member,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCapability {
+    Inference,
+    Client,
+    RpcWorker,
+    Discovery,
+}
+
+impl Default for RuntimeRole {
+    fn default() -> Self {
+        Self::Host
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_discovery_version")]
+    pub protocol_version: u8,
+    #[serde(default = "default_broadcast_interval_ms")]
+    pub broadcast_interval_ms: u64,
+    #[serde(default = "default_peer_timeout_ms")]
+    pub peer_timeout_ms: u64,
+    #[serde(default = "default_max_peers")]
+    pub max_peers: usize,
+    #[serde(default)]
+    pub mdns: MdnsConfig,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protocol_version: default_discovery_version(),
+            broadcast_interval_ms: default_broadcast_interval_ms(),
+            peer_timeout_ms: default_peer_timeout_ms(),
+            max_peers: default_max_peers(),
+            mdns: MdnsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MdnsConfig {
+    #[serde(default = "default_mdns_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_mdns_service_type")]
+    pub service_type: String,
+}
+
+impl Default for MdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mdns_enabled(),
+            service_type: default_mdns_service_type(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityConfig {
+    #[serde(default = "default_security_protocol_version")]
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub require_pairing: bool,
+    #[serde(default)]
+    pub allowed_peer_ids: Vec<Uuid>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            protocol_version: default_security_protocol_version(),
+            require_pairing: false,
+            allowed_peer_ids: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AnchorConfig {
+    #[serde(default)]
+    pub primary_compute_id: Option<Uuid>,
+    #[serde(default)]
+    pub primary_client_id: Option<Uuid>,
 }
 
 /// Cluster and distributed RPC layer offload configurations.
@@ -318,6 +528,26 @@ fn default_rpc_port() -> u16 {
 
 fn default_max_rpc_ram_mb() -> u64 {
     1800
+}
+
+fn default_discovery_version() -> u8 {
+    1
+}
+
+fn default_security_protocol_version() -> u16 {
+    1
+}
+
+fn default_max_peers() -> usize {
+    64
+}
+
+fn default_mdns_enabled() -> bool {
+    false
+}
+
+fn default_mdns_service_type() -> String {
+    "_nexus._tcp.local.".to_string()
 }
 
 /// Expand tilde prefix in paths to $HOME.

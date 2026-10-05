@@ -421,3 +421,20 @@ async fn test_cluster_view_interactions() {
     assert_eq!(cluster.adding_peer, false);
 }
 
+#[tokio::test]
+async fn test_cluster_view_header_status_badges() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config, None));
+    let cluster = nexus::ui::cluster_view::ClusterView::new(discovery);
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| cluster.render(f, f.area())).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("Mesh Coordinator"));
+    assert!(content.contains("UDP:"));
+    assert!(content.contains("mDNS:"));
+    assert!(content.contains("Broadcasting"));
+}
+

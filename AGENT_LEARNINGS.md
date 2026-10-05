@@ -27,6 +27,22 @@ avoid repeating known mistakes.
 
 ---
 
+## 2026-10-05 — Dual Discovery Backends (UDP Beacon + mDNS) and Hub Broadcaster Fix
+- Category: bug
+- Context: Devices failing to discover each other over Wi-Fi when running the default hub TUI (`nexus`).
+- Finding:
+  1. Default hub mode (`nexus` with no subcommand) launched the UDP listener but never spawned the broadcaster or mDNS services, leaving the node invisible to peers on the local network.
+  2. `default_mdns_enabled()` was disabled (`false`), relying purely on UDP broadcast to port 9999 which is frequently dropped by Wi-Fi routers with client isolation or AP multicast filtering.
+  3. Non-Unix platforms returned an empty list of broadcast addresses, restricting UDP discovery solely to limited broadcast (`255.255.255.255`).
+  4. The ClusterView header provided no visual indication of whether UDP or mDNS discovery backends were healthy or running.
+- Action:
+  1. Enabled mDNS-SD by default (`default_mdns_enabled() -> true`) so both UDP beacons and multicast DNS run concurrently.
+  2. Spawned the beacon broadcaster and mDNS services in default hub mode, worker mode, and client fallback.
+  3. Added `add_static_peer` with runtime dynamic target probing and persistence to `config.network.static_peers` via `config.save()`.
+  4. Added `record_service_endpoint` to merge mDNS discoveries into active peers and trigger targeted telemetry exchange probes.
+  5. Added real-time backend health indicator badges (`● UDP: Active ● mDNS: Active | Peers: N | ↻ Broadcasting`) to the Cluster tab header.
+- Verification: Validated with `cargo test` across all 65 test cases including new tests in `tests/test_discovery.rs` and `tests/test_hub_ui.rs`.
+
 ## 2026-10-05 — Windows Host Tooling: Cargo Only Available in WSL
 - Category: environment
 - Context: Running build and test verification on Windows host.

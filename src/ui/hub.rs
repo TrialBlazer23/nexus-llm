@@ -724,12 +724,13 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         if !input.is_empty() {
                                             if !hub.config.network.static_peers.contains(&input) {
                                                 hub.config.network.static_peers.push(input.clone());
-                                                let _ = hub.config.save_to_path(crate::config::NexusConfig::default_config_path());
+                                                let _ = hub.config.save();
                                             }
+                                            hub.discovery.add_static_peer(&input).await;
                                             hub.cluster_view.adding_peer = false;
                                             hub.cluster_view.add_peer_input.clear();
                                             hub.cluster_view.status_message = Some((
-                                                format!("Static peer '{}' added to mesh", input),
+                                                format!("Static peer '{}' added & probed", input),
                                                 Color::Green,
                                             ));
                                             hub.cluster_view.refresh().await;

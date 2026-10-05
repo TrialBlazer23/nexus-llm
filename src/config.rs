@@ -134,6 +134,19 @@ impl NexusConfig {
         Ok(())
     }
 
+    /// Save configuration to default path (~/.nexus/config.toml or $NEXUS_CONFIG).
+    pub fn save(&self) -> Result<(), ConfigError> {
+        let path = if let Ok(custom_path) = std::env::var("NEXUS_CONFIG") {
+            PathBuf::from(custom_path)
+        } else {
+            Self::default_config_path()
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.save_to_path(&path)
+    }
+
     /// Returns the default configuration path (~/.nexus/config.toml).
     pub fn default_config_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -559,7 +572,7 @@ fn default_max_peers() -> usize {
 }
 
 fn default_mdns_enabled() -> bool {
-    false
+    true
 }
 
 fn default_mdns_service_type() -> String {

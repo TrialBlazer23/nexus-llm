@@ -182,7 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             let config = NexusConfig::load()?;
             let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
 
             // Determine default client endpoint
             let host = if let Some(dh) = &config.network.default_host {
@@ -210,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
             let server_cfg = LlamaServerConfig {
                 binary_path: binary,
                 model_path: model,
@@ -339,8 +342,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = NexusConfig::load().unwrap_or_default();
             let discovery = Arc::new(DiscoveryService::new(config, None));
             let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
+            discovery.send_probe().await;
 
-            println!("Listening for discovery beacons on UDP 9999 for {}s...", timeout);
+            println!("Listening for discovery beacons on UDP 9999 & mDNS for {}s...", timeout);
             tokio::time::sleep(Duration::from_secs(timeout)).await;
 
             let peers = discovery.get_active_peers().await;
@@ -367,7 +372,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Dashboard => {
             let config = NexusConfig::load().unwrap_or_default();
             let discovery = Arc::new(DiscoveryService::new(config, None));
+            let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
             run_dashboard_tui(discovery).await?;
         }
 
@@ -413,6 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery.set_rpc_status(true, port).await;
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
 
             println!("Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)", port);
 
@@ -501,6 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => {
                     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
                     let _listener = discovery.clone().start_listener();
+                    let _mdns = discovery.clone().start_mdns();
                     discovery.send_probe().await;
                     println!("Auto-discovering compute host on subnet (Wi-Fi)...");
                     if let Some(node_selector) = node {

@@ -87,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     ));
     let listener_handle = discovery.clone().start_listener();
+    let _mdns_handle = discovery.clone().start_mdns();
     info!(
         "Autonomous discovery daemon active (Node UUID: {})",
         discovery.node_uuid()

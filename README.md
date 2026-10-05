@@ -176,7 +176,7 @@ nexus
 ```
 
 ### Views & Navigation
-Use `F1` - `F5`, `Tab`, or `Shift+Tab` to navigate between views:
+Use `F1` - `F4`, `Tab`, or `Shift+Tab` to navigate between views:
 
 - **`[F1: 💬 Chat]`**: Full-screen streaming conversation with auto-scroll and multi-turn history.
   - Press `[C]` to switch the chat endpoint to any discovered node or host.
@@ -184,9 +184,12 @@ Use `F1` - `F5`, `Tab`, or `Shift+Tab` to navigate between views:
 - **`[F2: 📦 Models]`**: Split-pane model browser and zero-copy GGUF inspector.
   - Displays file size, quantization type, context length, KV cache overhead, and memory badges (`[OK]`, `[RPC]`, `[OOM]`).
   - Press `[Enter]` to open the **Target Node Selection Modal**: choose to load the model locally or dispatch it to any connected peer in the mesh.
-- **`[F3: 🖥️ Dashboard]`**: Cluster performance monitor displaying CPU load, RAM utilization, Vulkan/GPU status, and active peer nodes.
-- **`[F4: 🔗 USB Tunnel]`**: Live ADB USB status monitor, one-key port forwarding (`F`), and tunnel teardown (`T`).
-- **`[F5: ⚙️ Settings]`**: Live configuration editor for GPU layer offload, CPU threads, context window, and RPC limits. Toggle with `Space`, adjust with `Left`/`Right`, save with `S`.
+- **`[F3: 🌐 Cluster]`**: Interactive WiFi mesh coordinator and live telemetry monitor.
+  - Lists discovered peers with endpoints, roles, allocatable RAM, acceleration tier, and active models.
+  - Selected peer actions: `[Enter]` Connect Chat endpoint, `[L]` Remote Load Model, `[W]` Request RPC Worker, `[I]` Inspect Hardware Modal, `[A]` Add Static Peer, `[D]` Disconnect to Local, `[R]` Refresh.
+- **`[F4: ⚙️ Settings]`**: Live configuration editor with inline text editing and enum cycle selectors.
+  - Edit Node Identity (name, mesh role), Paths & Binaries (models dir, llama-server/rpc-server binaries), Network & Transport (default host, static peers, mDNS), Hardware Acceleration, and RPC offload budgets.
+  - Press `[S]` to save to `~/.nexus/config.toml` with immediate hot-reload into running services.
 
 ### Safe Model Hot-Swapping
 When a model is already active, selecting another model and confirming will gracefully terminate the active process, re-evaluate target device memory headroom, and load the new model without needing to restart the hub.

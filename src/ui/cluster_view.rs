@@ -1,4 +1,4 @@
-use crate::discovery::{DiscoveryService, PeerNode};
+use crate::discovery::{BackendHealth, DiscoveryService, PeerNode};
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,6 +8,25 @@ use ratatui::{
     Frame,
 };
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendStatus {
+    Starting,
+    Active,
+    Failed,
+    Disabled,
+}
+
+impl BackendStatus {
+    pub fn display(&self) -> (&'static str, Color) {
+        match self {
+            Self::Active => ("Active", Color::Green),
+            Self::Starting => ("Starting", Color::Yellow),
+            Self::Failed => ("Failed", Color::Red),
+            Self::Disabled => ("Disabled", Color::DarkGray),
+        }
+    }
+}
 
 pub struct ClusterView {
     pub discovery: Arc<DiscoveryService>,
@@ -19,12 +38,26 @@ pub struct ClusterView {
     pub adding_peer: bool,
     pub add_peer_input: String,
     pub status_message: Option<(String, Color)>,
+    pub udp_status: BackendStatus,
+    pub mdns_status: BackendStatus,
 }
 
 impl ClusterView {
     pub fn new(discovery: Arc<DiscoveryService>) -> Self {
         let local_profile = SystemProfile::probe();
         let thermal_index = DiscoveryService::probe_thermal_index();
+        let udp_status = if discovery.config().network.discovery.enabled {
+            BackendStatus::Starting
+        } else {
+            BackendStatus::Disabled
+        };
+        let mdns_status = if discovery.config().network.discovery.enabled
+            && discovery.config().network.discovery.mdns.enabled
+        {
+            BackendStatus::Starting
+        } else {
+            BackendStatus::Disabled
+        };
 
         Self {
             discovery,
@@ -36,6 +69,8 @@ impl ClusterView {
             adding_peer: false,
             add_peer_input: String::new(),
             status_message: None,
+            udp_status,
+            mdns_status,
         }
     }
 
@@ -45,6 +80,31 @@ impl ClusterView {
         self.peers = self.discovery.get_active_peers().await;
         if self.selected_index >= self.peers.len() && !self.peers.is_empty() {
             self.selected_index = self.peers.len() - 1;
+        }
+
+        if !self.discovery.config().network.discovery.enabled {
+            self.udp_status = BackendStatus::Disabled;
+            self.mdns_status = BackendStatus::Disabled;
+        } else {
+            let udp_health = *self.discovery.udp_health().read().await;
+            self.udp_status = match udp_health {
+                BackendHealth::Started => BackendStatus::Starting,
+                BackendHealth::Healthy => BackendStatus::Active,
+                BackendHealth::Failed => BackendStatus::Failed,
+                BackendHealth::Stopped => BackendStatus::Disabled,
+            };
+
+            if !self.discovery.config().network.discovery.mdns.enabled {
+                self.mdns_status = BackendStatus::Disabled;
+            } else {
+                let mdns_health = *self.discovery.mdns_health().read().await;
+                self.mdns_status = match mdns_health {
+                    BackendHealth::Started => BackendStatus::Starting,
+                    BackendHealth::Healthy => BackendStatus::Active,
+                    BackendHealth::Failed => BackendStatus::Failed,
+                    BackendHealth::Stopped => BackendStatus::Disabled,
+                };
+            }
         }
     }
 
@@ -128,17 +188,27 @@ impl ClusterView {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let title = format!(
-            " Nexus-LLM Mesh Coordinator | Target: {} | Active Nodes: {} (Local + {} Peers)",
-            std::env::consts::ARCH,
-            self.peers.len() + 1,
-            self.peers.len()
-        );
+        let (udp_text, udp_color) = self.udp_status.display();
+        let (mdns_text, mdns_color) = self.mdns_status.display();
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]))
-        .block(
+        let header_spans = vec![
+            Span::styled(" Nexus-LLM Mesh Coordinator ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("({}) ", std::env::consts::ARCH), Style::default().fg(Color::DarkGray)),
+            Span::styled("| ", Style::default().fg(Color::DarkGray)),
+            Span::styled("● ", Style::default().fg(udp_color)),
+            Span::styled(format!("UDP: {}  ", udp_text), Style::default().fg(Color::White)),
+            Span::styled("● ", Style::default().fg(mdns_color)),
+            Span::styled(format!("mDNS: {}  ", mdns_text), Style::default().fg(Color::White)),
+            Span::styled("| ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("Peers: {}  ", self.peers.len()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("| ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.discovery.config().network.discovery.enabled { "↻ Broadcasting" } else { "Discovery Off" },
+                Style::default().fg(if self.discovery.config().network.discovery.enabled { Color::LightGreen } else { Color::DarkGray }),
+            ),
+        ];
+
+        let header = Paragraph::new(Line::from(header_spans)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),

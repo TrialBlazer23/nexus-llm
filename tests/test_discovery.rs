@@ -1,9 +1,10 @@
 use nexus::client::{ChatCompletionChunk, ChatMessage, ChatCompletionRequest};
 use nexus::config::NexusConfig;
 use nexus::discovery::{
-    BeaconPacket, DiscoveryError, DiscoveryService, NodeRole, PeerNode, StatusFlags,
-    BEACON_MAGIC, BEACON_PACKET_SIZE, BEACON_VERSION,
+    BackendHealth, BeaconPacket, DiscoveryError, DiscoveryService, NodeRole, PeerNode,
+    ServiceEndpoint, StatusFlags, BEACON_MAGIC, BEACON_PACKET_SIZE, BEACON_VERSION,
 };
+use nexus::peer_registry::ObservationSource;
 use nexus::sysinfo::AccelerationBackend;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -347,4 +348,72 @@ fn test_get_broadcast_addresses_and_targets() {
         let expected = SocketAddr::new(std::net::IpAddr::V4(bcast), config.network.discovery_port);
         assert!(targets.contains(&expected));
     }
+}
+
+#[tokio::test]
+async fn test_dynamic_static_peer_addition() {
+    let config = NexusConfig::default();
+    let discovery = DiscoveryService::new(config, None);
+
+    let initial_targets = discovery.broadcast_targets().await;
+    assert!(!initial_targets.contains(&"192.168.1.150:9999".parse().unwrap()));
+
+    discovery.add_static_peer("192.168.1.150:9999").await;
+    let targets = discovery.broadcast_targets().await;
+    assert!(targets.contains(&"192.168.1.150:9999".parse().unwrap()));
+
+    // IP-only string should use default discovery port
+    discovery.add_static_peer("10.10.10.10").await;
+    let targets2 = discovery.broadcast_targets().await;
+    assert!(targets2.contains(&"10.10.10.10:9999".parse().unwrap()));
+}
+
+#[tokio::test]
+async fn test_record_service_endpoint_merges_mdns() {
+    let config = NexusConfig::default();
+    let discovery = DiscoveryService::new(config, None);
+
+    let node_id = Uuid::new_v4();
+    let endpoint = ServiceEndpoint {
+        node_id,
+        cluster_id: None,
+        protocol_version: 1,
+        role: NodeRole::HOST,
+        capabilities: vec!["inference".to_string()],
+        addresses: vec!["192.168.1.200:8080".parse().unwrap()],
+        api_port: 8080,
+        rpc_port: 50052,
+    };
+
+    discovery
+        .record_service_endpoint(endpoint, ObservationSource::Mdns)
+        .await;
+
+    let peers = discovery.get_active_peers().await;
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].uuid, node_id);
+    assert!(peers[0].role.is_host());
+    assert!(peers[0].is_rpc_ready());
+    assert_eq!(peers[0].api_endpoint(), "http://192.168.1.200:8080");
+    assert_eq!(peers[0].rpc_endpoint(), "192.168.1.200:50052");
+
+    // Also check registry
+    let registry = discovery.peer_registry();
+    let reg_read = registry.read().await;
+    assert!(reg_read.get(node_id).is_some());
+}
+
+#[tokio::test]
+async fn test_backend_health_tracking() {
+    let config = NexusConfig::default();
+    let discovery = DiscoveryService::new(config, None);
+
+    assert_eq!(*discovery.udp_health().read().await, BackendHealth::Started);
+    assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Started);
+
+    discovery.set_udp_health(BackendHealth::Healthy).await;
+    assert_eq!(*discovery.udp_health().read().await, BackendHealth::Healthy);
+
+    discovery.set_mdns_health(BackendHealth::Healthy).await;
+    assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Healthy);
 }

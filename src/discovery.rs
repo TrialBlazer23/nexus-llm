@@ -364,6 +364,9 @@ pub struct DiscoveryService {
     active_model: Arc<RwLock<String>>,
     status_flags: Arc<RwLock<StatusFlags>>,
     rpc_port: Arc<RwLock<u16>>,
+    udp_health: Arc<RwLock<BackendHealth>>,
+    mdns_health: Arc<RwLock<BackendHealth>>,
+    extra_targets: Arc<RwLock<Vec<SocketAddr>>>,
 }
 
 impl DiscoveryService {
@@ -374,6 +377,18 @@ impl DiscoveryService {
         let max_peers = config.network.discovery.max_peers;
         let peer_timeout = Duration::from_millis(config.network.discovery.peer_timeout_ms);
         let default_status = StatusFlags(0);
+        let udp_health = Arc::new(RwLock::new(if config.network.discovery.enabled {
+            BackendHealth::Started
+        } else {
+            BackendHealth::Stopped
+        }));
+        let mdns_health = Arc::new(RwLock::new(
+            if config.network.discovery.enabled && config.network.discovery.mdns.enabled {
+                BackendHealth::Started
+            } else {
+                BackendHealth::Stopped
+            },
+        ));
 
         Self {
             config,
@@ -386,6 +401,9 @@ impl DiscoveryService {
             active_model: Arc::new(RwLock::new(String::new())),
             status_flags: Arc::new(RwLock::new(default_status)),
             rpc_port: Arc::new(RwLock::new(0)),
+            udp_health,
+            mdns_health,
+            extra_targets: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -399,6 +417,22 @@ impl DiscoveryService {
 
     pub fn peer_registry(&self) -> Arc<RwLock<PeerRegistry>> {
         self.registry.clone()
+    }
+
+    pub fn udp_health(&self) -> Arc<RwLock<BackendHealth>> {
+        self.udp_health.clone()
+    }
+
+    pub fn mdns_health(&self) -> Arc<RwLock<BackendHealth>> {
+        self.mdns_health.clone()
+    }
+
+    pub async fn set_udp_health(&self, health: BackendHealth) {
+        *self.udp_health.write().await = health;
+    }
+
+    pub async fn set_mdns_health(&self, health: BackendHealth) {
+        *self.mdns_health.write().await = health;
     }
 
     pub async fn set_active_model(&self, model_name: impl Into<String>) {
@@ -492,8 +526,40 @@ impl DiscoveryService {
         targets
     }
 
-    /// Transmit an immediate discovery probe across all broadcast and peer targets.
-    pub async fn send_probe(&self) {
+    /// Compute active targets including static peers added at runtime.
+    pub async fn broadcast_targets(&self) -> Vec<SocketAddr> {
+        let mut targets = Self::get_broadcast_targets(&self.config);
+        let extra = self.extra_targets.read().await;
+        for target in extra.iter() {
+            if !targets.contains(target) {
+                targets.push(*target);
+            }
+        }
+        targets
+    }
+
+    /// Add a static peer address at runtime and send an immediate discovery probe to it.
+    pub async fn add_static_peer(&self, peer_str: &str) {
+        let target_addr = if let Ok(addr) = peer_str.parse::<SocketAddr>() {
+            Some(addr)
+        } else if let Ok(ip) = peer_str.parse::<std::net::IpAddr>() {
+            Some(SocketAddr::new(ip, self.config.network.discovery_port))
+        } else {
+            None
+        };
+
+        if let Some(addr) = target_addr {
+            let mut extra = self.extra_targets.write().await;
+            if !extra.contains(&addr) {
+                extra.push(addr);
+            }
+            drop(extra);
+            self.send_probe_to(addr).await;
+        }
+    }
+
+    /// Transmit a targeted discovery probe to a specific endpoint.
+    pub async fn send_probe_to(&self, target: SocketAddr) {
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
             Err(e) => {
@@ -525,9 +591,14 @@ impl DiscoveryService {
         };
 
         let packet_bytes = beacon.encode();
-        let targets = Self::get_broadcast_targets(&self.config);
+        let _ = socket.send_to(&packet_bytes, target).await;
+    }
+
+    /// Transmit an immediate discovery probe across all broadcast and peer targets.
+    pub async fn send_probe(&self) {
+        let targets = self.broadcast_targets().await;
         for target in targets {
-            let _ = socket.send_to(&packet_bytes, target).await;
+            self.send_probe_to(target).await;
         }
     }
 
@@ -551,7 +622,7 @@ impl DiscoveryService {
                 return;
             }
 
-            let initial_targets = Self::get_broadcast_targets(&self.config);
+            let initial_targets = self.broadcast_targets().await;
             info!(
                 "Discovery broadcaster active: transmitting beacons to {:?} every {} ms",
                 initial_targets, self.config.network.broadcast_interval_ms
@@ -585,7 +656,7 @@ impl DiscoveryService {
                 };
 
                 let packet_bytes = beacon.encode();
-                let targets = Self::get_broadcast_targets(&self.config);
+                let targets = self.broadcast_targets().await;
                 for target in targets {
                     if let Err(e) = socket.send_to(&packet_bytes, target).await {
                         debug!("UDP beacon send to {} failed: {}", target, e);
@@ -620,6 +691,7 @@ impl DiscoveryService {
         tokio::spawn(async move {
             if !self.config.network.discovery.enabled {
                 info!("Discovery listener disabled by configuration");
+                *self.udp_health.write().await = BackendHealth::Stopped;
                 return;
             }
             let socket = match create_listener_socket(self.config.network.discovery_port) {
@@ -629,6 +701,7 @@ impl DiscoveryService {
                         "Failed to bind discovery listener to port {}: {}",
                         self.config.network.discovery_port, e
                     );
+                    *self.udp_health.write().await = BackendHealth::Failed;
                     if let Some(sender) = &events {
                         let _ = sender
                             .send(DiscoveryEvent::BackendHealth {
@@ -645,6 +718,7 @@ impl DiscoveryService {
                 "Discovery listener active on port {}",
                 self.config.network.discovery_port
             );
+            *self.udp_health.write().await = BackendHealth::Healthy;
             if let Some(sender) = &events {
                 let _ = sender
                     .send(DiscoveryEvent::BackendHealth {
@@ -841,6 +915,164 @@ impl DiscoveryService {
     pub async fn select_rpc_candidate(&self, policy: RpcSelectionPolicy) -> Option<RpcCandidate> {
         self.rpc_candidates(policy).await.into_iter().next()
     }
+
+    /// Record a discovered service endpoint (from mDNS, static config, etc.) and merge into active peers.
+    pub async fn record_service_endpoint(
+        &self,
+        endpoint: ServiceEndpoint,
+        source: ObservationSource,
+    ) {
+        if endpoint.node_id == self.node_uuid {
+            return;
+        }
+
+        let probe_target = endpoint.addresses.first().map(|addr| {
+            SocketAddr::new(addr.ip(), self.config.network.discovery_port)
+        });
+
+        let mut peers = self.peers.write().await;
+        let event = if let Some(existing) = peers.get_mut(&endpoint.node_id) {
+            existing.role = endpoint.role;
+            if let Some(addr) = endpoint.addresses.first() {
+                existing.addr = *addr;
+            }
+            existing.api_port = endpoint.api_port;
+            existing.rpc_port = endpoint.rpc_port;
+            if endpoint.rpc_port > 0 {
+                existing.status.0 |= StatusFlags::RPC_READY.0;
+            }
+            existing.last_seen = Instant::now();
+            DiscoveryEvent::ServiceUpdated(existing.service_endpoint())
+        } else {
+            let addr = endpoint.addresses.first().cloned().unwrap_or_else(|| {
+                SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    endpoint.api_port,
+                )
+            });
+            let mut status = StatusFlags::READY;
+            if endpoint.rpc_port > 0 {
+                status.0 |= StatusFlags::RPC_READY.0;
+            }
+            let peer = PeerNode {
+                uuid: endpoint.node_id,
+                addr,
+                role: endpoint.role,
+                status,
+                api_port: endpoint.api_port,
+                rpc_port: endpoint.rpc_port,
+                total_ram_mb: 0,
+                free_ram_mb: 0,
+                backend: AccelerationBackend::GenericCpu,
+                thermal_index: 0,
+                active_model: String::new(),
+                last_seen: Instant::now(),
+            };
+            peers.insert(endpoint.node_id, peer.clone());
+            DiscoveryEvent::ServiceFound(endpoint.clone())
+        };
+        drop(peers);
+
+        if let Err(e) = self.registry.write().await.apply_event(event, source, Instant::now()) {
+            warn!("Rejected {} peer observation: {}", match source {
+                ObservationSource::Udp => "UDP",
+                ObservationSource::Mdns => "mDNS",
+                ObservationSource::Static => "static",
+                ObservationSource::ControlPlane => "control plane",
+            }, e);
+        }
+
+        // Send a unicast UDP probe to obtain full hardware telemetry if endpoint address is reachable
+        if let Some(target) = probe_target {
+            self.send_probe_to(target).await;
+        }
+    }
+
+    /// Remove a decommissioned or timed-out peer.
+    pub async fn remove_peer(&self, node_id: Uuid) {
+        let mut peers = self.peers.write().await;
+        peers.remove(&node_id);
+        drop(peers);
+
+        let _ = self.registry.write().await.apply_event(
+            DiscoveryEvent::ServiceRemoved { node_id },
+            ObservationSource::Mdns,
+            Instant::now(),
+        );
+    }
+
+    /// Spawn asynchronous mDNS advertising and browsing service if enabled.
+    pub fn start_mdns(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.config.network.discovery.enabled || !self.config.network.discovery.mdns.enabled {
+            info!("mDNS discovery disabled by configuration");
+            return None;
+        }
+
+        let this = self.clone();
+        Some(tokio::spawn(async move {
+            let mdns = match crate::mdns::MdnsBackend::new() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to initialize mDNS daemon: {}", e);
+                    *this.mdns_health.write().await = BackendHealth::Failed;
+                    return;
+                }
+            };
+
+            let local_ip = get_local_ip();
+            let rpc_port = *this.rpc_port.read().await;
+            let role = NodeRole::from_str_role(&this.config.node.role);
+            let caps = vec!["inference".to_string(), "rpc".to_string()];
+
+            if let Err(e) = mdns.register(
+                &this.config.network.discovery.mdns.service_type,
+                &this.node_uuid.to_string(),
+                &format!("{}.local.", this.node_uuid),
+                this.config.network.api_port,
+                rpc_port,
+                this.node_uuid,
+                None,
+                role,
+                &caps,
+                local_ip,
+            ) {
+                warn!("Failed to register mDNS service: {}", e);
+                *this.mdns_health.write().await = BackendHealth::Failed;
+                return;
+            }
+
+            *this.mdns_health.write().await = BackendHealth::Healthy;
+            info!(
+                "mDNS service registered on {} ({})",
+                local_ip, this.config.network.discovery.mdns.service_type
+            );
+
+            let (mut events, _browse_handle) = match mdns.browse(&this.config.network.discovery.mdns.service_type) {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!("Failed to start mDNS browse: {}", e);
+                    *this.mdns_health.write().await = BackendHealth::Failed;
+                    return;
+                }
+            };
+
+            while let Some(event) = events.recv().await {
+                match event {
+                    DiscoveryEvent::ServiceFound(endpoint) | DiscoveryEvent::ServiceUpdated(endpoint) => {
+                        debug!("mDNS discovered service: {:?}", endpoint.node_id);
+                        this.record_service_endpoint(endpoint, ObservationSource::Mdns).await;
+                    }
+                    DiscoveryEvent::ServiceRemoved { node_id } => {
+                        debug!("mDNS service removed: {:?}", node_id);
+                        this.remove_peer(node_id).await;
+                    }
+                    DiscoveryEvent::BackendHealth { health, .. } => {
+                        *this.mdns_health.write().await = health;
+                    }
+                }
+            }
+        }))
+    }
 }
 
 /// Create a non-blocking UDP socket configured with SO_REUSEADDR and SO_REUSEPORT.
@@ -936,4 +1168,31 @@ pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
 #[cfg(not(unix))]
 pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
     Vec::new()
+}
+
+/// Determine the preferred local IP address for peer advertising.
+pub fn get_local_ip() -> std::net::IpAddr {
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
+                    return addr.ip();
+                }
+            }
+        }
+    }
+
+    for bcast in get_broadcast_addresses() {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect((bcast, 9999)).is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
+                        return addr.ip();
+                    }
+                }
+            }
+        }
+    }
+
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
 }

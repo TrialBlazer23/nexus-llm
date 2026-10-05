@@ -7,16 +7,34 @@ use ratatui::{
     Frame,
 };
 
+pub const VALID_ROLES: &[&str] = &["host", "client", "worker", "member", "standalone"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingType {
+    // Node Identity
+    NodeName,
+    NodeRole,
+    // Paths & Binaries
+    ModelsDir,
+    PresetsDir,
+    LlamaServerBinary,
+    RpcServerBinary,
+    // Network & Transport
+    DefaultHost,
+    StaticPeers,
+    EnableMdns,
+    DiscoveryPort,
+    ApiPort,
+    PreferAdbTunnel,
+    // Hardware & Acceleration
     PreferGpu,
     GpuLayers,
     FallbackCpu,
     CpuThreads,
+    // Memory & Android LMK Safeguards
     MaxRamPercent,
     Mmap,
-    ApiPort,
-    PreferAdbTunnel,
+    // Distributed Cluster RPC
     EnableRpc,
     MaxRpcRamMb,
     AutoOffload,
@@ -31,6 +49,82 @@ pub struct SettingItem {
 }
 
 pub const SETTING_ITEMS: &[SettingItem] = &[
+    // Node Identity
+    SettingItem {
+        category: "Node Identity",
+        name: "Node Hostname / Name",
+        description: "Unique human-readable identifier for this node in the mesh",
+        setting_type: SettingType::NodeName,
+    },
+    SettingItem {
+        category: "Node Identity",
+        name: "Node Mesh Role",
+        description: "Operational role (host, client, worker, member, standalone)",
+        setting_type: SettingType::NodeRole,
+    },
+    // Paths & Binaries
+    SettingItem {
+        category: "Paths & Binaries",
+        name: "Models Storage Directory",
+        description: "Filesystem directory scanned for .gguf model weights",
+        setting_type: SettingType::ModelsDir,
+    },
+    SettingItem {
+        category: "Paths & Binaries",
+        name: "Presets Directory",
+        description: "Directory storing chat templates and persona YAML definitions",
+        setting_type: SettingType::PresetsDir,
+    },
+    SettingItem {
+        category: "Paths & Binaries",
+        name: "llama-server Binary Path",
+        description: "Path or executable name for local llama.cpp HTTP server",
+        setting_type: SettingType::LlamaServerBinary,
+    },
+    SettingItem {
+        category: "Paths & Binaries",
+        name: "rpc-server Binary Path",
+        description: "Path or executable name for llama.cpp distributed rpc-server",
+        setting_type: SettingType::RpcServerBinary,
+    },
+    // Network & Transport
+    SettingItem {
+        category: "Network & Transport",
+        name: "Default Inference Host Endpoint",
+        description: "Static HTTP API endpoint (or 'none' for auto-discovery)",
+        setting_type: SettingType::DefaultHost,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "Static Peer IP:Port List",
+        description: "Comma-separated peer endpoints for non-broadcast subnets",
+        setting_type: SettingType::StaticPeers,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "Enable mDNS Service Discovery",
+        description: "Zero-config multicast DNS LAN discovery (_nexus._tcp.local.)",
+        setting_type: SettingType::EnableMdns,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "UDP Discovery Port",
+        description: "UDP port for heartbeat beacons (default: 9999)",
+        setting_type: SettingType::DiscoveryPort,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "API Port (OpenAI REST / SSE)",
+        description: "Port for llama-server HTTP API (default: 8080)",
+        setting_type: SettingType::ApiPort,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "Prefer USB Cable Tunnel (ADB)",
+        description: "Prioritize low-latency localhost USB tunnel when cable is connected",
+        setting_type: SettingType::PreferAdbTunnel,
+    },
+    // Hardware & Acceleration
     SettingItem {
         category: "Hardware & Acceleration",
         name: "Prefer Vulkan GPU Acceleration",
@@ -55,6 +149,7 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         description: "Number of performance threads (recommended: 6 for Snapdragon 8 Gen 2)",
         setting_type: SettingType::CpuThreads,
     },
+    // Memory & Android LMK Safeguards
     SettingItem {
         category: "Memory & Android LMK Safeguards",
         name: "Max RAM Safety Ceiling",
@@ -67,18 +162,7 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         description: "Use mmap for zero-copy weight paging into memory",
         setting_type: SettingType::Mmap,
     },
-    SettingItem {
-        category: "Network & Transport",
-        name: "API Port (OpenAI REST / SSE)",
-        description: "Port for llama-server HTTP API (default: 8080)",
-        setting_type: SettingType::ApiPort,
-    },
-    SettingItem {
-        category: "Network & Transport",
-        name: "Prefer USB Cable Tunnel (ADB)",
-        description: "Prioritize low-latency localhost USB tunnel when cable is connected",
-        setting_type: SettingType::PreferAdbTunnel,
-    },
+    // Distributed Cluster RPC
     SettingItem {
         category: "Distributed Cluster RPC",
         name: "Enable Cluster RPC Offload",
@@ -103,6 +187,8 @@ pub struct SettingsView {
     pub config: NexusConfig,
     pub selected_index: usize,
     pub status_message: Option<(String, Color)>,
+    pub editing_text: bool,
+    pub text_buffer: String,
 }
 
 impl SettingsView {
@@ -111,10 +197,15 @@ impl SettingsView {
             config,
             selected_index: 0,
             status_message: None,
+            editing_text: false,
+            text_buffer: String::new(),
         }
     }
 
     pub fn next(&mut self) {
+        if self.editing_text {
+            return;
+        }
         if self.selected_index + 1 < SETTING_ITEMS.len() {
             self.selected_index += 1;
         } else {
@@ -123,6 +214,9 @@ impl SettingsView {
     }
 
     pub fn previous(&mut self) {
+        if self.editing_text {
+            return;
+        }
         if self.selected_index == 0 {
             self.selected_index = SETTING_ITEMS.len() - 1;
         } else {
@@ -130,9 +224,144 @@ impl SettingsView {
         }
     }
 
+    pub fn is_current_text(&self) -> bool {
+        matches!(
+            SETTING_ITEMS[self.selected_index].setting_type,
+            SettingType::NodeName
+                | SettingType::ModelsDir
+                | SettingType::PresetsDir
+                | SettingType::LlamaServerBinary
+                | SettingType::RpcServerBinary
+                | SettingType::DefaultHost
+                | SettingType::StaticPeers
+        )
+    }
+
+    pub fn start_editing(&mut self) {
+        if !self.is_current_text() {
+            return;
+        }
+        let cur_val = match SETTING_ITEMS[self.selected_index].setting_type {
+            SettingType::NodeName => self.config.node.name.clone(),
+            SettingType::ModelsDir => self.config.node.models_dir.to_string_lossy().to_string(),
+            SettingType::PresetsDir => self.config.node.presets_dir.to_string_lossy().to_string(),
+            SettingType::LlamaServerBinary => self.config.node.llama_server_binary.clone(),
+            SettingType::RpcServerBinary => self.config.node.rpc_server_binary.clone(),
+            SettingType::DefaultHost => self.config.network.default_host.clone().unwrap_or_default(),
+            SettingType::StaticPeers => self.config.network.static_peers.join(", "),
+            _ => String::new(),
+        };
+        self.text_buffer = cur_val;
+        self.editing_text = true;
+        self.status_message = Some(("Editing... [Enter] Commit | [Esc] Cancel".to_string(), Color::Yellow));
+    }
+
+    pub fn commit_text(&mut self) {
+        if !self.editing_text {
+            return;
+        }
+        let val = self.text_buffer.trim().to_string();
+        match SETTING_ITEMS[self.selected_index].setting_type {
+            SettingType::NodeName => {
+                if !val.is_empty() {
+                    self.config.node.name = val;
+                }
+            }
+            SettingType::ModelsDir => {
+                if !val.is_empty() {
+                    self.config.node.models_dir = std::path::PathBuf::from(val);
+                }
+            }
+            SettingType::PresetsDir => {
+                if !val.is_empty() {
+                    self.config.node.presets_dir = std::path::PathBuf::from(val);
+                }
+            }
+            SettingType::LlamaServerBinary => {
+                if !val.is_empty() {
+                    self.config.node.llama_server_binary = val;
+                }
+            }
+            SettingType::RpcServerBinary => {
+                if !val.is_empty() {
+                    self.config.node.rpc_server_binary = val;
+                }
+            }
+            SettingType::DefaultHost => {
+                if val.is_empty() || val == "none" || val == "auto" {
+                    self.config.network.default_host = None;
+                } else {
+                    self.config.network.default_host = Some(val);
+                }
+            }
+            SettingType::StaticPeers => {
+                self.config.network.static_peers = val
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            _ => {}
+        }
+        self.editing_text = false;
+        self.text_buffer.clear();
+        self.status_message = Some(("Modified (Press 'S' to save)".to_string(), Color::Yellow));
+    }
+
+    pub fn cancel_text(&mut self) {
+        self.editing_text = false;
+        self.text_buffer.clear();
+        self.status_message = Some(("Edit cancelled".to_string(), Color::DarkGray));
+    }
+
+    pub fn push_char(&mut self, c: char) {
+        if self.editing_text {
+            self.text_buffer.push(c);
+        }
+    }
+
+    pub fn backspace_text(&mut self) {
+        if self.editing_text {
+            self.text_buffer.pop();
+        }
+    }
+
     pub fn toggle_or_adjust(&mut self, is_left: bool, is_right: bool) {
+        if self.editing_text {
+            return;
+        }
         let item = &SETTING_ITEMS[self.selected_index];
         match item.setting_type {
+            SettingType::NodeName
+            | SettingType::ModelsDir
+            | SettingType::PresetsDir
+            | SettingType::LlamaServerBinary
+            | SettingType::RpcServerBinary
+            | SettingType::DefaultHost
+            | SettingType::StaticPeers => {
+                self.start_editing();
+                return;
+            }
+            SettingType::NodeRole => {
+                let cur = self.config.node.role.as_str();
+                let idx = VALID_ROLES.iter().position(|r| *r == cur).unwrap_or(0);
+                let new_idx = if is_left {
+                    if idx == 0 { VALID_ROLES.len() - 1 } else { idx - 1 }
+                } else {
+                    (idx + 1) % VALID_ROLES.len()
+                };
+                self.config.node.role = VALID_ROLES[new_idx].to_string();
+            }
+            SettingType::EnableMdns => {
+                self.config.network.discovery.mdns.enabled = !self.config.network.discovery.mdns.enabled;
+            }
+            SettingType::DiscoveryPort => {
+                if is_left {
+                    self.config.network.discovery_port = self.config.network.discovery_port.saturating_sub(1);
+                } else if is_right {
+                    self.config.network.discovery_port = self.config.network.discovery_port.saturating_add(1);
+                }
+            }
             SettingType::PreferGpu => {
                 self.config.hardware.acceleration.prefer_gpu = !self.config.hardware.acceleration.prefer_gpu;
             }
@@ -237,18 +466,38 @@ impl SettingsView {
             }
 
             let is_selected = i == self.selected_index;
-            let val_str = match item.setting_type {
-                SettingType::PreferGpu => format!("[ {} ]", if self.config.hardware.acceleration.prefer_gpu { "ON" } else { "OFF" }),
-                SettingType::GpuLayers => format!("[ {} layers ]", self.config.hardware.acceleration.gpu_layers),
-                SettingType::FallbackCpu => format!("[ {} ]", if self.config.hardware.acceleration.fallback_to_cpu { "ON" } else { "OFF" }),
-                SettingType::CpuThreads => format!("[ {} threads ]", self.config.hardware.acceleration.cpu_threads),
-                SettingType::MaxRamPercent => format!("[ {}% ]", self.config.hardware.safety.max_ram_usage_percent),
-                SettingType::Mmap => format!("[ {} ]", if self.config.hardware.safety.mmap { "ON" } else { "OFF" }),
-                SettingType::ApiPort => format!("[ {} ]", self.config.network.api_port),
-                SettingType::PreferAdbTunnel => format!("[ {} ]", if self.config.cluster.prefer_adb_tunnel { "ON" } else { "OFF" }),
-                SettingType::EnableRpc => format!("[ {} ]", if self.config.cluster.enable_rpc { "ON" } else { "OFF" }),
-                SettingType::MaxRpcRamMb => format!("[ {} MB ]", self.config.cluster.max_rpc_ram_mb),
-                SettingType::AutoOffload => format!("[ {} ]", if self.config.cluster.auto_offload { "ON" } else { "OFF" }),
+            let val_str = if is_selected && self.editing_text {
+                format!("[ {}█ ]", self.text_buffer)
+            } else {
+                match item.setting_type {
+                    SettingType::NodeName => format!("[ {} ]", self.config.node.name),
+                    SettingType::NodeRole => format!("[ {} ]", self.config.node.role),
+                    SettingType::ModelsDir => format!("[ {} ]", self.config.node.models_dir.display()),
+                    SettingType::PresetsDir => format!("[ {} ]", self.config.node.presets_dir.display()),
+                    SettingType::LlamaServerBinary => format!("[ {} ]", self.config.node.llama_server_binary),
+                    SettingType::RpcServerBinary => format!("[ {} ]", self.config.node.rpc_server_binary),
+                    SettingType::DefaultHost => format!("[ {} ]", self.config.network.default_host.as_deref().unwrap_or("none")),
+                    SettingType::StaticPeers => {
+                        if self.config.network.static_peers.is_empty() {
+                            "[ none ]".to_string()
+                        } else {
+                            format!("[ {} ]", self.config.network.static_peers.join(", "))
+                        }
+                    }
+                    SettingType::EnableMdns => format!("[ {} ]", if self.config.network.discovery.mdns.enabled { "ON" } else { "OFF" }),
+                    SettingType::DiscoveryPort => format!("[ {} ]", self.config.network.discovery_port),
+                    SettingType::PreferGpu => format!("[ {} ]", if self.config.hardware.acceleration.prefer_gpu { "ON" } else { "OFF" }),
+                    SettingType::GpuLayers => format!("[ {} layers ]", self.config.hardware.acceleration.gpu_layers),
+                    SettingType::FallbackCpu => format!("[ {} ]", if self.config.hardware.acceleration.fallback_to_cpu { "ON" } else { "OFF" }),
+                    SettingType::CpuThreads => format!("[ {} threads ]", self.config.hardware.acceleration.cpu_threads),
+                    SettingType::MaxRamPercent => format!("[ {}% ]", self.config.hardware.safety.max_ram_usage_percent),
+                    SettingType::Mmap => format!("[ {} ]", if self.config.hardware.safety.mmap { "ON" } else { "OFF" }),
+                    SettingType::ApiPort => format!("[ {} ]", self.config.network.api_port),
+                    SettingType::PreferAdbTunnel => format!("[ {} ]", if self.config.cluster.prefer_adb_tunnel { "ON" } else { "OFF" }),
+                    SettingType::EnableRpc => format!("[ {} ]", if self.config.cluster.enable_rpc { "ON" } else { "OFF" }),
+                    SettingType::MaxRpcRamMb => format!("[ {} MB ]", self.config.cluster.max_rpc_ram_mb),
+                    SettingType::AutoOffload => format!("[ {} ]", if self.config.cluster.auto_offload { "ON" } else { "OFF" }),
+                }
             };
 
             let prefix = if is_selected { " > " } else { "   " };
@@ -259,14 +508,18 @@ impl SettingsView {
             };
 
             let val_style = if is_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                if self.editing_text {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                }
             } else {
                 Style::default().fg(Color::Green)
             };
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
-                Span::styled(format!("{:<40}", item.name), style),
+                Span::styled(format!("{:<38}", item.name), style),
                 Span::styled(val_str, val_style),
             ]));
         }
@@ -283,8 +536,12 @@ impl SettingsView {
         let cur_item = &SETTING_ITEMS[self.selected_index];
         let status_span = if let Some((msg, color)) = &self.status_message {
             Span::styled(format!(" Status: {}", msg), Style::default().fg(*color).add_modifier(Modifier::BOLD))
+        } else if self.editing_text {
+            Span::styled(" [Enter] Commit | [Esc] Cancel | [Backspace] Delete", Style::default().fg(Color::Yellow))
+        } else if self.is_current_text() {
+            Span::styled(" [Enter] Edit Text | [S] Save | [R] Reload", Style::default().fg(Color::DarkGray))
         } else {
-            Span::styled(" [Space] Toggle | [Left/Right] Adjust | [S] Save | [R] Reload", Style::default().fg(Color::DarkGray))
+            Span::styled(" [Space/Enter] Toggle | [Left/Right] Adjust/Cycle | [S] Save", Style::default().fg(Color::DarkGray))
         };
 
         let footer_lines = vec![

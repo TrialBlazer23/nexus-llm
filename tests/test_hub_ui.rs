@@ -69,12 +69,8 @@ fn test_hub_tab_cycling_and_titles() {
     assert!(HubTab::Models.title().contains("Models"));
 
     hub.next_tab();
-    assert_eq!(hub.active_tab, HubTab::Dashboard);
-    assert!(HubTab::Dashboard.title().contains("Dashboard"));
-
-    hub.next_tab();
-    assert_eq!(hub.active_tab, HubTab::Tunnel);
-    assert!(HubTab::Tunnel.title().contains("Tunnel"));
+    assert_eq!(hub.active_tab, HubTab::Cluster);
+    assert!(HubTab::Cluster.title().contains("Cluster"));
 
     hub.next_tab();
     assert_eq!(hub.active_tab, HubTab::Settings);
@@ -89,10 +85,7 @@ fn test_hub_tab_cycling_and_titles() {
     assert_eq!(hub.active_tab, HubTab::Settings);
 
     hub.previous_tab();
-    assert_eq!(hub.active_tab, HubTab::Tunnel);
-
-    hub.previous_tab();
-    assert_eq!(hub.active_tab, HubTab::Dashboard);
+    assert_eq!(hub.active_tab, HubTab::Cluster);
 
     hub.previous_tab();
     assert_eq!(hub.active_tab, HubTab::Models);
@@ -153,7 +146,28 @@ fn test_settings_view_navigation_and_mutations() {
     // Verify categories and initial selected field
     assert!(view.item_count() > 0);
     assert_eq!(view.selected_index, 0);
-    assert_eq!(view.current_item().category, "Hardware & Acceleration");
+    assert_eq!(view.current_item().category, "Node Identity");
+
+    // Test enum cycling on Node Mesh Role
+    let role_idx = SettingsView::items().iter().position(|i| i.name == "Node Mesh Role").expect("role field must exist");
+    view.selected_index = role_idx;
+    assert_eq!(view.config.node.role, "host");
+    view.toggle_or_adjust(false, true); // cycle right
+    assert_eq!(view.config.node.role, "client");
+    view.toggle_or_adjust(true, false); // cycle left
+    assert_eq!(view.config.node.role, "host");
+
+    // Test text editing on Node Hostname / Name
+    let name_idx = SettingsView::items().iter().position(|i| i.name.contains("Node Hostname")).expect("name field must exist");
+    view.selected_index = name_idx;
+    assert_eq!(view.is_current_text(), true);
+    view.start_editing();
+    assert_eq!(view.editing_text, true);
+    view.push_char('-');
+    view.push_char('1');
+    view.commit_text();
+    assert_eq!(view.editing_text, false);
+    assert!(view.config.node.name.ends_with("-1"));
 
     // Find and mutate prefer_gpu (boolean toggle)
     let gpu_idx = SettingsView::items().iter().position(|i| i.name == "Prefer Vulkan GPU Acceleration").expect("prefer_gpu field must exist");
@@ -189,6 +203,8 @@ fn test_settings_view_navigation_and_mutations() {
 
     // Verify written TOML
     let loaded = NexusConfig::load_from_path(&config_path).expect("Must load saved config");
+    assert_eq!(loaded.node.role, "host");
+    assert!(loaded.node.name.ends_with("-1"));
     assert_eq!(loaded.hardware.acceleration.prefer_gpu, true);
     assert_eq!(loaded.hardware.acceleration.cpu_threads, 4);
     assert_eq!(loaded.hardware.safety.max_ram_usage_percent, 75);
@@ -239,31 +255,23 @@ async fn test_hub_app_headless_render_all_tabs() {
     assert!(content.contains("Model Architecture & Metadata"), "Must render metadata inspector pane");
     assert!(content.contains("tiny-llama.gguf"), "Must list discovered model");
 
-    // 3. Render Tab 2: Dashboard
-    hub.set_tab(HubTab::Dashboard);
-    terminal.draw(|f| hub.render(f)).expect("Failed to render Dashboard tab");
+    // 3. Render Tab 2: Cluster
+    hub.set_tab(HubTab::Cluster);
+    terminal.draw(|f| hub.render(f)).expect("Failed to render Cluster tab");
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
-    assert!(content.contains("[F3] 🖥️ Dashboard"), "Must render Dashboard tab active");
-    assert!(content.contains("Cluster Monitor"), "Must render cluster monitor header");
-    assert!(content.contains("Memory Utilization"), "Must render memory utilization gauge");
+    assert!(content.contains("[F3] 🌐 Cluster"), "Must render Cluster tab active");
+    assert!(content.contains("Mesh Coordinator"), "Must render cluster header");
+    assert!(content.contains("Local RAM"), "Must render local memory gauge");
 
-    // 4. Render Tab 3: Tunnel
-    hub.set_tab(HubTab::Tunnel);
-    terminal.draw(|f| hub.render(f)).expect("Failed to render Tunnel tab");
-    let buffer = terminal.backend().buffer();
-    let content = format!("{:?}", buffer);
-    assert!(content.contains("[F4] 🔗 USB Tunnel"), "Must render Tunnel tab active");
-    assert!(content.contains("Hardware Transport & USB Device Status"), "Must render tunnel view header");
-    assert!(content.contains("ADB Runtime:"), "Must render ADB runtime status");
-
-    // 5. Render Tab 4: Settings
+    // 4. Render Tab 3: Settings
     hub.set_tab(HubTab::Settings);
     terminal.draw(|f| hub.render(f)).expect("Failed to render Settings tab");
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
-    assert!(content.contains("[F5] ⚙️ Settings"), "Must render Settings tab active");
+    assert!(content.contains("[F4] ⚙️ Settings"), "Must render Settings tab active");
     assert!(content.contains("Configuration & Settings"), "Must render settings editor header");
+    assert!(content.contains("Node Identity"), "Must render Node Identity category");
     assert!(content.contains("Hardware & Acceleration"), "Must render Hardware category");
     assert!(content.contains("Memory & Android LMK Safeguards"), "Must render Memory Safety category");
 }
@@ -331,5 +339,85 @@ async fn test_hub_app_target_node_selection_modal() {
     assert!(content.contains("qwen2.5-coder-7b"), "Must render target model name");
     assert!(content.contains("Local Machine"), "Must list Local Machine option");
     assert!(content.contains("Galaxy-S23"), "Must list remote peer candidate");
+}
+
+#[tokio::test]
+async fn test_cluster_view_interactions() {
+    use nexus::discovery::PeerNode;
+    use nexus::sysinfo::AccelerationBackend;
+    use nexus::ui::cluster_view::ClusterView;
+    use uuid::Uuid;
+
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config, None));
+    let mut cluster = ClusterView::new(discovery);
+
+    // Initial state
+    assert_eq!(cluster.peers.len(), 0);
+    assert_eq!(cluster.selected_index, 0);
+    assert_eq!(cluster.show_info_modal, false);
+    assert_eq!(cluster.adding_peer, false);
+
+    // Simulate adding peers
+    let peer1 = PeerNode {
+        uuid: Uuid::new_v4(),
+        addr: "192.168.1.10:8080".parse().unwrap(),
+        role: nexus::discovery::NodeRole::HOST,
+        status: nexus::discovery::StatusFlags::READY,
+        api_port: 8080,
+        rpc_port: 50052,
+        total_ram_mb: 12000,
+        free_ram_mb: 8192,
+        backend: AccelerationBackend::Vulkan,
+        thermal_index: 45,
+        active_model: "llama-3.2-3b.gguf".to_string(),
+        last_seen: std::time::Instant::now(),
+    };
+    let peer2 = PeerNode {
+        uuid: Uuid::new_v4(),
+        addr: "192.168.1.20:8080".parse().unwrap(),
+        role: nexus::discovery::NodeRole::CLIENT,
+        status: nexus::discovery::StatusFlags::RPC_READY,
+        api_port: 8080,
+        rpc_port: 50052,
+        total_ram_mb: 4000,
+        free_ram_mb: 1800,
+        backend: AccelerationBackend::ArmCpuDotProd,
+        thermal_index: 30,
+        active_model: String::new(),
+        last_seen: std::time::Instant::now(),
+    };
+
+    cluster.peers.push(peer1);
+    cluster.peers.push(peer2);
+
+    assert_eq!(cluster.peers.len(), 2);
+    assert_eq!(cluster.selected_index, 0);
+
+    // Navigation
+    cluster.next();
+    assert_eq!(cluster.selected_index, 1);
+    cluster.next();
+    assert_eq!(cluster.selected_index, 0);
+    cluster.previous();
+    assert_eq!(cluster.selected_index, 1);
+
+    // Modal inspection
+    cluster.toggle_info_modal();
+    assert_eq!(cluster.show_info_modal, true);
+    cluster.toggle_info_modal();
+    assert_eq!(cluster.show_info_modal, false);
+
+    // Static peer input
+    cluster.start_add_peer();
+    assert_eq!(cluster.adding_peer, true);
+    for c in "192.168.1.99:8080".chars() {
+        cluster.push_add_char(c);
+    }
+    assert_eq!(cluster.add_peer_input, "192.168.1.99:8080");
+    cluster.backspace_add_char();
+    assert_eq!(cluster.add_peer_input, "192.168.1.99:808");
+    cluster.cancel_add_peer();
+    assert_eq!(cluster.adding_peer, false);
 }
 

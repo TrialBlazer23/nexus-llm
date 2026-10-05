@@ -164,6 +164,12 @@ pub struct NodeConfig {
 
     #[serde(default = "default_presets_dir")]
     pub presets_dir: PathBuf,
+
+    #[serde(default = "default_llama_server_binary")]
+    pub llama_server_binary: String,
+
+    #[serde(default = "default_rpc_server_binary")]
+    pub rpc_server_binary: String,
 }
 
 impl Default for NodeConfig {
@@ -176,6 +182,8 @@ impl Default for NodeConfig {
             capabilities: vec![NodeCapability::Discovery],
             models_dir: default_models_dir(),
             presets_dir: default_presets_dir(),
+            llama_server_binary: default_llama_server_binary(),
+            rpc_server_binary: default_rpc_server_binary(),
         }
     }
 }
@@ -476,6 +484,14 @@ fn default_models_dir() -> PathBuf {
 
 fn default_presets_dir() -> PathBuf {
     expand_tilde("~/.nexus/presets")
+}
+
+fn default_llama_server_binary() -> String {
+    "llama-server".to_string()
+}
+
+fn default_rpc_server_binary() -> String {
+    "rpc-server".to_string()
 }
 
 fn default_true() -> bool {

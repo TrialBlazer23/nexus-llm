@@ -4,10 +4,9 @@ use crate::discovery::DiscoveryService;
 use crate::supervisor::{LlamaServerConfig, ProcessSupervisor};
 use crate::sysinfo::SystemProfile;
 use crate::ui::chat::{ChatApp, StreamMsg};
-use crate::ui::dashboard::DashboardApp;
+use crate::ui::cluster_view::ClusterView;
 use crate::ui::models_view::ModelsView;
 use crate::ui::settings_view::SettingsView;
-use crate::ui::tunnel_view::TunnelView;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -34,9 +33,8 @@ use uuid::Uuid;
 pub enum HubTab {
     Chat = 0,
     Models = 1,
-    Dashboard = 2,
-    Tunnel = 3,
-    Settings = 4,
+    Cluster = 2,
+    Settings = 3,
 }
 
 impl HubTab {
@@ -44,9 +42,8 @@ impl HubTab {
         match self {
             Self::Chat => " [F1] 💬 Chat ",
             Self::Models => " [F2] 📦 Models ",
-            Self::Dashboard => " [F3] 🖥️ Dashboard ",
-            Self::Tunnel => " [F4] 🔗 USB Tunnel ",
-            Self::Settings => " [F5] ⚙️ Settings ",
+            Self::Cluster => " [F3] 🌐 Cluster ",
+            Self::Settings => " [F4] ⚙️ Settings ",
         }
     }
 }
@@ -95,8 +92,7 @@ pub struct HubApp {
     pub active_tab: HubTab,
     pub chat: ChatApp,
     pub models_view: ModelsView,
-    pub dashboard_view: DashboardApp,
-    pub tunnel_view: TunnelView,
+    pub cluster_view: ClusterView,
     pub settings_view: SettingsView,
     pub supervisor: Option<ProcessSupervisor>,
     pub active_model_name: String,
@@ -108,8 +104,7 @@ pub struct HubApp {
 impl HubApp {
     pub fn new(config: NexusConfig, client: NexusClient, discovery: Arc<DiscoveryService>) -> Self {
         let models_view = ModelsView::new(config.node.models_dir.clone());
-        let dashboard_view = DashboardApp::new(discovery.clone());
-        let tunnel_view = TunnelView::new(config.network.api_port, config.cluster.rpc_port);
+        let cluster_view = ClusterView::new(discovery.clone());
         let settings_view = SettingsView::new(config.clone());
         let chat = ChatApp::new(client, "default", None);
 
@@ -119,8 +114,7 @@ impl HubApp {
             active_tab: HubTab::Chat,
             chat,
             models_view,
-            dashboard_view,
-            tunnel_view,
+            cluster_view,
             settings_view,
             supervisor: None,
             active_model_name: "None (Idle)".to_string(),
@@ -134,33 +128,29 @@ impl HubApp {
         self.active_tab = tab;
         if tab == HubTab::Models {
             self.models_view.refresh();
-        } else if tab == HubTab::Tunnel {
-            self.tunnel_view.refresh();
         }
     }
 
     pub fn next_tab(&mut self) {
-        let next_idx = ((self.active_tab as usize) + 1) % 5;
+        let next_idx = ((self.active_tab as usize) + 1) % 4;
         self.set_tab(match next_idx {
             0 => HubTab::Chat,
             1 => HubTab::Models,
-            2 => HubTab::Dashboard,
-            3 => HubTab::Tunnel,
+            2 => HubTab::Cluster,
             _ => HubTab::Settings,
         });
     }
 
     pub fn previous_tab(&mut self) {
         let prev_idx = if (self.active_tab as usize) == 0 {
-            4
+            3
         } else {
             (self.active_tab as usize) - 1
         };
         self.set_tab(match prev_idx {
             0 => HubTab::Chat,
             1 => HubTab::Models,
-            2 => HubTab::Dashboard,
-            3 => HubTab::Tunnel,
+            2 => HubTab::Cluster,
             _ => HubTab::Settings,
         });
     }
@@ -347,7 +337,7 @@ impl HubApp {
         }
 
         let server_cfg = LlamaServerConfig {
-            binary_path: PathBuf::from("llama-server"),
+            binary_path: PathBuf::from(&self.config.node.llama_server_binary),
             model_path: model_path.clone(),
             host: self.config.network.api_host.clone(),
             port: self.config.network.api_port,
@@ -403,8 +393,7 @@ impl HubApp {
         match self.active_tab {
             HubTab::Chat => self.chat.render_in_area(frame, chunks[1]),
             HubTab::Models => self.models_view.render(frame, chunks[1]),
-            HubTab::Dashboard => self.dashboard_view.render_in_area(frame, chunks[1]),
-            HubTab::Tunnel => self.tunnel_view.render(frame, chunks[1]),
+            HubTab::Cluster => self.cluster_view.render(frame, chunks[1]),
             HubTab::Settings => self.settings_view.render(frame, chunks[1]),
         }
 
@@ -425,8 +414,7 @@ impl HubApp {
         let titles = vec![
             HubTab::Chat.title(),
             HubTab::Models.title(),
-            HubTab::Dashboard.title(),
-            HubTab::Tunnel.title(),
+            HubTab::Cluster.title(),
             HubTab::Settings.title(),
         ];
 
@@ -458,7 +446,7 @@ impl HubApp {
         );
         let footer_line = Line::from(vec![
             Span::styled(
-                " [F1-F5] Tabs ",
+                " [F1-F4] Tabs ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -614,8 +602,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
         tokio::select! {
             _ = refresh_interval.tick() => {
-                if hub.active_tab == HubTab::Dashboard {
-                    hub.dashboard_view.refresh().await;
+                if hub.active_tab == HubTab::Cluster {
+                    hub.cluster_view.refresh().await;
                 }
             }
             Some(event_res) = event_stream.next() => {
@@ -673,13 +661,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         continue;
                     }
 
-                    // Global function keys F1..F5
+                    // Global function keys F1..F4
                     match key.code {
                         KeyCode::F(1) => { hub.set_tab(HubTab::Chat); continue; }
                         KeyCode::F(2) => { hub.set_tab(HubTab::Models); continue; }
-                        KeyCode::F(3) => { hub.set_tab(HubTab::Dashboard); continue; }
-                        KeyCode::F(4) => { hub.set_tab(HubTab::Tunnel); continue; }
-                        KeyCode::F(5) => { hub.set_tab(HubTab::Settings); continue; }
+                        KeyCode::F(3) => { hub.set_tab(HubTab::Cluster); hub.cluster_view.refresh().await; continue; }
+                        KeyCode::F(4) => { hub.set_tab(HubTab::Settings); continue; }
                         _ => {}
                     }
 
@@ -729,35 +716,175 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 _ => {}
                             }
                         }
-                        HubTab::Dashboard => {
-                            match key.code {
-                                KeyCode::Char('r') | KeyCode::Char('R') => hub.dashboard_view.refresh().await,
-                                KeyCode::Tab => hub.next_tab(),
-                                KeyCode::BackTab => hub.previous_tab(),
-                                _ => {}
-                            }
-                        }
-                        HubTab::Tunnel => {
-                            match key.code {
-                                KeyCode::Char('f') | KeyCode::Char('F') => hub.tunnel_view.setup_tunnel(),
-                                KeyCode::Char('t') | KeyCode::Char('T') => hub.tunnel_view.teardown_tunnel(),
-                                KeyCode::Char('r') | KeyCode::Char('R') => hub.tunnel_view.refresh(),
-                                KeyCode::Tab => hub.next_tab(),
-                                KeyCode::BackTab => hub.previous_tab(),
-                                _ => {}
+                        HubTab::Cluster => {
+                            if hub.cluster_view.adding_peer {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let input = hub.cluster_view.add_peer_input.trim().to_string();
+                                        if !input.is_empty() {
+                                            if !hub.config.network.static_peers.contains(&input) {
+                                                hub.config.network.static_peers.push(input.clone());
+                                                let _ = hub.config.save_to_path(crate::config::NexusConfig::default_config_path());
+                                            }
+                                            hub.cluster_view.adding_peer = false;
+                                            hub.cluster_view.add_peer_input.clear();
+                                            hub.cluster_view.status_message = Some((
+                                                format!("Static peer '{}' added to mesh", input),
+                                                Color::Green,
+                                            ));
+                                            hub.cluster_view.refresh().await;
+                                        } else {
+                                            hub.cluster_view.cancel_add_peer();
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        hub.cluster_view.cancel_add_peer();
+                                    }
+                                    KeyCode::Backspace => {
+                                        hub.cluster_view.backspace_add_char();
+                                    }
+                                    KeyCode::Char(c) => {
+                                        hub.cluster_view.push_add_char(c);
+                                    }
+                                    _ => {}
+                                }
+                            } else if hub.cluster_view.show_info_modal {
+                                match key.code {
+                                    KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Esc => {
+                                        hub.cluster_view.toggle_info_modal();
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => hub.cluster_view.previous(),
+                                    KeyCode::Down | KeyCode::Char('j') => hub.cluster_view.next(),
+                                    KeyCode::Enter => {
+                                        if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            let ep = peer.api_endpoint();
+                                            let model = if !peer.active_model.is_empty() {
+                                                peer.active_model.clone()
+                                            } else {
+                                                "cluster-peer".to_string()
+                                            };
+                                            hub.chat.client = NexusClient::new(ep.clone());
+                                            hub.chat.model_name = model.clone();
+                                            hub.active_model_name = model.clone();
+                                            hub.status_message = Some((format!("Connected to peer at {}", ep), Color::Green));
+                                            hub.chat.messages.push(ChatMessage::assistant(format!(
+                                                "Connected to remote peer '{}' at {}. Ready for chat.",
+                                                peer.uuid, ep
+                                            )));
+                                            hub.set_tab(HubTab::Chat);
+                                        } else {
+                                            hub.cluster_view.status_message = Some(("No peer selected to connect".to_string(), Color::Yellow));
+                                        }
+                                    }
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            let peer_uuid = peer.uuid;
+                                            let peer_name = format!("Node-{}", &peer_uuid.to_string()[..8]);
+                                            let peer_ep = peer.api_endpoint();
+                                            if let Some(m) = hub.models_view.selected_model() {
+                                                let client = reqwest::Client::new();
+                                                let model_name = m.filename.clone();
+                                                let req = crate::control_plane::ModelLoadRequest {
+                                                    protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
+                                                    requester_id: hub.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
+                                                    model_path: model_name.clone(),
+                                                    context_size: 4096,
+                                                    gpu_layers: if hub.config.hardware.acceleration.prefer_gpu { 99 } else { 0 },
+                                                    threads: hub.config.hardware.acceleration.cpu_threads,
+                                                    rpc_workers: Vec::new(),
+                                                };
+                                                match crate::control_plane::dispatch_load_model(&client, &peer_ep, &req).await {
+                                                    Ok(resp) if resp.success => {
+                                                        hub.active_model_name = model_name.clone();
+                                                        let target_api = if !resp.api_endpoint.is_empty() { resp.api_endpoint } else { peer_ep.clone() };
+                                                        hub.chat.client = NexusClient::new(target_api);
+                                                        hub.chat.model_name = model_name.clone();
+                                                        hub.chat.messages.push(ChatMessage::assistant(format!(
+                                                            "Loaded '{}' on remote node {}.", model_name, peer_name
+                                                        )));
+                                                        hub.status_message = Some((format!("Active on {}: {}", peer_name, model_name), Color::Green));
+                                                        hub.set_tab(HubTab::Chat);
+                                                    }
+                                                    Ok(resp) => {
+                                                        let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
+                                                        hub.cluster_view.status_message = Some((format!("Load failed on {}: {}", peer_name, err), Color::Red));
+                                                    }
+                                                    Err(e) => {
+                                                        hub.cluster_view.status_message = Some((format!("Dispatch error to {}: {}", peer_name, e), Color::Red));
+                                                    }
+                                                }
+                                            } else {
+                                                hub.cluster_view.status_message = Some(("Select a model in [F2] Models first".to_string(), Color::Yellow));
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('w') | KeyCode::Char('W') => {
+                                        if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            let ep = peer.api_endpoint();
+                                            let short_id = &peer.uuid.to_string()[..8];
+                                            hub.cluster_view.status_message = Some((
+                                                format!("Requested Node-{} at {} to stand by for RPC worker offload", short_id, ep),
+                                                Color::Cyan,
+                                            ));
+                                        }
+                                    }
+                                    KeyCode::Char('i') | KeyCode::Char('I') => hub.cluster_view.toggle_info_modal(),
+                                    KeyCode::Char('a') | KeyCode::Char('A') => hub.cluster_view.start_add_peer(),
+                                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                                        let local_ep = format!("http://127.0.0.1:{}", hub.config.network.api_port);
+                                        hub.chat.client = NexusClient::new(local_ep.clone());
+                                        hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
+                                        hub.chat.messages.push(ChatMessage::assistant(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
+                                    }
+                                    KeyCode::Char('r') | KeyCode::Char('R') => hub.cluster_view.refresh().await,
+                                    KeyCode::Tab => hub.next_tab(),
+                                    KeyCode::BackTab => hub.previous_tab(),
+                                    _ => {}
+                                }
                             }
                         }
                         HubTab::Settings => {
-                            match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => hub.settings_view.previous(),
-                                KeyCode::Down | KeyCode::Char('j') => hub.settings_view.next(),
-                                KeyCode::Char(' ') | KeyCode::Enter => hub.settings_view.toggle_or_adjust(false, false),
-                                KeyCode::Left | KeyCode::Char('h') => hub.settings_view.toggle_or_adjust(true, false),
-                                KeyCode::Right | KeyCode::Char('l') => hub.settings_view.toggle_or_adjust(false, true),
-                                KeyCode::Char('s') | KeyCode::Char('S') => { let _ = hub.settings_view.save(); },
-                                KeyCode::Tab => hub.next_tab(),
-                                KeyCode::BackTab => hub.previous_tab(),
-                                _ => {}
+                            if hub.settings_view.editing_text {
+                                match key.code {
+                                    KeyCode::Enter => hub.settings_view.commit_text(),
+                                    KeyCode::Esc => hub.settings_view.cancel_text(),
+                                    KeyCode::Backspace => hub.settings_view.backspace_text(),
+                                    KeyCode::Char(c) => hub.settings_view.push_char(c),
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => hub.settings_view.previous(),
+                                    KeyCode::Down | KeyCode::Char('j') => hub.settings_view.next(),
+                                    KeyCode::Enter => {
+                                        if hub.settings_view.is_current_text() {
+                                            hub.settings_view.start_editing();
+                                        } else {
+                                            hub.settings_view.toggle_or_adjust(false, false);
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => hub.settings_view.toggle_or_adjust(false, false),
+                                    KeyCode::Left | KeyCode::Char('h') => hub.settings_view.toggle_or_adjust(true, false),
+                                    KeyCode::Right | KeyCode::Char('l') => hub.settings_view.toggle_or_adjust(false, true),
+                                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                                        if let Ok(()) = hub.settings_view.save() {
+                                            hub.config = hub.settings_view.config.clone();
+                                            hub.models_view.models_dir = hub.config.node.models_dir.clone();
+                                            hub.models_view.refresh();
+                                            if let Some(host) = &hub.config.network.default_host {
+                                                hub.chat.client = NexusClient::new(host.clone());
+                                            }
+                                            hub.status_message = Some(("Settings saved & hot-reloaded".to_string(), Color::Green));
+                                        }
+                                    }
+                                    KeyCode::Tab => hub.next_tab(),
+                                    KeyCode::BackTab => hub.previous_tab(),
+                                    _ => {}
+                                }
                             }
                         }
                     }

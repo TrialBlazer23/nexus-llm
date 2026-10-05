@@ -1,7 +1,7 @@
 use clap::Parser;
 use nexus::config::NexusConfig;
 use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
-use nexus::sysinfo::SystemProfile;
+use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -52,8 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set tracing subscriber");
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     let args = Args::parse();
 
@@ -65,22 +64,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         NexusConfig::load()?
     };
-    info!("Node Role: {}, Models Dir: {:?}", config.node.role, config.node.models_dir);
+    info!(
+        "Node Role: {}, Models Dir: {:?}",
+        config.node.role, config.node.models_dir
+    );
 
     // 2. System Introspection & Android LMK Profiling
     let profile = SystemProfile::probe();
     info!("Hardware Introspection:");
     info!("  Total RAM: {} MB", profile.total_ram_mb);
     info!("  Available RAM: {} MB", profile.available_ram_mb);
-    info!("  Memory Safety Cap (75%): {} MB", profile.max_allowed_memory_bytes() / (1024 * 1024));
+    info!(
+        "  Memory Safety Cap (75%): {} MB",
+        profile.max_allowed_memory_bytes() / (1024 * 1024)
+    );
     info!("  Detected Backend: {}", profile.detected_backend);
     info!("  Recommended CPU Threads: {}", profile.recommended_threads);
 
     // 3. Start Autonomous UDP Discovery Service
-    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::new(config.clone(), None));
-    let _broadcaster_handle = discovery.clone().start_broadcaster();
-    let _listener_handle = discovery.clone().start_listener();
-    info!("Autonomous discovery daemon active (Node UUID: {})", discovery.node_uuid());
+    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::new(
+        config.clone(),
+        None,
+    ));
+    let listener_handle = discovery.clone().start_listener();
+    info!(
+        "Autonomous discovery daemon active (Node UUID: {})",
+        discovery.node_uuid()
+    );
 
     // 4. Optional Model Launch
     if let Some(model_path) = args.model {
@@ -107,7 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut extra_args = Vec::new();
 
-        if total_required_mb > host_cap_mb || total_required_mb > nexus::cluster::NODE_A_MAX_STANDALONE_MB {
+        if total_required_mb > host_cap_mb
+            || total_required_mb > nexus::cluster::NODE_A_MAX_STANDALONE_MB
+        {
             info!(
                 "Model memory requirement ({} MB) exceeds Node A standalone budget ({} MB). Evaluating cluster offload...",
                 total_required_mb, host_cap_mb
@@ -119,7 +131,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Probing subnet for available RPC worker peer...");
                 discovery.send_probe().await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                discovery.find_best_rpc_peer().await.map(|p| p.rpc_endpoint())
+                discovery
+                    .select_rpc_candidate(nexus::discovery::RpcSelectionPolicy {
+                        max_thermal_index: 75,
+                        max_allocatable_mb: config.cluster.max_rpc_ram_mb,
+                        require_pairing: config.network.security.require_pairing,
+                    })
+                    .await
+                    .map(|candidate| candidate.peer.rpc_endpoint())
             } else {
                 None
             };
@@ -130,7 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let budget = nexus::cluster::ClusterCoordinator::calculate_budget(profile.available_ram_mb, remote_ram);
+            let budget = nexus::cluster::ClusterCoordinator::calculate_budget(
+                profile.available_ram_mb,
+                remote_ram,
+            );
 
             let total_layers = if let Ok(gguf) = nexus::gguf::GgufMetadata::open(&model_path) {
                 gguf.block_count.unwrap_or(32) as u32
@@ -169,10 +191,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             extra_args,
         };
 
-        info!("Launching model {:?} with context size {}", model_path, args.ctx);
+        info!(
+            "Launching model {:?} with context size {}",
+            model_path, args.ctx
+        );
         match ProcessSupervisor::spawn_with_fallback(server_cfg).await {
             Ok(mut supervisor) => {
-                info!("Server supervisor active on backend: {}", supervisor.active_backend());
+                info!(
+                    "Server supervisor active on backend: {}",
+                    supervisor.active_backend()
+                );
+                let mut status = nexus::discovery::StatusFlags::READY;
+                if supervisor.active_backend() == AccelerationBackend::Vulkan {
+                    status.0 |= nexus::discovery::StatusFlags::VULKAN_ACTIVE.0;
+                }
+                discovery.set_status_flags(status).await;
+                let broadcaster_handle = discovery.clone().start_broadcaster();
                 info!("Listening for termination signal (Ctrl+C)...");
                 tokio::select! {
                     res = tokio::signal::ctrl_c() => {
@@ -186,17 +220,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         error!("llama-server process exited unexpectedly: {:?}", exit_res);
                     }
                 }
+                discovery
+                    .set_status_flags(nexus::discovery::StatusFlags(0))
+                    .await;
                 supervisor.stop().await?;
+                broadcaster_handle.abort();
+                listener_handle.abort();
                 info!("Shutdown complete.");
             }
             Err(e) => {
+                listener_handle.abort();
                 error!("Failed to launch supervisor: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
+        let broadcaster_handle = discovery.clone().start_broadcaster();
         info!("No model specified. Daemon idle. Broadcasting beacon. Press Ctrl+C to exit.");
         tokio::signal::ctrl_c().await?;
+        discovery
+            .set_status_flags(nexus::discovery::StatusFlags(0))
+            .await;
+        broadcaster_handle.abort();
+        listener_handle.abort();
         info!("Daemon stopped.");
     }
 

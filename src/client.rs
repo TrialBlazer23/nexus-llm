@@ -137,11 +137,14 @@ impl NexusClient {
         discovery: &DiscoveryService,
         timeout: Duration,
     ) -> Result<Self, ClientError> {
-        info!("Resolving compute host via autonomous discovery (timeout: {:?})...", timeout);
+        info!(
+            "Resolving compute host via autonomous discovery (timeout: {:?})...",
+            timeout
+        );
         let start = tokio::time::Instant::now();
 
         while start.elapsed() < timeout {
-            if let Some(host) = discovery.find_best_host().await {
+            if let Some(host) = discovery.resolve_primary_compute_anchor().await {
                 info!(
                     "Discovered active host: {} at {} (Model: {:?}, Vulkan: {})",
                     host.uuid,
@@ -163,7 +166,10 @@ impl NexusClient {
                 };
                 let test_client = Self::new(&endpoint);
                 if let Ok(true) = test_client.health().await {
-                    info!("Discovered active host via static peer health check: {}", endpoint);
+                    info!(
+                        "Discovered active host via static peer health check: {}",
+                        endpoint
+                    );
                     return Ok(test_client);
                 }
             }
@@ -210,7 +216,10 @@ impl NexusClient {
     }
 
     /// Execute a non-streaming chat completion request.
-    pub async fn complete_chat(&self, mut req: ChatCompletionRequest) -> Result<String, ClientError> {
+    pub async fn complete_chat(
+        &self,
+        mut req: ChatCompletionRequest,
+    ) -> Result<String, ClientError> {
         req.stream = false;
         let url = format!("{}/v1/chat/completions", self.endpoint);
 

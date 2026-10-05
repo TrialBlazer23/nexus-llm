@@ -38,8 +38,13 @@ pub struct ServiceEndpoint {
 pub enum DiscoveryEvent {
     ServiceFound(ServiceEndpoint),
     ServiceUpdated(ServiceEndpoint),
-    ServiceRemoved { node_id: Uuid },
-    BackendHealth { backend: &'static str, health: BackendHealth },
+    ServiceRemoved {
+        node_id: Uuid,
+    },
+    BackendHealth {
+        backend: &'static str,
+        health: BackendHealth,
+    },
 }
 
 pub const BEACON_MAGIC: u32 = 0x4E585553; // "NXUS"
@@ -263,7 +268,10 @@ impl BeaconPacket {
 
         // 0x26 - 0x3D: Active Model
         let model_slice = &buf[38..62];
-        let null_pos = model_slice.iter().position(|&b| b == 0).unwrap_or(model_slice.len());
+        let null_pos = model_slice
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(model_slice.len());
         let active_model = String::from_utf8_lossy(&model_slice[..null_pos]).to_string();
 
         Ok(Self {
@@ -289,7 +297,7 @@ pub fn compute_crc16(data: &[u8]) -> u16 {
 }
 
 /// Discovered peer representation in local peer cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerNode {
     pub uuid: Uuid,
     pub addr: SocketAddr,
@@ -304,6 +312,20 @@ pub struct PeerNode {
     pub active_model: String,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcSelectionPolicy {
+    pub max_thermal_index: u8,
+    pub max_allocatable_mb: u64,
+    pub require_pairing: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcCandidate {
+    pub peer: PeerNode,
+    pub allocatable_mb: u64,
+    pub rationale: String,
 }
 
 impl PeerNode {
@@ -351,11 +373,7 @@ impl DiscoveryService {
             .unwrap_or_else(Uuid::new_v4);
         let max_peers = config.network.discovery.max_peers;
         let peer_timeout = Duration::from_millis(config.network.discovery.peer_timeout_ms);
-        let default_status = if config.hardware.acceleration.prefer_gpu {
-            StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0)
-        } else {
-            StatusFlags::READY
-        };
+        let default_status = StatusFlags(0);
 
         Self {
             config,
@@ -441,7 +459,10 @@ impl DiscoveryService {
 
         // 2. Subnet directed broadcast addresses (e.g. 192.168.6.255)
         for bcast_ip in get_broadcast_addresses() {
-            let addr = SocketAddr::new(std::net::IpAddr::V4(bcast_ip), config.network.discovery_port);
+            let addr = SocketAddr::new(
+                std::net::IpAddr::V4(bcast_ip),
+                config.network.discovery_port,
+            );
             if !targets.contains(&addr) {
                 targets.push(addr);
             }
@@ -583,7 +604,10 @@ impl DiscoveryService {
 
     pub fn start_listener_with_events(
         self: Arc<Self>,
-    ) -> (tokio::sync::mpsc::Receiver<DiscoveryEvent>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         let task = Self::start_listener_inner(self, Some(sender));
         (receiver, task)
@@ -601,7 +625,10 @@ impl DiscoveryService {
             let socket = match create_listener_socket(self.config.network.discovery_port) {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("Failed to bind discovery listener to port {}: {}", self.config.network.discovery_port, e);
+                    error!(
+                        "Failed to bind discovery listener to port {}: {}",
+                        self.config.network.discovery_port, e
+                    );
                     if let Some(sender) = &events {
                         let _ = sender
                             .send(DiscoveryEvent::BackendHealth {
@@ -614,7 +641,10 @@ impl DiscoveryService {
                 }
             };
 
-            info!("Discovery listener active on port {}", self.config.network.discovery_port);
+            info!(
+                "Discovery listener active on port {}",
+                self.config.network.discovery_port
+            );
             if let Some(sender) = &events {
                 let _ = sender
                     .send(DiscoveryEvent::BackendHealth {
@@ -636,7 +666,10 @@ impl DiscoveryService {
                                         continue;
                                     }
 
-                                    debug!("Received valid beacon from {:?} ({:?})", peer_addr, beacon.uuid);
+                                    debug!(
+                                        "Received valid beacon from {:?} ({:?})",
+                                        peer_addr, beacon.uuid
+                                    );
                                     let peer = PeerNode {
                                         uuid: beacon.uuid,
                                         addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
@@ -672,9 +705,13 @@ impl DiscoveryService {
                                     }
 
                                     // If this node is a host and received a client beacon/probe, reply unicast immediately
-                                    let is_host_node = NodeRole::from_str_role(&self.config.node.role).is_host();
+                                    let is_host_node =
+                                        NodeRole::from_str_role(&self.config.node.role).is_host();
                                     if is_host_node && beacon.role.is_client() {
-                                        let reply_addr = SocketAddr::new(peer_addr.ip(), self.config.network.discovery_port);
+                                        let reply_addr = SocketAddr::new(
+                                            peer_addr.ip(),
+                                            self.config.network.discovery_port,
+                                        );
                                         let profile = SystemProfile::probe();
                                         let reply_beacon = BeaconPacket {
                                             magic: BEACON_MAGIC,
@@ -695,7 +732,11 @@ impl DiscoveryService {
                                     }
                                 }
                                 Err(e) => {
-                                    trace!("Discarding invalid discovery packet from {}: {}", peer_addr, e);
+                                    trace!(
+                                        "Discarding invalid discovery packet from {}: {}",
+                                        peer_addr,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -718,6 +759,7 @@ impl DiscoveryService {
     }
 
     /// Select the best compute host peer currently available on the subnet.
+    #[deprecated(note = "use resolve_primary_compute_anchor")]
     pub async fn find_best_host(&self) -> Option<PeerNode> {
         let active = self.get_active_peers().await;
         active
@@ -738,12 +780,67 @@ impl DiscoveryService {
     }
 
     /// Select the best RPC peer node currently available on the subnet (highest free RAM).
+    #[deprecated(note = "use select_rpc_candidate")]
     pub async fn find_best_rpc_peer(&self) -> Option<PeerNode> {
         let active = self.get_active_peers().await;
         active
             .into_iter()
             .filter(|p| p.is_rpc_ready())
             .max_by_key(|p| p.free_ram_mb)
+    }
+
+    pub async fn resolve_primary_compute_anchor(&self) -> Option<PeerNode> {
+        let anchor = self.config.network.anchors.primary_compute_id?;
+        self.get_active_peers()
+            .await
+            .into_iter()
+            .find(|peer| peer.uuid == anchor && peer.role.is_host() && peer.status.is_ready())
+    }
+
+    pub async fn rpc_candidates(&self, policy: RpcSelectionPolicy) -> Vec<RpcCandidate> {
+        let mut candidates = self
+            .get_active_peers()
+            .await
+            .into_iter()
+            .filter(|peer| {
+                peer.is_rpc_ready()
+                    && peer.status.is_ready()
+                    && peer.thermal_index <= policy.max_thermal_index
+                    && (!policy.require_pairing
+                        || self
+                            .config
+                            .network
+                            .security
+                            .allowed_peer_ids
+                            .contains(&peer.uuid))
+            })
+            .map(|peer| {
+                let allocatable_mb = u64::from(peer.free_ram_mb)
+                    .min(policy.max_allocatable_mb)
+                    .min(crate::cluster::NODE_B_MAX_RPC_RAM_MB);
+                RpcCandidate {
+                    rationale: format!(
+                        "healthy RPC-ready peer; allocatable budget capped at {} MB",
+                        allocatable_mb
+                    ),
+                    peer,
+                    allocatable_mb,
+                }
+            })
+            .filter(|candidate| candidate.allocatable_mb > 0)
+            .collect::<Vec<_>>();
+
+        candidates.sort_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.allocatable_mb),
+                candidate.peer.uuid,
+            )
+        });
+        candidates
+    }
+
+    pub async fn select_rpc_candidate(&self, policy: RpcSelectionPolicy) -> Option<RpcCandidate> {
+        self.rpc_candidates(policy).await.into_iter().next()
     }
 }
 

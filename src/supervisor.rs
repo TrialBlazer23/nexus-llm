@@ -5,6 +5,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tracing::{debug, error, info, trace, warn};
 
 #[derive(Error, Debug)]
@@ -33,6 +34,14 @@ pub enum SupervisorError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorState {
+    Starting,
+    Ready,
+    Stopped,
+    Failed,
 }
 
 /// Configuration parameters for spawning the underlying llama-server instance.
@@ -100,6 +109,7 @@ pub struct ProcessSupervisor {
     config: LlamaServerConfig,
     active_backend: AccelerationBackend,
     client: reqwest::Client,
+    state_tx: watch::Sender<SupervisorState>,
 }
 
 impl ProcessSupervisor {
@@ -111,6 +121,14 @@ impl ProcessSupervisor {
     /// Return reference to configuration.
     pub fn config(&self) -> &LlamaServerConfig {
         &self.config
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<SupervisorState> {
+        self.state_tx.subscribe()
+    }
+
+    pub fn state(&self) -> SupervisorState {
+        *self.state_tx.borrow()
     }
 
     /// Spawn llama-server with Vulkan GPU offload if requested, automatically
@@ -153,7 +171,10 @@ impl ProcessSupervisor {
 
         // Attempt 1: Vulkan offload if requested
         if config.gpu_layers > 0 {
-            info!("Attempting to spawn llama-server with Vulkan offload (-ngl {})", config.gpu_layers);
+            info!(
+                "Attempting to spawn llama-server with Vulkan offload (-ngl {})",
+                config.gpu_layers
+            );
             match Self::try_spawn(&config, config.gpu_layers).await {
                 Ok((mut child, mut stdout_reader, mut stderr_reader)) => {
                     // Check if Vulkan initialization succeeds or fails
@@ -162,45 +183,60 @@ impl ProcessSupervisor {
                         &mut stdout_reader,
                         &mut stderr_reader,
                         Duration::from_secs(4),
-                    ).await;
+                    )
+                    .await;
 
                     match vulkan_result {
                         Ok(()) => {
                             info!("Vulkan acceleration successfully initialized.");
                             Self::spawn_drain_tasks(stdout_reader, stderr_reader);
+                            let (state_tx, _) = watch::channel(SupervisorState::Starting);
                             let mut supervisor = Self {
                                 child: Some(child),
                                 config: config.clone(),
                                 active_backend: AccelerationBackend::Vulkan,
                                 client: http_client.clone(),
+                                state_tx,
                             };
 
                             // Wait for /health endpoint readiness
                             if supervisor.wait_until_ready(Duration::from_secs(15)).await {
+                                let _ = supervisor.state_tx.send(SupervisorState::Ready);
                                 return Ok(supervisor);
                             } else {
                                 warn!("Health check timed out on Vulkan backend. Terminating...");
+                                let _ = supervisor.state_tx.send(SupervisorState::Failed);
                                 let _ = supervisor.stop().await;
                             }
                         }
                         Err(err_msg) => {
-                            warn!("Vulkan initialization failed ({}); falling back to CPU mode...", err_msg);
+                            warn!(
+                                "Vulkan initialization failed ({}); falling back to CPU mode...",
+                                err_msg
+                            );
                             // Kill failed child cleanly
                             let _ = child.kill().await;
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to spawn with Vulkan flags: {}; falling back to CPU mode...", e);
+                    warn!(
+                        "Failed to spawn with Vulkan flags: {}; falling back to CPU mode...",
+                        e
+                    );
                 }
             }
         }
 
         // Attempt 2: CPU fallback
-        info!("Spawning llama-server in CPU mode (-ngl 0, threads: {})", config.threads);
+        info!(
+            "Spawning llama-server in CPU mode (-ngl 0, threads: {})",
+            config.threads
+        );
         let (child, stdout_reader, stderr_reader) = Self::try_spawn(&config, 0).await?;
         Self::spawn_drain_tasks(stdout_reader, stderr_reader);
 
+        let (state_tx, _) = watch::channel(SupervisorState::Starting);
         let mut supervisor = Self {
             child: Some(child),
             config: config.clone(),
@@ -210,13 +246,16 @@ impl ProcessSupervisor {
                 AccelerationBackend::X86Baseline
             },
             client: http_client,
+            state_tx,
         };
 
         if !supervisor.wait_until_ready(Duration::from_secs(20)).await {
+            let _ = supervisor.state_tx.send(SupervisorState::Failed);
             let _ = supervisor.stop().await;
             return Err(SupervisorError::HealthCheckTimeout(Duration::from_secs(20)));
         }
 
+        let _ = supervisor.state_tx.send(SupervisorState::Ready);
         info!("llama-server successfully running on CPU backend.");
         Ok(supervisor)
     }
@@ -262,7 +301,10 @@ impl ProcessSupervisor {
         SupervisorError,
     > {
         let args = config.build_args(gpu_layers);
-        debug!("Spawning process: {:?} with args: {:?}", config.binary_path, args);
+        debug!(
+            "Spawning process: {:?} with args: {:?}",
+            config.binary_path, args
+        );
 
         let mut cmd = Command::new(&config.binary_path);
         cmd.args(&args)
@@ -270,7 +312,9 @@ impl ProcessSupervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd.spawn().map_err(|e| SupervisorError::SpawnFailed(e.to_string()))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SupervisorError::SpawnFailed(e.to_string()))?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             SupervisorError::SpawnFailed("Failed to capture child stdout".to_string())
@@ -379,15 +423,23 @@ impl ProcessSupervisor {
     /// Wait asynchronously for child process to exit.
     pub async fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
         if let Some(child) = &mut self.child {
-            child.wait().await
+            let result = child.wait().await;
+            if result.is_ok() {
+                let _ = self.state_tx.send(SupervisorState::Failed);
+            }
+            result
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No child process running"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No child process running",
+            ))
         }
     }
 
     /// Gracefully stop the underlying llama-server child process.
     pub async fn stop(&mut self) -> Result<(), SupervisorError> {
         if let Some(mut child) = self.child.take() {
+            let _ = self.state_tx.send(SupervisorState::Stopped);
             if let Some(pid) = child.id() {
                 info!("Sending SIGTERM to llama-server (PID: {})...", pid);
                 unsafe {

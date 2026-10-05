@@ -66,11 +66,7 @@ pub struct HubApp {
 }
 
 impl HubApp {
-    pub fn new(
-        config: NexusConfig,
-        client: NexusClient,
-        discovery: Arc<DiscoveryService>,
-    ) -> Self {
+    pub fn new(config: NexusConfig, client: NexusClient, discovery: Arc<DiscoveryService>) -> Self {
         let models_view = ModelsView::new(config.node.models_dir.clone());
         let dashboard_view = DashboardApp::new(discovery.clone());
         let tunnel_view = TunnelView::new(config.network.api_port, config.cluster.rpc_port);
@@ -166,15 +162,27 @@ impl HubApp {
 
         let mut extra_args = Vec::new();
 
-        if total_required_mb > host_cap_mb || total_required_mb > crate::cluster::NODE_A_MAX_STANDALONE_MB {
-            let rpc_peer = self.discovery.find_best_rpc_peer().await;
-            let rpc_endpoint = rpc_peer.map(|p| p.rpc_endpoint());
+        if total_required_mb > host_cap_mb
+            || total_required_mb > crate::cluster::NODE_A_MAX_STANDALONE_MB
+        {
+            let rpc_peer = self
+                .discovery
+                .select_rpc_candidate(crate::discovery::RpcSelectionPolicy {
+                    max_thermal_index: 75,
+                    max_allocatable_mb: self.config.cluster.max_rpc_ram_mb,
+                    require_pairing: self.config.network.security.require_pairing,
+                })
+                .await;
+            let rpc_endpoint = rpc_peer.map(|candidate| candidate.peer.rpc_endpoint());
             let remote_ram = if rpc_endpoint.is_some() {
                 Some(self.config.cluster.max_rpc_ram_mb)
             } else {
                 None
             };
-            let budget = crate::cluster::ClusterCoordinator::calculate_budget(profile.available_ram_mb, remote_ram);
+            let budget = crate::cluster::ClusterCoordinator::calculate_budget(
+                profile.available_ram_mb,
+                remote_ram,
+            );
 
             let total_layers = if let Ok(gguf) = crate::gguf::GgufMetadata::open(&model_path) {
                 gguf.block_count.unwrap_or(32) as u32
@@ -227,7 +235,8 @@ impl HubApp {
                     self.active_model_name
                 )));
 
-                self.status_message = Some((format!("Active: {}", self.active_model_name), Color::Green));
+                self.status_message =
+                    Some((format!("Active: {}", self.active_model_name), Color::Green));
                 // Automatically switch to Chat tab!
                 self.set_tab(HubTab::Chat);
             }
@@ -298,9 +307,18 @@ impl HubApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let active_str = format!("Model: {} | Host: {}", self.active_model_name, self.chat.client.endpoint());
+        let active_str = format!(
+            "Model: {} | Host: {}",
+            self.active_model_name,
+            self.chat.client.endpoint()
+        );
         let footer_line = Line::from(vec![
-            Span::styled(" [F1-F5] Tabs ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [F1-F5] Tabs ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(active_str, Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
@@ -321,28 +339,36 @@ impl HubApp {
             .unwrap_or_else(|| "new model".to_string());
 
         let lines = vec![
-            Line::from(vec![
-                Span::styled(" Model Hot-Swap Confirmation", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("\nActive Model:   {}", self.active_model_name), Style::default().fg(Color::White)),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("Target Model:   {}", target_name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled("\nUnload active model and launch new model? [Y / N]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled(
+                " Model Hot-Swap Confirmation",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(
+                format!("\nActive Model:   {}", self.active_model_name),
+                Style::default().fg(Color::White),
+            )]),
+            Line::from(vec![Span::styled(
+                format!("Target Model:   {}", target_name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(
+                "\nUnload active model and launch new model? [Y / N]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )]),
         ];
 
-        let block = Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(" Hot-Swap ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
+        let block = Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .title(" Hot-Swap ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
 
         frame.render_widget(block, modal_area);
     }

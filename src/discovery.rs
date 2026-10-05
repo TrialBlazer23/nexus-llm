@@ -1,4 +1,5 @@
 use crate::config::NexusConfig;
+use crate::peer_registry::{ObservationSource, PeerRegistry};
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -337,6 +338,7 @@ pub struct DiscoveryService {
     config: NexusConfig,
     node_uuid: Uuid,
     peers: Arc<RwLock<HashMap<Uuid, PeerNode>>>,
+    registry: Arc<RwLock<PeerRegistry>>,
     active_model: Arc<RwLock<String>>,
     status_flags: Arc<RwLock<StatusFlags>>,
     rpc_port: Arc<RwLock<u16>>,
@@ -347,6 +349,8 @@ impl DiscoveryService {
         let node_uuid = custom_uuid
             .or_else(|| config.node_uuid().ok())
             .unwrap_or_else(Uuid::new_v4);
+        let max_peers = config.network.discovery.max_peers;
+        let peer_timeout = Duration::from_millis(config.network.discovery.peer_timeout_ms);
         let default_status = if config.hardware.acceleration.prefer_gpu {
             StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0)
         } else {
@@ -357,6 +361,10 @@ impl DiscoveryService {
             config,
             node_uuid,
             peers: Arc::new(RwLock::new(HashMap::new())),
+            registry: Arc::new(RwLock::new(
+                PeerRegistry::new(max_peers, peer_timeout)
+                    .expect("validated discovery peer limit must be non-zero"),
+            )),
             active_model: Arc::new(RwLock::new(String::new())),
             status_flags: Arc::new(RwLock::new(default_status)),
             rpc_port: Arc::new(RwLock::new(0)),
@@ -369,6 +377,10 @@ impl DiscoveryService {
 
     pub fn peers(&self) -> Arc<RwLock<HashMap<Uuid, PeerNode>>> {
         self.peers.clone()
+    }
+
+    pub fn peer_registry(&self) -> Arc<RwLock<PeerRegistry>> {
+        self.registry.clone()
     }
 
     pub async fn set_active_model(&self, model_name: impl Into<String>) {
@@ -648,6 +660,13 @@ impl DiscoveryService {
                                     };
                                     peers.insert(beacon.uuid, peer);
                                     drop(peers);
+                                    if let Err(error) = self.registry.write().await.apply_event(
+                                        event.clone(),
+                                        ObservationSource::Udp,
+                                        Instant::now(),
+                                    ) {
+                                        warn!("Rejected UDP peer observation: {}", error);
+                                    }
                                     if let Some(sender) = &events {
                                         let _ = sender.send(event).await;
                                     }

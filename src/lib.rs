@@ -1,10 +1,12 @@
 pub mod client;
 pub mod cluster;
 pub mod config;
+pub mod control_plane;
 pub mod discovery;
 pub mod mdns;
 pub mod downloader;
 pub mod gguf;
+pub mod peer_registry;
 pub mod preset;
 pub mod supervisor;
 pub mod sysinfo;

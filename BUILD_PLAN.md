@@ -87,13 +87,19 @@ Verification Command
 cargo test --test test_discovery
 
 
-<!-- STREAMING_CHUNK:Specifying Phase 3 GGUF inspection and model management -->
-Phase 3: Zero-Copy GGUF Inspection & Persona Engine
+<!-- STREAMING_CHUNK:Specifying merged Phase 3 registry, control plane, and model management -->
+Phase 3: Peer Registry, Control-Plane Validation, & Model Management
 Antigravity Directive
-antigravity run --task "Phase 3: GGUF Metadata Parser and Persona Engine"
+antigravity run --task "Phase 3: Peer Registry, Control Plane, GGUF Metadata, and Persona Engine"
 
 
 Objectives
+Implement src/peer_registry.rs:
+Maintain one authoritative event-driven peer registry per runtime, merging UDP, mDNS, static, and verified control-plane observations by stable node UUID.
+Track discovered, verifying, healthy, stale, removed, and rejected lifecycle states with bounded metadata, endpoint conflict handling, and expiry.
+Implement src/control_plane.rs:
+Validate a bounded versioned Nexus-owned control-plane state response for identity, protocol, role, readiness, capabilities, and policy-capped allocatable memory.
+Keep control-plane management separate from llama-server inference and SSE endpoints.
 Implement src/gguf.rs:
 Zero-copy binary parser for GGUF headers and key-value metadata arrays.
 Extract architecture (llama, qwen2, gemma2), context length, and tensor count directly without loading weights into RAM.
@@ -101,7 +107,8 @@ Implement src/preset.rs:
 YAML persona engine loading system prompts, temperature, top_p, and chat formatting templates (ChatML, Llama-3, Alpaca).
 Implement src/downloader.rs:
 Resumable chunked model downloader with SHA-256 validation.
-Verification Command
+Verification Commands
+cargo test --test test_phase3_network
 cargo test --test test_gguf_metadata
 
 
@@ -175,7 +182,6 @@ Implement src/ui/tunnel_view.rs:
 - Interactive USB ADB device monitor, one-key port forward and reverse tunnel setup (`F`) and teardown (`T`).
 Verification Command
 cargo test --test test_hub_ui
-
 
 
 

@@ -93,7 +93,7 @@ Bitmask: 0x01 = Host, 0x02 = Client, 0x04 = Standalone.
 0x06 - 0x07
 Status Flags
 uint16 (BE)
-Bit 0: Ready, Bit 1: Inferring, Bit 2: Vulkan Active, Bit 3: Thermal Throttle.
+Bit 0: Ready, Bit 1: Inferring, Bit 2: Vulkan Active, Bit 3: Thermal Throttle, Bit 4: RPC Ready.
 0x08 - 0x17
 Node UUID
 uint8[16]
@@ -103,9 +103,9 @@ API Port
 uint16 (BE)
 Active HTTP port (default 8080).
 0x1A - 0x1B
-Reserved
+RPC Port
 uint16 (BE)
-Reserved for future transport extensions.
+Active sequential layer-pipeline RPC port; zero when unavailable.
 0x1C - 0x1F
 Total RAM
 uint32 (BE)
@@ -130,6 +130,12 @@ Null-padded ASCII model family name.
 Checksum
 uint16 (BE)
 CRC-16-CCITT computed over bytes 0x00 through 0x3D.
+
+The UDP beacon is advisory telemetry. A runtime must verify the stable node
+identity, protocol version, readiness, capabilities, and policy-capped
+allocatable memory through the Nexus control plane before using a peer for
+privileged inference or RPC work. The control plane is separate from
+llama-server's inference and SSE data plane.
 
 <!-- STREAMING_CHUNK:Configuring build flags and compiler constraints for ARM and Penryn -->
 4. Hardware Compilation & Runtime Flags

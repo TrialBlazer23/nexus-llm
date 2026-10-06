@@ -264,7 +264,7 @@ async fn test_hub_app_headless_render_all_tabs() {
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
     assert!(content.contains("[F2] 📦 Models"), "Must render Models tab active");
-    assert!(content.contains("Local Models (1)"), "Must render models list pane");
+    assert!(content.contains("Mesh Models (1)"), "Must render models list pane");
     assert!(content.contains("Model Architecture & Metadata"), "Must render metadata inspector pane");
     assert!(content.contains("tiny-llama.gguf"), "Must list discovered model");
 

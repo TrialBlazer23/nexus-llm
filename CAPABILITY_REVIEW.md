@@ -10,7 +10,8 @@
 (PR #10). Phase 9 trust is **shipped** on `cursor/phase9-trust-4865` (Ed25519
 identity, signed control plane, TOFU pairing, registry verification at runtime).
 Historical findings below are preserved; status markers call out what is done vs
-still open. **Recommended next phase: Phase 10 (model store / LAN transfer).** Phase 8 TUI is Done.
+still open. **Phase 10 (model store / LAN transfer) is Done.** Recommended next:
+Phase 11 (placement intelligence). Phase 8 TUI is Done.
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -41,7 +42,7 @@ inert — are mechanically reproducible:
 | `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
 | Peer registry as runtime SoT | **Done** | `src/registry_runtime.rs`, `src/discovery.rs`, Cluster UI |
 | TUI responsiveness / hub split | **Done — Phase 8** | `src/ui/hub/` command/event + ChatEntry |
-| Model store / LAN transfer | **Open — Phase 10** | §4 |
+| Model store / LAN transfer | **Done — Phase 10** | `src/store.rs`, blob routes, hardened `downloader.rs`, Models `[D]`/`[T]`/`[S]` |
 
 ---
 
@@ -1205,6 +1206,13 @@ pairing two devices takes one code entry. Covered by `tests/test_trust.rs` and
 extended network/control-plane tests.
 
 ### Phase 10 — Model store and LAN transfer
+
+> **Status (2026-10-06): Done.** Content-addressed `~/.nexus/models.json` index
+> (`src/store.rs`); catalog digests on `GET /models`; privileged
+> `GET /nexus/control/v1/blob/{digest}` Range streaming + `POST /blob/fetch`;
+> hardened downloader (async I/O, `.part.json`, retry, incremental hash, disk
+> preflight); Models mesh catalog with `[D]`/`[T]`/`[S]`. Covered by
+> `tests/test_phase10_store.rs`.
 
 - Content-addressed index with cached digests and GGUF metadata (§4.9)
 - Catalog endpoint and a mesh-wide model view in the TUI (§4.9)

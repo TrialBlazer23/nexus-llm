@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 10 model store / LAN blob transfer
+- Category: design-decision
+- Context: CAPABILITY_REVIEW Phase 10 on `cursor/phase10-model-store-d6cb`.
+- Finding: Control-plane JSON uses `MAX_CONTROL_RESPONSE_BYTES` (16 KiB); blob bodies must stream with a separate body type and never wrap in `Limited`. Phase 9 text requires transfer to be privileged like load/unload — `GET /blob/{digest}` and `POST /blob/fetch` use `verify_control_request` + `authorize_privileged_signer`. Filename-only catalogs are insufficient for verified LAN sync; digests live in `~/.nexus/models.json` (override with `NEXUS_MODELS_INDEX`). Concurrent reconcile of the shared index needs a process lock or tests flake.
+- Action: Added `src/store.rs`, digest fields on `ModelCatalogEntry`, streaming blob route, hardened `downloader.rs` (`.part.json`, retry, incremental hash, disk preflight), Models `[D]`/`[T]`/`[S]` via hub worker commands.
+- Verification: `cargo test --locked` including `tests/test_phase10_store.rs`.
+
 ## 2026-10-06 — Phase 8 TUI: command/event bus, ChatEntry, hot-swap -ngl
 - Category: design-decision
 - Context: CAPABILITY_REVIEW §2 Phase 8 on `cursor/phase8-tui-responsiveness-4865` stacked on Phase 9 trust.

@@ -122,15 +122,9 @@ impl ChatApp {
         }
     }
 
-    /// Returns true if a message is a genuine dialogue turn rather than a system/UI banner.
+    /// Returns true if a message is a genuine dialogue turn rather than UI chrome.
     pub fn is_conversation_message(m: &ChatMessage) -> bool {
-        let trimmed = m.content.trim();
-        !trimmed.starts_with("Model '")
-            && !trimmed.starts_with("Connected to")
-            && !trimmed.starts_with("⚠️")
-            && !trimmed.starts_with("Model unloaded")
-            && !trimmed.starts_with("Disconnected from")
-            && !trimmed.starts_with("Loaded '")
+        !m.is_status()
     }
 
     /// Build a cleaned list of messages for sending to OpenAI /v1/chat/completions.
@@ -200,21 +194,58 @@ impl ChatApp {
 
     /// Prepare and render the UI frame within a specified sub-area.
     pub fn render_in_area(&self, frame: &mut Frame, area: Rect) {
+        let show_hints = crate::ui::slash::should_show_hints(&self.input_buffer);
+        let hint_lines = if show_hints {
+            crate::ui::slash::matching_hints(&self.input_buffer).len().min(8) as u16
+        } else {
+            0
+        };
+
+        let mut constraints = vec![
+            Constraint::Length(3), // Header bar
+            Constraint::Min(8),    // Chat history area
+        ];
+        if hint_lines > 0 {
+            constraints.push(Constraint::Length(hint_lines + 2));
+        }
+        constraints.push(Constraint::Length(3)); // Input box
+        constraints.push(Constraint::Length(1)); // Help / status footer
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints([
-                Constraint::Length(3), // Header bar
-                Constraint::Min(8),    // Chat history area
-                Constraint::Length(3), // Input box
-                Constraint::Length(1), // Help / status footer
-            ])
+            .constraints(constraints)
             .split(area);
 
         self.render_header(frame, chunks[0]);
         self.render_chat_history(frame, chunks[1]);
-        self.render_input_box(frame, chunks[2]);
-        self.render_footer(frame, chunks[3]);
+        let mut idx = 2;
+        if hint_lines > 0 {
+            self.render_slash_hints(frame, chunks[idx]);
+            idx += 1;
+        }
+        self.render_input_box(frame, chunks[idx]);
+        self.render_footer(frame, chunks[idx + 1]);
+    }
+
+    fn render_slash_hints(&self, frame: &mut Frame, area: Rect) {
+        let hints = crate::ui::slash::matching_hints(&self.input_buffer);
+        let lines: Vec<Line> = hints
+            .into_iter()
+            .map(|h| {
+                Line::from(Span::styled(
+                    format!("  {}", h),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect();
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Slash Commands ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta)),
+        );
+        frame.render_widget(widget, area);
     }
 
     fn spawn_stream(&mut self, tx: &mpsc::Sender<StreamMsg>) {
@@ -349,6 +380,27 @@ impl ChatApp {
         }
 
         for msg in &self.messages {
+            if msg.is_status() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " [Status] ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+                for text_line in msg.content.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {}", text_line),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+                lines.push(Line::from(""));
+                continue;
+            }
+
             let (label, color) = if msg.role == "user" {
                 (" [You] ", Color::Blue)
             } else {
@@ -535,7 +587,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             } else {
                                 ""
                             };
-                            app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
+                            app.messages.push(ChatMessage::status(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
                             app.status_message = Some(format!("Error: {}", err));
                             app.auto_scroll = true;
                         }

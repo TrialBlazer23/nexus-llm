@@ -62,6 +62,18 @@ impl ChatMessage {
             content: content.into(),
         }
     }
+
+    /// UI-only chrome (load/connect banners). Never sent to the inference API.
+    pub fn status(content: impl Into<String>) -> Self {
+        Self {
+            role: "status".to_string(),
+            content: content.into(),
+        }
+    }
+
+    pub fn is_status(&self) -> bool {
+        self.role == "status"
+    }
 }
 
 /// Request payload for OpenAI-compatible /v1/chat/completions endpoint.

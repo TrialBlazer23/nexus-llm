@@ -1,3 +1,4 @@
+use crate::cluster::{ModelFit, DEFAULT_CONTEXT_SIZE};
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::SystemProfile;
 use crate::ui::models::{scan_models_dir, ModelEntry};
@@ -18,6 +19,10 @@ pub struct ModelsView {
     pub selected_index: usize,
     pub status_message: Option<String>,
     pub cached_profile: SystemProfile,
+    /// Context window used for fit badges / KV display (owned by Hub, mirrored here for render).
+    pub selected_context: usize,
+    /// Configured RPC worker allocation cap for cluster-fit classification.
+    pub max_rpc_ram_mb: u64,
 }
 
 impl ModelsView {
@@ -29,6 +34,8 @@ impl ModelsView {
             selected_index: 0,
             status_message: None,
             cached_profile: SystemProfile::probe(),
+            selected_context: DEFAULT_CONTEXT_SIZE,
+            max_rpc_ram_mb: 1800,
         }
     }
 
@@ -65,6 +72,22 @@ impl ModelsView {
         self.models.get(self.selected_index)
     }
 
+    /// Host LMK capacity + optional RPC worker cap for fit classification.
+    pub fn cluster_caps_mb(&self) -> (u64, u64) {
+        let host = self
+            .cached_profile
+            .max_allowed_memory_bytes()
+            / (1024 * 1024);
+        let cluster = host.saturating_add(self.max_rpc_ram_mb);
+        (host, cluster)
+    }
+
+    pub fn fit_for(&self, model: &ModelEntry) -> ModelFit {
+        let required = model.required_mb_at(self.selected_context);
+        let (host, cluster) = self.cluster_caps_mb();
+        ModelFit::classify(required, host, cluster)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -87,12 +110,12 @@ impl ModelsView {
                 .enumerate()
                 .map(|(i, m)| {
                     let is_selected = i == self.selected_index;
-                    let (badge_text, badge_color) = if m.lmk_compatible {
-                        ("[OK]", Color::Green)
-                    } else if m.size_mb <= 10300 {
-                        ("[RPC]", Color::Yellow)
-                    } else {
-                        ("[OOM]", Color::Red)
+                    let fit = self.fit_for(m);
+                    let badge_text = fit.list_badge();
+                    let badge_color = match fit {
+                        ModelFit::Fits => Color::Green,
+                        ModelFit::NeedsRpc => Color::Yellow,
+                        ModelFit::WontFit => Color::Red,
                     };
 
                     let prefix = if is_selected { " > " } else { "   " };
@@ -146,7 +169,9 @@ impl ModelsView {
             let total_ram_mb = profile.total_ram_mb;
             let avail_ram_mb = profile.available_ram_mb;
             let lmk_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
-            let required_mb = m.size_mb + m.exact_kv_mb;
+            let kv_mb = m.required_mb_at(self.selected_context).saturating_sub(m.size_mb);
+            let required_mb = m.required_mb_at(self.selected_context);
+            let fit = self.fit_for(m);
 
             let ram_ratio = if lmk_cap_mb > 0 {
                 ((required_mb as f64) / (lmk_cap_mb as f64)).min(1.0)
@@ -154,12 +179,10 @@ impl ModelsView {
                 0.0
             };
 
-            let gauge_color = if required_mb <= lmk_cap_mb {
-                Color::Green
-            } else if required_mb <= 10300 {
-                Color::Yellow
-            } else {
-                Color::Red
+            let gauge_color = match fit {
+                ModelFit::Fits => Color::Green,
+                ModelFit::NeedsRpc => Color::Yellow,
+                ModelFit::WontFit => Color::Red,
             };
 
             let info_lines = vec![
@@ -196,8 +219,18 @@ impl ModelsView {
                     Span::styled(format!("{} tokens", m.context_length), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Exact KV Cache (4k):", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{} MB", m.exact_kv_mb), Style::default().fg(Color::White)),
+                    Span::styled(" Selected Context:  ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        format!("{} tokens [+/-]", self.selected_context),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!(" Exact KV Cache ({}):", format_ctx_short(self.selected_context)),
+                        Style::default().fg(Color::LightBlue),
+                    ),
+                    Span::styled(format!("{} MB", kv_mb), Style::default().fg(Color::White)),
                 ]),
             ];
 
@@ -209,10 +242,13 @@ impl ModelsView {
             );
             frame.render_widget(meta_widget, right_chunks[0]);
 
-            // RAM Health Block
             let gauge_label = format!(
-                "{} MB / {} MB Cap (Available: {} MB of {} MB)",
-                required_mb, lmk_cap_mb, avail_ram_mb, total_ram_mb
+                "{} MB / {} MB Cap (Available: {} MB of {} MB) {}",
+                required_mb,
+                lmk_cap_mb,
+                avail_ram_mb,
+                total_ram_mb,
+                fit.modal_badge()
             );
 
             let gauge_widget = Gauge::default()
@@ -227,13 +263,13 @@ impl ModelsView {
                 .label(gauge_label);
             frame.render_widget(gauge_widget, right_chunks[1]);
 
-            // Action / Status bar
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
-            } else if m.lmk_compatible {
-                " [Enter] Select Execution Device  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
             } else {
-                " [Enter] Select Cluster Node  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
+                format!(
+                    " [Enter] Target  |  [+/-] Ctx={}  |  [u] Unload  |  [P] Persona  |  [R] Rescan ",
+                    self.selected_context
+                )
             };
 
             let action_widget = Paragraph::new(Line::from(vec![Span::styled(
@@ -252,6 +288,14 @@ impl ModelsView {
                 .block(Block::default().title(" Details ").borders(Borders::ALL));
             frame.render_widget(empty_widget, area);
         }
+    }
+}
+
+fn format_ctx_short(ctx: usize) -> String {
+    if ctx >= 1024 && ctx % 1024 == 0 {
+        format!("{}k", ctx / 1024)
+    } else {
+        format!("{}", ctx)
     }
 }
 

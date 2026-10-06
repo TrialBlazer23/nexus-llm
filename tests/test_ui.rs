@@ -128,18 +128,20 @@ fn test_models_scanner() {
 #[test]
 fn test_clean_conversation_messages() {
     let raw_messages = vec![
-        ChatMessage::assistant("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
-        ChatMessage::assistant("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
-        ChatMessage::assistant("⚠️ [Connection / Generation Error]: Transport Error"),
-        ChatMessage::assistant("Model unloaded. Local inference engine is idle."),
+        ChatMessage::status("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
+        ChatMessage::status("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
+        ChatMessage::status("⚠️ [Connection / Generation Error]: Transport Error"),
+        ChatMessage::status("Model unloaded. Local inference engine is idle."),
         ChatMessage::user("What is the capital of France?"),
         ChatMessage::assistant("The capital of France is Paris."),
         ChatMessage::user("And its population?"),
+        // User text that looks like a banner must survive (no prefix filtering)
+        ChatMessage::user("Model 'x' is great for coding."),
     ];
 
     let cleaned = ChatApp::clean_conversation_messages(&raw_messages, Some("You are a helpful assistant."));
 
-    assert_eq!(cleaned.len(), 4); // System instruction + 3 genuine dialogue turns
+    assert_eq!(cleaned.len(), 5); // System instruction + 4 genuine dialogue turns
     assert_eq!(cleaned[0].role, "system");
     assert_eq!(cleaned[0].content, "You are a helpful assistant.");
     assert_eq!(cleaned[1].role, "user");
@@ -148,6 +150,9 @@ fn test_clean_conversation_messages() {
     assert_eq!(cleaned[2].content, "The capital of France is Paris.");
     assert_eq!(cleaned[3].role, "user");
     assert_eq!(cleaned[3].content, "And its population?");
+    assert_eq!(cleaned[4].role, "user");
+    assert_eq!(cleaned[4].content, "Model 'x' is great for coding.");
+    assert!(cleaned.iter().all(|m| !m.is_status()));
 }
 
 #[test]

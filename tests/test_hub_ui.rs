@@ -322,16 +322,33 @@ async fn test_hub_app_target_node_selection_modal() {
     assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
     assert!(matches!(state.candidates[1], TargetExecutionNode::LocalCpu { .. }));
 
-    // Add a simulated remote peer candidate
+    // Add a high-RAM remote (fits) and a tiny remote (won't fit) for badge coverage.
+    // Model path does not exist so required_mb is ~KV-only (~800 MB at 4k estimate); set explicitly.
+    state.required_mb = 5000;
+    state.rpc_worker_cap_mb = 1800;
+
     let peer_id = Uuid::new_v4();
     state.candidates.push(TargetExecutionNode::Remote {
         uuid: peer_id,
         name: "Galaxy-S23".to_string(),
         endpoint: "http://192.168.1.100:8080".to_string(),
-        free_ram_mb: 8500,
+        free_ram_mb: 12000, // LMK budget ~9000 → fits 5000
         backend: "Vulkan".to_string(),
     });
-    assert_eq!(state.candidates.len(), 3);
+    let tiny_id = Uuid::new_v4();
+    state.candidates.push(TargetExecutionNode::Remote {
+        uuid: tiny_id,
+        name: "Tiny-Pi".to_string(),
+        endpoint: "http://192.168.1.50:8080".to_string(),
+        free_ram_mb: 800, // LMK ~600; +1800 RPC still < 5000 → won't fit
+        backend: "CPU".to_string(),
+    });
+    assert_eq!(state.candidates.len(), 4);
+
+    let fits = state.candidates[2].fit(state.required_mb, state.rpc_worker_cap_mb);
+    let wont = state.candidates[3].fit(state.required_mb, state.rpc_worker_cap_mb);
+    assert_eq!(fits, nexus::cluster::ModelFit::Fits);
+    assert_eq!(wont, nexus::cluster::ModelFit::WontFit);
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -344,6 +361,11 @@ async fn test_hub_app_target_node_selection_modal() {
     assert!(content.contains("qwen2.5-coder-7b"), "Must render target model name");
     assert!(content.contains("Local GPU") || content.contains("Local CPU"), "Must list Local execution options");
     assert!(content.contains("Galaxy-S23"), "Must list remote peer candidate");
+    assert!(
+        content.contains("fits") || content.contains("won't fit") || content.contains("needs RPC"),
+        "Must show fit-per-target badges: {}",
+        content
+    );
 }
 
 #[tokio::test]
@@ -511,4 +533,36 @@ fn test_models_view_cached_profile_refresh() {
     view.refresh_profile();
     assert!(view.cached_profile.total_ram_mb > 0 || view.cached_profile.available_ram_mb == 0);
 }
+
+#[tokio::test]
+async fn test_hub_slash_commands_and_context() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    hub.dispatch_slash_command("/help").await;
+    assert!(
+        hub.chat.messages.iter().any(|m| m.is_status() && m.content.contains("/unload")),
+        "help should emit a status banner with command list"
+    );
+
+    hub.chat.messages.push(nexus::client::ChatMessage::user("keep me"));
+    hub.dispatch_slash_command("/clear").await;
+    assert!(hub.chat.messages.is_empty());
+
+    hub.dispatch_slash_command("/temp 0.25").await;
+    assert!((hub.chat.temperature - 0.25).abs() < f32::EPSILON);
+
+    hub.dispatch_slash_command("/context 2048").await;
+    assert_eq!(hub.selected_context, 2048);
+    assert_eq!(hub.models_view.selected_context, 2048);
+
+    hub.dispatch_slash_command("/preset coder").await;
+    assert_eq!(hub.chat.persona_name.as_deref(), Some("coder"));
+
+    hub.adjust_context(true);
+    assert_eq!(hub.selected_context, 2048 + 512);
+}
+
 

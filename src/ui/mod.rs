@@ -5,6 +5,7 @@ pub mod hub;
 pub mod models;
 pub mod models_view;
 pub mod settings_view;
+pub mod slash;
 pub mod tunnel_view;
 
 use std::sync::Once;

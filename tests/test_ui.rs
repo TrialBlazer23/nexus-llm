@@ -216,3 +216,81 @@ fn test_apply_preset_sets_hyperparams() {
     assert_eq!(app.max_tokens, 4096);
 }
 
+#[test]
+fn test_chat_cursor_navigation_and_editing() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    let (tx, _rx) = mpsc::channel(8);
+
+    for c in ['h', 'e', 'l', 'l', 'o'] {
+        app.handle_key_input(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &tx,
+        );
+    }
+    assert_eq!(app.input_buffer, "hello");
+    assert_eq!(app.cursor_idx, 5);
+
+    app.handle_key_input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    assert_eq!(app.cursor_idx, 3);
+
+    app.handle_key_input(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), &tx);
+    assert_eq!(app.input_buffer, "helXlo");
+    assert_eq!(app.cursor_idx, 4);
+
+    app.handle_key_input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &tx);
+    assert_eq!(app.input_buffer, "hello");
+    assert_eq!(app.cursor_idx, 3);
+
+    app.handle_key_input(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &tx);
+    assert_eq!(app.input_buffer, "helo");
+    assert_eq!(app.cursor_idx, 3);
+
+    app.handle_key_input(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &tx);
+    assert_eq!(app.cursor_idx, 0);
+    app.handle_key_input(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &tx);
+    assert_eq!(app.cursor_idx, 4);
+}
+
+#[test]
+fn test_chat_prompt_history_alt_arrows() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    let (tx, _rx) = mpsc::channel(8);
+
+    app.prompt_history = vec!["first".into(), "second".into()];
+    app.handle_key_input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "second");
+    app.handle_key_input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "first");
+    app.handle_key_input(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "second");
+}
+
+#[test]
+fn test_markdown_rendering_and_boxed_code() {
+    use nexus::ui::markdown::render_markdown;
+
+    let markdown_text = "# Test Title\n\nHere is **bold** text and `inline_code`.\n\n```rust\nfn main() {\n    println!(\"Hello!\");\n}\n```";
+    let lines = render_markdown(markdown_text);
+    assert!(!lines.is_empty(), "markdown should produce lines");
+    let flat: String = lines
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(flat.contains("Test Title"), "heading text should appear");
+    assert!(flat.contains("main"), "code fence body should appear");
+    assert!(
+        flat.contains("─") || flat.contains("│"),
+        "code block should use box drawing"
+    );
+}
+

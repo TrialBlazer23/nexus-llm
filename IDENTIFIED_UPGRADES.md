@@ -2,7 +2,7 @@
 
 ## Status legend
 
-- ✅ **Done** — shipped (Phase 1: `cursor/phase1-p0-bugs-probe-cache-80f9`; Phase 2: `cursor/phase2-model-loop-0d08`)
+- ✅ **Done** — shipped (Phase 1: `cursor/phase1-p0-bugs-probe-cache-80f9`; Phase 2: `cursor/phase2-model-loop-0d08`; Phase 3: `cursor/phase3-completeness-6a2f`)
 - ⬜ **Open** — not yet implemented
 
 ---
@@ -19,7 +19,7 @@
 **Done:** `pending_hot_swap: Option<(PathBuf, Option<u32>)>`; confirm calls `execute_model_load_with_gpu` so Local CPU Safe Mode (`-ngl 0`) survives.
 
 **4. ✅ Remote load sends an unresolvable model path — inconsistently.** ~~Target selection sent `file_stem`; Cluster `L` sent `filename`.~~
-**Done:** `open_target_selection` now uses `file_name()` (e.g. `foo.gguf`), matching Cluster `L`. Full peer catalog remains #9.
+**Done:** Canonical `file_name()` dispatch (Phase 1) plus peer catalogs (#9) so remotes only receive filenames they advertise.
 
 **5. ✅ The transport badge lies.** ~~Any `127.0.0.1`/`localhost` showed `[USB Cable]`.~~
 **Done:** Explicit `TransportBadge::{Local, Usb, Wifi}`. Local supervised loads → `[Local]`; ADB forward (cached via `AdbTunnelSupervisor::is_forward_active` on the 500ms tick) → `[USB Cable]`; remote endpoints → `[Wi-Fi]`.
@@ -37,9 +37,11 @@
 **8. ✅ Kill the magic numbers.** ~~`10300`, bare `4096`/`99` in Hub load paths.~~
 **Done:** Dynamic host+RPC budgets; `HubApp::selected_context` (default 4096) with Models `[+/-]` and `/context`; remote/local loads use `selected_context` and `config.hardware.acceleration.gpu_layers` (via `configured_gpu_layers()`). Temp/max_tokens remain on `ChatApp` (Phase 1 personas + `/temp`).
 
-**9. ⬜ Remote model awareness.** Right now you can only browse *local* `.gguf` files, and remote-load blindly hopes the peer has the same file. Add a `GET /cluster/models` control-plane endpoint so the Models tab can show a merged view: local models + each peer's models (with host column). That also completes the long-term fix for #4 — you'd dispatch a path the peer actually has. Longer term: a `push`-style model transfer or a shared "download on target" command.
+**9. ✅ Remote model awareness.** ~~Local-only Models browse; remote load hoped the peer shared the file.~~
+**Done:** Hyper control-plane server on `network.control_port` (default 8081) serves `GET /nexus/control/v1/models` (+ alias `GET /cluster/models`), started from Hub and `nexusd`. Models tab merges local + peer catalogs with a host column; target selection / Cluster `L` dispatch via `control_endpoint()` and only offer remotes that advertise the filename. Push/transfer still deferred.
 
-**10. ⬜ In-TUI downloads.** `nexus download` exists but the TUI has no way to fetch a model — a user who finds an empty Models tab (`No .gguf models found in ...`) hits a dead end. Add `[D] Download` in the Models tab: URL input + a progress gauge (downloader already supports resume/SHA-256; wire its progress into a modal). The empty-state message should also *say* this ("press D to download, or see `nexus download --help`").
+**10. ✅ In-TUI downloads.** ~~Empty Models tab was a dead end.~~
+**Done:** Models `[D]` opens a URL modal; `ModelDownloader` runs with a progress Gauge into `models_dir`; empty state tells operators to press `D` or use `nexus download --help`.
 
 **11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running.
 
@@ -50,7 +52,8 @@
 
 ## 🟡 P2 — Chat usability
 
-**13. ⬜ Real input editing.** The input box only supports push/pop of chars — no cursor, no Left/Right/Home/End, no Ctrl+W/Ctrl+U, no multiline, no prompt history. Add at minimum: cursor movement + prompt history on `Alt+↑/↓` (since ↑/↓ scroll). Consider `tui-textarea` rather than hand-rolling — it's a small dependency and handles paste properly (bracketed paste currently sprays `Char` events).
+**13. ✅ Real input editing.** ~~Input was end-only push/pop.~~
+**Done:** `ChatApp::cursor_idx` with Left/Right/Home/End/Delete; Shift|Alt+Enter newline; `Alt+↑/↓` prompt history. Hand-rolled (no `tui-textarea`). Bracketed paste still arrives as Char events.
 
 **14. ✅ Slash-command system.** ~~Only `/unload` special-cased.~~
 **Done:** `ui/slash.rs` parser + `/`-triggered hint popup; Hub Chat Enter dispatches `/unload`, `/preset`, `/host`, `/context`, `/temp`, `/clear`, `/help`.
@@ -60,7 +63,8 @@
 
 **16. ⬜ Generation context display.** You track tokens/s — also show token count vs. context budget (`1,240 / 4,096 ctx`), ideally colored as it approaches the limit, since llama.cpp silently truncates. And label the metric honestly: you're counting SSE chunks, which is usually tokens for llama-server, but say "tok/s" only if verified.
 
-**17. ⬜ Markdown-ish rendering.** Assistant output renders as raw text — fenced code blocks lose all affordance. Even lightweight styling (dim the ` fences, background-color code spans, bold headers) makes long coding answers dramatically more readable. `tui-markdown` or a small custom highlighter.
+**17. ✅ Markdown-ish rendering.** ~~Assistant output was raw text.~~
+**Done:** `ui/markdown.rs` + `pulldown-cmark` with fenced code boxes, bold/italic/headers; chat history and streaming use `render_markdown`. Status lines stay plain.
 
 **18. ⬜ Retry/regenerate + clear.** `[R]`egenerate last response (pop last assistant message, resend) and `/clear` are the two most-missed chat affordances. Also: pressing Enter while streaming should queue or visibly refuse — right now input is silently ignored. *(`/clear` now exists via #14; regenerate remains open.)*
 
@@ -68,7 +72,8 @@
 
 ## 🟢 P3 — Navigation, feedback & polish
 
-**19. ⬜ Consistent keybinding scheme.** Bare `1–4` switch tabs in Models/Cluster but type digits in Chat; `Tab` cycles tabs from Chat but also from Models; `Alt+C` connects in Chat while bare `C` does nothing. Pick one global scheme (F-keys + `Alt+1..4` + `Tab`/`Shift+Tab` everywhere) and make tab-local keys non-conflicting mnemonics. Add a `?` / `F12` **help modal** listing keys for the current view — discoverability is currently 100% README-dependent, and the per-view footers already disagree with reality (#1, #2 — footers for those are now accurate).
+**19. ✅ Consistent keybinding scheme.** ~~Bare `1–4` conflicted with Chat digits; no help modal.~~
+**Done:** Global tabs are F1–F4 / Alt+1–4 / Tab / BackTab only (bare digits removed from Models/Cluster/Settings). Models `D` = download; Cluster `D` = disconnect. `?` / F12 opens a per-tab help modal; footer shows `[?] Help`. Chat connect remains Alt+C.
 
 **20. ⬜ Status messages that expire.** `status_message` persists until overwritten — a stale green "Active: model-x" survives the model crashing. Add timestamps and auto-clear info/success messages after 5s (keep errors until dismissed).
 
@@ -91,5 +96,5 @@
 | --- | --- | --- | --- |
 | 1 | #1–#6 (bugs) + #21 | Restores promised behavior, cheap | ✅ Complete |
 | 2 | #7, #8, #12, #14, #15 | Core model-handling loop becomes trustworthy | ✅ Complete |
-| 3 | #9, #10, #13, #17, #19 | Completeness: remote catalogs, downloads, real input | ⬜ Next |
+| 3 | #9, #10, #13, #17, #19 | Completeness: remote catalogs, downloads, real input | ✅ Complete |
 | 4 | #16, #18, #20, #22–#25 | Polish | ⬜ Open |

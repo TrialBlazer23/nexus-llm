@@ -25,6 +25,19 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 3 control_port vs api_port + Hub completeness
+- Category: design-decision
+- Context: IDENTIFIED_UPGRADES Phase 3 (#9/#10/#13/#17/#19) on stacked branch `cursor/phase3-completeness-6a2f`.
+- Finding:
+  1. `control_plane.rs` had clients/handlers but no HTTP listener; remote load posted to `api_port` where llama-server does not speak `/nexus/control/v1/*`.
+  2. The 64-byte UDP beacon has no free field for a second port; advertising control via mDNS TXT `ctrl` and defaulting UDP peers to `network.control_port` (8081) avoids colliding with llama-server on 8080.
+  3. `main` already had markdown + cursor editing (`213ee12`) that was not on the Phase 1/2 stack — porting those features onto Phase 2 was cheaper than reinventing.
+- Action:
+  1. Add `network.control_port` (default 8081), Hyper control-plane server (`control_plane_server.rs`) started from Hub + `nexusd`, catalog `GET /nexus/control/v1/models` (+ `/cluster/models` alias).
+  2. Models merged catalog + in-TUI `[D]` download; help modal `?`/F12; bare `1–4` tab keys removed.
+  3. Chat: cursor editing + Alt+↑/↓ history + `pulldown-cmark` markdown (status lines stay plain).
+- Verification: `cargo test --locked` green on Phase 3 branch.
+
 ## 2026-10-06 — Phase 1 P0 Hub/TUI fixes (hot-swap layers, Esc abort, transport badge)
 - Category: bug
 - Context: Implementing IDENTIFIED_UPGRADES.md Phase 1 (#1–#6 + #21) on the Hub TUI.

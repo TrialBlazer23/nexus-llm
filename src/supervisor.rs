@@ -57,6 +57,10 @@ pub struct LlamaServerConfig {
     pub threads: usize,
     pub context_size: usize,
     pub extra_args: Vec<String>,
+    /// When false, pass `--no-mmap` to llama-server.
+    pub use_mmap: bool,
+    /// LMK / memory ceiling percent (from `hardware.safety.max_ram_usage_percent`).
+    pub memory_budget_percent: u8,
 }
 
 impl LlamaServerConfig {
@@ -75,6 +79,8 @@ impl LlamaServerConfig {
             threads: 6,
             context_size: 4096,
             extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
         }
     }
 
@@ -108,6 +114,9 @@ impl LlamaServerConfig {
             "-ngl".to_string(),
             effective_gpu_layers.to_string(),
         ];
+        if !self.use_mmap {
+            args.push("--no-mmap".to_string());
+        }
         args.extend(self.extra_args.clone());
         args
     }
@@ -186,13 +195,19 @@ impl ProcessSupervisor {
             let model_size_bytes = model_metadata.len();
             let sys_profile = SystemProfile::probe();
 
-            if !sys_profile.can_safely_load(model_size_bytes, config.context_size) {
+            if !sys_profile.can_safely_load_pct(
+                model_size_bytes,
+                config.context_size,
+                config.memory_budget_percent,
+            ) {
                 let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
                 let total_required = model_size_bytes + kv_bytes;
                 return Err(SupervisorError::MemoryCapExceeded {
                     required_mb: total_required / (1024 * 1024),
                     available_mb: sys_profile.available_ram_mb,
-                    max_allowed_mb: sys_profile.max_allowed_memory_bytes() / (1024 * 1024),
+                    max_allowed_mb: sys_profile
+                        .max_allowed_memory_bytes_pct(config.memory_budget_percent)
+                        / (1024 * 1024),
                 });
             }
         }
@@ -550,6 +565,20 @@ impl SupervisorManager {
         }
     }
 
+    /// True when a supervisor child process slot is occupied (may still be starting).
+    pub async fn is_running(&self) -> bool {
+        let lock = self.inner.lock().await;
+        lock.is_some()
+    }
+
+    /// Non-async check for UI rendering (best-effort; treats a held lock as running).
+    pub fn is_running_blocking(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
+    }
+
     /// Check if a supervisor child process is currently running and healthy.
     pub async fn is_healthy(&self) -> bool {
         let lock = self.inner.lock().await;
@@ -572,6 +601,34 @@ impl SupervisorManager {
         })
     }
 
+    /// Poll child process exit status. On exit, returns `(status, last_stderr_lines)`
+    /// and clears the supervisor slot.
+    pub async fn check_status(
+        &self,
+    ) -> Result<Option<(std::process::ExitStatus, Vec<String>)>, std::io::Error> {
+        let mut lock = self.inner.lock().await;
+        if let Some(sup) = lock.as_mut() {
+            match sup.check_status()? {
+                Some(status) => {
+                    let lines = sup.last_stderr_lines();
+                    *lock = None;
+                    Ok(Some((status, lines)))
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Last stderr lines from the active supervisor, if any.
+    pub async fn last_stderr_lines(&self) -> Vec<String> {
+        let lock = self.inner.lock().await;
+        lock.as_ref()
+            .map(|sup| sup.last_stderr_lines())
+            .unwrap_or_default()
+    }
+
     /// Spawn a new model supervisor, stopping any previously running instance.
     pub async fn spawn(&self, config: LlamaServerConfig) -> Result<(), SupervisorError> {
         let mut lock = self.inner.lock().await;
@@ -590,6 +647,18 @@ impl SupervisorManager {
             existing.stop().await?;
         }
         Ok(())
+    }
+
+    /// Subscribe to supervisor state transitions for UI phase labels.
+    pub async fn subscribe(&self) -> Option<watch::Receiver<SupervisorState>> {
+        let lock = self.inner.lock().await;
+        lock.as_ref().map(|sup| sup.subscribe())
+    }
+
+    /// Current supervisor state, if a child is slotted.
+    pub async fn state(&self) -> Option<SupervisorState> {
+        let lock = self.inner.lock().await;
+        lock.as_ref().map(|sup| sup.state())
     }
 }
 

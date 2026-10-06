@@ -70,6 +70,7 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 │   ├── mdns.rs            # mDNS-SD zero-config discovery
 │   ├── peer_registry.rs   # Dynamic peer lifecycle registry
 │   ├── control_plane.rs   # Remote execution & handshake protocol
+│   ├── control_plane_server.rs # HTTP control-plane listener (hyper)
 │   ├── client.rs          # OpenAI HTTP/SSE client
 │   ├── gguf.rs            # Zero-copy GGUF header parser
 │   ├── downloader.rs      # Chunked HTTP resume engine

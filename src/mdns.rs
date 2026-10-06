@@ -40,12 +40,12 @@ impl MdnsBackend {
         cluster_id: Option<Uuid>,
         role: NodeRole,
         capabilities: &[String],
+        display_name: &str,
         address: IpAddr,
-        display_name: Option<&str>,
     ) -> Result<(), MdnsError> {
         let capability_list = capabilities.join(",");
         let cluster = cluster_id.map(|id| id.to_string()).unwrap_or_default();
-        let mut properties = HashMap::from([
+        let properties = HashMap::from([
             ("id".to_string(), node_id.to_string()),
             ("cluster".to_string(), cluster),
             ("proto".to_string(), "1".to_string()),
@@ -54,13 +54,8 @@ impl MdnsBackend {
             ("api".to_string(), api_port.to_string()),
             ("rpc".to_string(), rpc_port.to_string()),
             ("ctrl".to_string(), control_port.to_string()),
+            ("name".to_string(), display_name.to_string()),
         ]);
-        if let Some(name) = display_name {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() && trimmed != "auto" {
-                properties.insert("name".to_string(), trimmed.to_string());
-            }
-        }
         let info = ServiceInfo::new(
             service_type,
             instance_name,
@@ -159,19 +154,16 @@ fn endpoint_from_resolved(
     let control_port = properties
         .get("ctrl")
         .and_then(|port| port.parse().ok())
-        .unwrap_or(8081);
+        .unwrap_or(9998);
     let capabilities = properties
         .get("caps")
         .map(|caps| caps.split(',').filter(|cap| !cap.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
-    let display_name = properties.get("name").and_then(|n| {
-        let trimmed = n.trim();
-        if trimmed.is_empty() || trimmed == "auto" {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
+    let display_name = properties
+        .get("name")
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default();
 
     Ok(ServiceEndpoint {
         node_id,

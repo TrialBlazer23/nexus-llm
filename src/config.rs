@@ -1,3 +1,4 @@
+use crate::node_identity::NodeIdentity;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,18 +91,44 @@ impl NexusConfig {
         Ok(raw.node.id)
     }
 
-    fn ensure_identity(&mut self) -> Result<(), ConfigError> {
+    pub fn ensure_identity(&mut self) -> Result<(), ConfigError> {
+        let identity = NodeIdentity::load_or_create(None)
+            .map_err(|e| ConfigError::Invalid(format!("node identity: {e}")))?;
         if self.node.id.trim().is_empty() || self.node.id == "auto" {
-            self.node.id = Uuid::new_v4().to_string();
+            self.node.id = identity.node_id_from_public_key().to_string();
         }
         Uuid::parse_str(&self.node.id)
             .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))?;
         Ok(())
     }
 
+    /// Load Ed25519 identity and align `node.id` for fresh installs.
+    pub fn load_node_identity(&self) -> Result<NodeIdentity, ConfigError> {
+        NodeIdentity::load_or_create(None)
+            .map_err(|e| ConfigError::Invalid(format!("node identity: {e}")))
+    }
+
     pub fn node_uuid(&self) -> Result<Uuid, ConfigError> {
         Uuid::parse_str(&self.node.id)
             .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))
+    }
+
+    /// Human-readable mesh name for mDNS TXT `name=` and local identity.
+    /// Resolves `auto` / empty to the system hostname, then `nexus-<id8>`.
+    pub fn resolved_display_name(&self) -> String {
+        let name = self.node.name.trim();
+        if !name.is_empty() && name != "auto" {
+            return name.to_string();
+        }
+        if let Ok(hostname) = fs::read_to_string("/etc/hostname") {
+            let hostname = hostname.trim();
+            if !hostname.is_empty() {
+                return hostname.to_string();
+            }
+        }
+        let id = self.node.id.trim();
+        let short = if id.len() >= 8 { &id[..8] } else { id };
+        format!("nexus-{}", short)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -272,7 +299,8 @@ pub struct NetworkConfig {
     #[serde(default = "default_api_port")]
     pub api_port: u16,
 
-    /// HTTP control-plane port (model catalog / load / unload). Distinct from llama-server `api_port`.
+    /// Dedicated HTTP control-plane port (model load/unload/state). Distinct from
+    /// `api_port` (llama-server OpenAI surface) and `discovery_port` (UDP beacon).
     #[serde(default = "default_control_port")]
     pub control_port: u16,
 
@@ -321,17 +349,15 @@ impl Default for NetworkConfig {
 
 impl NetworkConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.api_port == 0 || self.discovery_port == 0 || self.discovery_port == self.api_port {
-            return Err(ConfigError::Invalid(
-                "network API and discovery ports must be non-zero and distinct".to_string(),
-            ));
-        }
-        if self.control_port == 0
+        if self.api_port == 0
+            || self.control_port == 0
+            || self.discovery_port == 0
+            || self.discovery_port == self.api_port
             || self.control_port == self.api_port
             || self.control_port == self.discovery_port
         {
             return Err(ConfigError::Invalid(
-                "network.control_port must be non-zero and distinct from api_port and discovery_port"
+                "network API, control, and discovery ports must be non-zero and pairwise distinct"
                     .to_string(),
             ));
         }
@@ -438,6 +464,12 @@ impl Default for MdnsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairedPeer {
+    pub node_id: Uuid,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurityConfig {
     #[serde(default = "default_security_protocol_version")]
     pub protocol_version: u16,
@@ -445,6 +477,8 @@ pub struct SecurityConfig {
     pub require_pairing: bool,
     #[serde(default)]
     pub allowed_peer_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub paired_peers: Vec<PairedPeer>,
 }
 
 impl Default for SecurityConfig {
@@ -453,7 +487,36 @@ impl Default for SecurityConfig {
             protocol_version: default_security_protocol_version(),
             require_pairing: false,
             allowed_peer_ids: Vec::new(),
+            paired_peers: Vec::new(),
         }
+    }
+}
+
+impl SecurityConfig {
+    pub fn pairing_enforced(&self) -> bool {
+        self.require_pairing || !self.allowed_peer_ids.is_empty()
+    }
+
+    pub fn public_key_for(&self, node_id: Uuid) -> Option<&str> {
+        self.paired_peers
+            .iter()
+            .find(|peer| peer.node_id == node_id)
+            .map(|peer| peer.public_key_hex.as_str())
+    }
+
+    pub fn record_pair(&mut self, node_id: Uuid, public_key_hex: String) {
+        if !self.allowed_peer_ids.contains(&node_id) {
+            self.allowed_peer_ids.push(node_id);
+        }
+        if let Some(existing) = self.paired_peers.iter_mut().find(|p| p.node_id == node_id) {
+            existing.public_key_hex = public_key_hex;
+        } else {
+            self.paired_peers.push(PairedPeer {
+                node_id,
+                public_key_hex,
+            });
+        }
+        self.require_pairing = true;
     }
 }
 
@@ -554,7 +617,7 @@ fn default_api_port() -> u16 {
 }
 
 fn default_control_port() -> u16 {
-    8081
+    9998
 }
 
 fn default_discovery_port() -> u16 {

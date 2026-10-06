@@ -25,54 +25,64 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
-## 2026-10-06 — Merge conflict markers in src/ui/mod.rs broke cargo build
-- Category: bug
-- Context: Running `cargo build --release` after commit b9f1d16501e6 (Phase 4 polish).
-- Finding: `src/ui/mod.rs` contained unmerged Git conflict markers around `session_logger` and `mouse` modules (`<<<<<<< HEAD`, `=======`, `>>>>>>> d04de08`), causing syntax errors with Unicode em-dash and unexpected tokens during `cargo build`.
-- Action: Removed conflict markers and registered both `pub mod mouse;` and `pub mod session_logger;` in `src/ui/mod.rs`.
-- Verification: `cargo build --release` compiled cleanly; all unit and integration test suites passed via `cargo test`.
-
-## 2026-10-06 — Phase 4 peer names via mDNS TXT (not beacon)
+## 2026-10-06 — Phase 8 TUI: command/event bus, ChatEntry, hot-swap -ngl
 - Category: design-decision
-- Context: IDENTIFIED_UPGRADES Phase 4 #24 on `cursor/phase4-polish-e793`.
-- Finding: The fixed 64-byte UDP `BeaconPacket` is fully consumed (magic through CRC); there is no spare field for a display name without a breaking beacon v2.
-- Action: Advertise `config.node.name` only via mDNS TXT `name=` when non-empty and not `auto`. Store on `PeerNode.display_name` / `ServiceEndpoint.display_name` and expose `PeerNode::friendly_name()` (`Node-{uuid8}` fallback). Preserve existing display names across UDP beacon refreshes.
-- Verification: `test_peer_friendly_name_from_mdns_display_name`; `cargo test --locked` green.
+- Context: CAPABILITY_REVIEW §2 Phase 8 on `cursor/phase8-tui-responsiveness-4865` stacked on Phase 9 trust.
+- Finding:
+  1. Long loads must not `.await` on the hub key path — `HubCommand`/`HubEvent` + `spawn_hub_worker` keep `run_hub_tui` draining crossterm/stream while `SupervisorManager::spawn` runs; `subscribe`/`state` feed phase labels.
+  2. `ChatEntry { kind, metrics, rendered }` replaces parallel `message_metrics` and English prefix banner filters; notices that say "Connected to…" stay out of the OpenAI prompt.
+  3. Hot-swap must carry full intent (`path`, `gpu_layers`, `context_size`) so CPU Safe Mode confirms with `-ngl 0` (`effective_ngl(Some(0), …) == 0`).
+  4. Render must be pure: GGUF fields cached on `ModelEntry` at scan; `ModelsView.cached_profile` on tick; `SystemProfile::probe_vulkan` process-cached via `OnceLock`; wrap scroll uses one `wrapped_line_count` shared by keys and Paragraph.
+- Action: Split `src/ui/hub/{mod,commands,keymap}.rs`; reserve `StartDownload`/`TransferModel` commands for Phase 10.
+- Verification: `cargo test --locked` (ChatEntry/wrap/hot-swap/keymap + existing suites). Live ~30s load soak needs `llama-server` + GGUF.
 
-## 2026-10-06 — Phase 3 control_port vs api_port + Hub completeness
+## 2026-10-06 — Phase 9 trust: signing canonical, node.key, pairing migration
 - Category: design-decision
-- Context: IDENTIFIED_UPGRADES Phase 3 (#9/#10/#13/#17/#19) on stacked branch `cursor/phase3-completeness-6a2f`.
+- Context: CAPABILITY_REVIEW §1.4 + §1.5 — authenticated control plane and registry as runtime source of truth on `cursor/phase9-trust-4865`.
 - Finding:
-  1. `control_plane.rs` had clients/handlers but no HTTP listener; remote load posted to `api_port` where llama-server does not speak `/nexus/control/v1/*`.
-  2. The 64-byte UDP beacon has no free field for a second port; advertising control via mDNS TXT `ctrl` and defaulting UDP peers to `network.control_port` (8081) avoids colliding with llama-server on 8080.
-  3. `main` already had markdown + cursor editing (`213ee12`) that was not on the Phase 1/2 stack — porting those features onto Phase 2 was cheaper than reinventing.
-- Action:
-  1. Add `network.control_port` (default 8081), Hyper control-plane server (`control_plane_server.rs`) started from Hub + `nexusd`, catalog `GET /nexus/control/v1/models` (+ `/cluster/models` alias).
-  2. Models merged catalog + in-TUI `[D]` download; help modal `?`/F12; bare `1–4` tab keys removed.
-  3. Chat: cursor editing + Alt+↑/↓ history + `pulldown-cmark` markdown (status lines stay plain).
-- Verification: `cargo test --locked` green on Phase 3 branch.
+  1. Control-plane auth uses header-based envelopes (`Nexus-Signature-*`) and canonical string `nexus-control-v1\n{METHOD}\n{PATH}\n{sha256_hex(body)}\n{timestamp}\n{nonce}\n{signer_id}` with ±120s skew and a per-peer nonce LRU (~10 min).
+  2. `~/.nexus/node.key` stores the Ed25519 secret with Unix mode **0600**; existing `node.id` UUIDs are preserved; fresh installs get UUID v5 from the public key.
+  3. Pairing codes are HMAC-SHA256 over 5-minute windows (6 digits, zero-padded). First successful pair appends `allowed_peer_ids` + `paired_peers` and sets `require_pairing = true`.
+  4. Beacons stay advisory; when pairing is enforced, chat/RPC use `registry_runtime` verification + `eligible_rpc_peers` / `find_best_trusted_host`, not beacon UUID alone.
+  5. `DiscoveryService` holds `Arc<RwLock<NexusConfig>>` — clone security policy before `.await` in listener tasks (`RwLockReadGuard` is not `Send`).
+- Action: Modules `node_identity`, `trust_auth`, `registry_runtime`; signed client POSTs; server gate on state/load/unload/pair; Cluster `[P]`/`[O]` and `nexus pair --host --code`.
+- Verification: `cargo test --locked` including `tests/test_trust.rs` (signatures, replay, forged beacon, pair-then-load).
 
-## 2026-10-06 — Cloud Agent base image Rust 1.83 cannot compile Cargo.lock
-- Category: environment
-- Context: Setting up the Cursor Cloud Agent environment for nexus-llm on Ubuntu 24.04.
-- Finding: The base image ships Rust 1.83.0. `cargo fetch --locked` fails because `indexmap` 2.14.2 requires the `edition2024` Cargo feature, stabilized in Rust 1.85. `cargo run` also needs `--bin nexus` because the package builds both `nexus` and `nexusd`. A second `nexus discover` process using the same `~/.nexus` identity does not list the local `nexusd` beacon as a peer.
-- Action: Install and default to Rust 1.99.0 with rustup (`--profile minimal`, plus rustfmt and clippy). Run Cargo directly on Cloud Agent VMs. Keep the Penryn rustflags in `.cargo/config.toml`.
-- Verification: `cargo test --locked` passed 73 tests on Rust 1.99.0. `nexus info`, `nexus check`, and `nexusd` startup (UDP 9999 plus mDNS) succeeded.
-
-## 2026-10-06 — Phase 1 P0 Hub/TUI fixes (hot-swap layers, Esc abort, transport badge)
-- Category: bug
-- Context: Implementing IDENTIFIED_UPGRADES.md Phase 1 (#1–#6 + #21) on the Hub TUI.
+## 2026-10-06 — Phase 7 remainder: names, zero-config resolve, doctor, settings honesty
+- Category: design-decision
+- Context: Finishing CAPABILITY_REVIEW §7 Phase 7 acceptance after PR #9 shipped the control-plane server.
 - Finding:
-  1. Hot-swap stored only the model path, dropping `custom_gpu_layers` — CPU Safe Mode (`-ngl 0`) was silently lost on confirm, reintroducing Android Vulkan freezes.
-  2. Any `127.0.0.1` endpoint was labeled `[USB Cable]`; plain local `llama-server` was mislabeled.
-  3. Esc quit standalone chat mid-stream and did nothing in Hub Chat; stream `JoinHandle`s were discarded so generation could not be cancelled.
-  4. `SystemProfile::probe()` ran inside Models `render()` every frame.
-- Action:
-  1. Persist `pending_hot_swap: Option<(PathBuf, Option<u32>)>` and confirm via `execute_model_load_with_gpu`.
-  2. Explicit `TransportBadge::{Local,Usb,Wifi}` with ADB `forward --list` cached on the 500ms tick.
-  3. Store stream `JoinHandle`, Esc aborts; quit via Ctrl+C / idle `q` only. Panic hook restores terminal.
-  4. Cache profile on `ModelsView`; wire `[P]` to cycle presets into Hub chat hyperparams.
-- Verification: `cargo test --locked` passed (all suites including new abort/badge/persona/hot-swap assertions).
+  1. Beacon v1 still has no room for a display name; mDNS TXT `name=` + `PeerNode.display_name` / `label()` is enough. UDP-only peers keep `Node-<uuid8>` until mDNS arrives.
+  2. `resolve_from_discovery` only consulted the unset primary-compute anchor. Undeprecating `find_best_host` as fallback restores default-config auto-connect. The hub path never called discovery at all (localhost fallback) — that was the larger gap for two-device LAN acceptance.
+  3. TUI had no tracing subscriber; file logs under `~/.nexus/logs/nexus-<pid>.log` via `src/logging.rs` keep the alternate screen clean. `nexus doctor` treats missing `llama-server`/`rpc-server`/`adb` as WARN (exit 0) and bind/config failures as FAIL (exit 1).
+  4. Settings honesty: wire `max_ram_usage_percent`, `mmap`, `enable_rpc`, `prefer_adb_tunnel`, `rpc_server_binary`, `node.name`; hide inert `FallbackCpu`; add live `control_port`. Leave TOML-only `runtime_role` / `capabilities` / `cpu_threads_batch` / `mlock` unsuffixed.
+- Action: Implemented on `cursor/phase7-mesh-remainder-7787` stacked on the Phase 7 control-plane tip. Next phase should be **Phase 9 Trust** (pairing / signed control plane / registry verification) before Phase 8 TUI responsiveness — remote `model/load` is now unauthenticated on the LAN.
+- Verification: `cargo test --locked`; `nexus doctor` WARN-only exit 0 without llama binaries; log files created under `~/.nexus/logs/`; `scripts/verify_review_findings.sh` updated for wired Settings fields + file logging.
+
+## 2026-10-06 — Phase 7: control plane HTTP server on dedicated port
+- Category: design-decision
+- Context: Implementing CAPABILITY_REVIEW.md §1.1 + §1.2 (Phase 7 MVP) so remote model load from the TUI can succeed.
+- Finding:
+  1. Serving control routes on `api_port` (8080) collides with llama-server; clients must target a dedicated `network.control_port` (default 9998).
+  2. Beacon v1 is a full 64-byte layout with no spare field for a control port. Advertising `ctrl` via mDNS TXT plus falling back to the local config default for UDP-only peers is enough for Phase 7; a beacon v2 layout is deferred.
+  3. Hub previously owned `Option<ProcessSupervisor>` while handlers used `SupervisorManager`. Without unifying those, a remote load and a local load would manage different subprocess slots.
+  4. `hyper` was only transitive via `reqwest`; an explicit `hyper` + `hyper-util` + `http-body-util` dependency is required for a hand-rolled server and should stay preferred over `axum` to keep the footprint small (AGENTS.md Directive 4 intent).
+- Action: Added `src/control_plane_server.rs`, `network.control_port`, mDNS `ctrl` TXT, `PeerNode::control_endpoint()`, hub/nexusd/worker lifecycle startup, and SupervisorManager as the shared inference owner. Deferred SSE events, pairing, and catalog GET to later phases.
+- Verification: `cargo test --locked` (including new `tests/test_control_plane_server.rs` loopback HTTP round-trips) and `scripts/verify_review_findings.sh` S1.1 positive wiring checks.
+
+- Category: research
+- Context: End-to-end review of the TUI, cross-device control plane, model handling, and model download/transfer paths at commit `213ee12`, recorded in [CAPABILITY_REVIEW.md](CAPABILITY_REVIEW.md).
+- Finding:
+  1. The dominant defect class is not bad code but unreachable code. `handle_load_model`/`handle_unload_model`/`fetch_state`/`dispatch_unload_model` (`src/control_plane.rs`), the entire `PeerRegistry` lifecycle (`expire`, `remove_terminal`, `mark_verified`, `eligible_rpc_peers`), `Preset::format_prompt`, `NexusClient::complete_chat`, `TunnelView`, and `ModelDownloader` (outside the CLI) have no callers in `src/`. No HTTP server binds the control-plane paths, so every remote model-load path in `src/ui/hub.rs` dispatches to an endpoint that cannot answer.
+  2. `cargo test` passed all 73 tests against this state, because the tests call library functions directly rather than driving behavior through `main.rs`/`nexusd` entry points. A green suite is not evidence that a documented feature is reachable.
+  3. Ten configuration fields are read and written only by `src/ui/settings_view.rs` and never consulted elsewhere: `node.name`, `node.runtime_role`, `node.capabilities`, `acceleration.fallback_to_cpu`, `acceleration.cpu_threads_batch`, `safety.mmap`, `safety.mlock`, `safety.max_ram_usage_percent`, `cluster.enable_rpc`, `cluster.prefer_adb_tunnel`. `SystemProfile::max_allowed_memory_bytes` hardcodes 75% and ignores `safety.max_ram_usage_percent` because `SystemProfile` has no access to config.
+  4. `NexusClient::resolve_from_discovery` only consults `resolve_primary_compute_anchor`, which returns `None` unless `network.anchors.primary_compute_id` is set. The default config therefore cannot auto-discover a host; the migration to pinned anchors deprecated `find_best_host` without replacing the zero-config path.
+  5. `src/main.rs` installs no `tracing` subscriber, so every log line emitted in TUI mode is discarded. Only `src/daemon.rs` configures one.
+  6. Hardcoded device constants survive outside `cluster.rs` despite Directive 3: `config.rs::validate()` rejects `cluster.max_rpc_ram_mb > 1800` (a Core 2 Duo limit enforced globally, so a 32 GB worker's config will not load), and `models_view.rs` compares against a bare `10300` MB for badge colors.
+  7. `src/ui/models_view.rs::render_model_details` calls `GgufMetadata::open()` and `SystemProfile::probe()` inside render, so a multi-megabyte tokenizer array is parsed several times per second. `src/gguf.rs` is documented as "zero-copy" but materializes every metadata array, and sizes `HashMap::with_capacity`/`Vec::with_capacity`/`vec![0u8; len]` directly from file-supplied lengths, so a corrupt GGUF can abort the process.
+  8. `message_metrics` is a `Vec` parallel to `messages` indexed positionally at render time; `src/ui/hub.rs` lines 256–257, 316, 439–440, and 713 mutate `messages` without the matching metrics operation, permanently misaligning telemetry badges.
+- Action: Recorded findings, proposals, and a Phase 7–12 plan in `CAPABILITY_REVIEW.md`. Two rules worth carrying forward: (a) treat "reachable from a user action" as an acceptance criterion alongside "unit tested", and build a fake `llama-server` harness so integration tests can drive real entry points; (b) when a config field is added to `SettingsView`, the same change must wire it into behavior or it must not be displayed.
+- Verification: Claims were each confirmed by `rg` over `src/` and `tests/` for call sites, and by reading the cited files. Baseline recorded: `cargo test` 73 passing, `cargo clippy --all-targets` 19 lib warnings and 0 errors, no CI workflows in `.github/`. The proposals themselves are unimplemented and unverified.
 
 ## 2026-10-05 — Chat TUI Overhaul: Pure-Rust Markdown, Cursor Ergonomics, Stream Abort, and Telemetry Badges
 - Category: design-decision

@@ -147,6 +147,9 @@ impl NexusClient {
     }
 
     /// Automatically discover compute host on the local subnet and construct a client.
+    ///
+    /// Resolution order: pinned ready primary-compute anchor → `find_best_host` →
+    /// static peer `/health` probes. Times out with `DiscoveryTimeout` if none succeed.
     pub async fn resolve_from_discovery(
         discovery: &DiscoveryService,
         timeout: Duration,
@@ -160,7 +163,20 @@ impl NexusClient {
         while start.elapsed() < timeout {
             if let Some(host) = discovery.resolve_primary_compute_anchor().await {
                 info!(
-                    "Discovered active host: {} at {} (Model: {:?}, Vulkan: {})",
+                    "Discovered pinned anchor host: {} ({}) at {} (Model: {:?}, Vulkan: {})",
+                    host.label(),
+                    host.uuid,
+                    host.api_endpoint(),
+                    host.active_model,
+                    host.status.is_vulkan_active()
+                );
+                return Ok(Self::new(host.api_endpoint()));
+            }
+
+            if let Some(host) = discovery.find_best_trusted_host().await {
+                info!(
+                    "Discovered trusted host: {} ({}) at {} (Model: {:?}, Vulkan: {})",
+                    host.label(),
                     host.uuid,
                     host.api_endpoint(),
                     host.active_model,

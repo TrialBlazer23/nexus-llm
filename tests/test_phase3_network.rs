@@ -17,10 +17,10 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         capabilities: vec!["inference".to_string()],
         addresses: vec![SocketAddr::from((address, 8080))],
         api_port: 8080,
+        control_port: 9998,
+        display_name: String::new(),
         rpc_port: 50052,
-                control_port: 8081,
-                display_name: None,
-        }
+    }
 }
 
 #[test]
@@ -104,6 +104,7 @@ fn control_plane_validates_identity_protocol_and_policy() {
         rpc_ready: true,
         allocatable_memory_mb: 1800,
         active_model: None,
+        signing_public_key: None,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 
@@ -138,15 +139,15 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         role: NodeRole::HOST,
         status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
         api_port: 8080,
+        control_port: 9998,
         rpc_port: 50052,
-                control_port: 8081,
         total_ram_mb: 4096,
         free_ram_mb: 3000,
         backend: nexus::sysinfo::AccelerationBackend::X86Baseline,
         thermal_index: 20,
         active_model: String::new(),
-        display_name: None,
-                last_seen: now,
+        display_name: String::new(),
+        last_seen: now,
     };
     discovery
         .peers()
@@ -154,11 +155,19 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         .await
         .insert(worker_id, beacon_peer.clone());
 
+    discovery
+        .peer_registry()
+        .write()
+        .await
+        .mark_verified(worker_id, endpoint(worker_id, [192, 168, 1, 30]), now)
+        .unwrap();
+
     let candidate = discovery
         .select_rpc_candidate(RpcSelectionPolicy {
             max_thermal_index: 75,
             max_allocatable_mb: 2200,
             require_pairing: true,
+            protocol_version: CONTROL_PLANE_VERSION,
         })
         .await
         .unwrap();
@@ -176,6 +185,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
             max_thermal_index: 75,
             max_allocatable_mb: 1800,
             require_pairing: true,
+            protocol_version: CONTROL_PLANE_VERSION,
         })
         .await
         .is_none());
@@ -196,15 +206,15 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             role: NodeRole::HOST,
             status: StatusFlags::READY,
             api_port: 8080,
+        control_port: 9998,
             rpc_port: 0,
-                control_port: 8081,
             total_ram_mb: 16000,
             free_ram_mb: 12000,
             backend: nexus::sysinfo::AccelerationBackend::Vulkan,
             thermal_index: 0,
             active_model: String::new(),
-            display_name: None,
-                last_seen: Instant::now(),
+            display_name: String::new(),
+            last_seen: Instant::now(),
         },
     );
 
@@ -237,7 +247,16 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
 
     // Test server handler with SupervisorManager (expect model not found error for non-existent model)
     let manager = SupervisorManager::new();
-    let response = handle_load_model(&manager, &load_req, "127.0.0.1", 8080, None).await;
+    let response = handle_load_model(
+        &manager,
+        &load_req,
+        "127.0.0.1",
+        8080,
+        std::path::Path::new("llama-server"),
+        true,
+        75,
+    )
+    .await;
     assert_eq!(response.protocol_version, CONTROL_PLANE_VERSION);
     assert!(!response.success);
     assert!(response.error_message.is_some());

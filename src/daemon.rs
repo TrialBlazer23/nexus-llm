@@ -1,12 +1,16 @@
 use clap::Parser;
 use nexus::config::NexusConfig;
-use nexus::control_plane_server::{spawn_control_plane, ControlPlaneServerState};
-use nexus::discovery::NodeRole;
-use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor, SupervisorManager};
+use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
+use nexus::discovery::{NodeRole, StatusFlags};
+use nexus::registry_runtime::spawn_registry_runtime;
+use nexus::trust_auth::TrustBootstrap;
+use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use tracing::{error, info, Level};
-use tracing_subscriber::FmtSubscriber;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "nexusd")]
@@ -47,16 +51,19 @@ struct Args {
     /// Disable automatic RPC discovery when model exceeds Node A's memory budget
     #[arg(long)]
     no_rpc_auto: bool,
+
+    /// Tracing filter level when RUST_LOG is unset
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-
     let args = Args::parse();
+    match nexus::logging::init_file_logging(&args.log_level) {
+        Ok(path) => eprintln!("nexusd log file: {}", path.display()),
+        Err(e) => eprintln!("Warning: file logging unavailable ({e})"),
+    }
 
     info!("=== Nexus-LLM Headless Daemon (nexusd) ===");
 
@@ -66,14 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         NexusConfig::load()?
     };
+    let trust = TrustBootstrap::load(config.clone())?;
     info!(
         "Node Role: {}, Models Dir: {:?}",
         config.node.role, config.node.models_dir
     );
-
-    if let Err(e) = std::fs::create_dir_all(&config.node.models_dir) {
-        tracing::warn!("Failed to create models_dir {:?}: {}", config.node.models_dir, e);
-    }
 
     // 2. System Introspection & Android LMK Profiling
     let profile = SystemProfile::probe();
@@ -88,10 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Recommended CPU Threads: {}", profile.recommended_threads);
 
     // 3. Start Autonomous UDP Discovery Service
-    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::new(
-        config.clone(),
+    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::with_shared_config(
+        trust.config.clone(),
         None,
     ));
+    let _registry_runtime = spawn_registry_runtime(
+        discovery.clone(),
+        trust.identity.clone(),
+        discovery.node_uuid(),
+    );
     let listener_handle = discovery.clone().start_listener();
     let _mdns_handle = discovery.clone().start_mdns();
     info!(
@@ -99,34 +108,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         discovery.node_uuid()
     );
 
-    // 3b. Control-plane HTTP (catalog / load / unload) — always on, even with no model.
-    let cp_manager = SupervisorManager::new();
-    let bind_host = if config.network.api_host == "0.0.0.0" {
-        "0.0.0.0"
-    } else {
-        config.network.api_host.as_str()
-    };
-    let cp_bind = format!("{}:{}", bind_host, config.network.control_port)
-        .parse()
-        .unwrap_or_else(|_| ([0, 0, 0, 0], config.network.control_port).into());
-    let cp_handle = spawn_control_plane(
-        cp_bind,
-        ControlPlaneServerState {
-            node_id: discovery.node_uuid(),
-            role: NodeRole::from_str_role(&config.node.role),
-            models_dir: config.node.models_dir.clone(),
-            api_host: config.network.api_host.clone(),
-            api_port: config.network.api_port,
-            manager: cp_manager,
-            allocatable_memory_mb: profile.max_allowed_memory_bytes() / (1024 * 1024),
-        },
+    // 4. Shared supervisor + control-plane HTTP server (dedicated control_port)
+    let supervisor = SupervisorManager::new();
+    let control_ctx = Arc::new(
+        ControlPlaneContext::new(
+            discovery.node_uuid(),
+            NodeRole::from_str_role(&config.node.role),
+            supervisor.clone(),
+            args.host.clone(),
+            args.port,
+            args.binary.clone(),
+            trust.identity.clone(),
+            trust.config.clone(),
+            trust.config_path.clone(),
+        )
+        .with_discovery(discovery.clone())
+        .with_capabilities(vec!["inference".to_string(), "daemon".to_string()])
+        .with_memory_policy(
+            config.hardware.safety.mmap,
+            config.hardware.safety.max_ram_usage_percent,
+        ),
     );
+    let control_addr = SocketAddr::from(([0, 0, 0, 0], config.network.control_port));
+    let control_handle = spawn_control_plane(control_addr, control_ctx);
     info!(
-        "Control-plane listening on {}:{}",
-        bind_host, config.network.control_port
+        "Control-plane HTTP server listening on port {}",
+        config.network.control_port
     );
 
-    // 4. Optional Model Launch
+    // 5. Optional Model Launch
     if let Some(model_path) = args.model {
         let model_name = model_path
             .file_stem()
@@ -147,7 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model_size_bytes = model_metadata.len();
         let kv_bytes = SystemProfile::estimate_kv_cache_bytes(args.ctx);
         let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
-        let host_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+        let host_cap_mb = profile
+            .max_allowed_memory_bytes_pct(config.hardware.safety.max_ram_usage_percent)
+            / (1024 * 1024);
 
         let mut extra_args = Vec::new();
 
@@ -159,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let rpc_endpoint = if let Some(ep) = args.rpc {
                 Some(ep)
-            } else if !args.no_rpc_auto && config.cluster.auto_offload {
+            } else if !args.no_rpc_auto && config.cluster.enable_rpc && config.cluster.auto_offload {
                 info!("Probing subnet for available RPC worker peer...");
                 discovery.send_probe().await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -168,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         max_thermal_index: 75,
                         max_allocatable_mb: config.cluster.max_rpc_ram_mb,
                         require_pairing: config.network.security.require_pairing,
+                        protocol_version: nexus::control_plane::CONTROL_PLANE_VERSION,
                     })
                     .await
                     .map(|candidate| candidate.peer.rpc_endpoint())
@@ -221,63 +234,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads,
             context_size: args.ctx,
             extra_args,
+            use_mmap: config.hardware.safety.mmap,
+            memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
         };
 
         info!(
             "Launching model {:?} with context size {}",
             model_path, args.ctx
         );
-        match ProcessSupervisor::spawn_with_fallback(server_cfg).await {
-            Ok(mut supervisor) => {
-                info!(
-                    "Server supervisor active on backend: {}",
-                    supervisor.active_backend()
-                );
-                let mut status = nexus::discovery::StatusFlags::READY;
-                if supervisor.active_backend() == AccelerationBackend::Vulkan {
-                    status.0 |= nexus::discovery::StatusFlags::VULKAN_ACTIVE.0;
+        match supervisor.spawn(server_cfg).await {
+            Ok(()) => {
+                let mut status = StatusFlags::READY;
+                if profile.detected_backend == AccelerationBackend::Vulkan {
+                    status.0 |= StatusFlags::VULKAN_ACTIVE.0;
                 }
                 discovery.set_status_flags(status).await;
                 let broadcaster_handle = discovery.clone().start_broadcaster();
                 info!("Listening for termination signal (Ctrl+C)...");
-                tokio::select! {
-                    res = tokio::signal::ctrl_c() => {
-                        if let Err(e) = res {
-                            error!("Error listening for Ctrl+C: {}", e);
-                        } else {
-                            info!("Termination signal received. Shutting down llama-server...");
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                loop {
+                    tokio::select! {
+                        res = tokio::signal::ctrl_c() => {
+                            if let Err(e) = res {
+                                error!("Error listening for Ctrl+C: {}", e);
+                            } else {
+                                info!("Termination signal received. Shutting down llama-server...");
+                            }
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            match supervisor.check_status().await {
+                                Ok(Some((exit_status, _))) => {
+                                    error!("llama-server process exited unexpectedly: {:?}", exit_status);
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    error!("Failed to poll supervisor: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
-                    exit_res = supervisor.wait() => {
-                        error!("llama-server process exited unexpectedly: {:?}", exit_res);
-                    }
                 }
-                discovery
-                    .set_status_flags(nexus::discovery::StatusFlags(0))
-                    .await;
-                supervisor.stop().await?;
+                discovery.set_status_flags(StatusFlags(0)).await;
+                let _ = supervisor.stop().await;
                 broadcaster_handle.abort();
                 listener_handle.abort();
-                cp_handle.abort();
+                control_handle.abort();
                 info!("Shutdown complete.");
             }
             Err(e) => {
                 listener_handle.abort();
-                cp_handle.abort();
+                control_handle.abort();
                 error!("Failed to launch supervisor: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
         let broadcaster_handle = discovery.clone().start_broadcaster();
-        info!("No model specified. Daemon idle. Broadcasting beacon. Press Ctrl+C to exit.");
+        info!(
+            "No model specified. Daemon idle with control-plane on port {}. Broadcasting beacon. Press Ctrl+C to exit.",
+            config.network.control_port
+        );
         tokio::signal::ctrl_c().await?;
-        discovery
-            .set_status_flags(nexus::discovery::StatusFlags(0))
-            .await;
+        discovery.set_status_flags(StatusFlags(0)).await;
         broadcaster_handle.abort();
         listener_handle.abort();
-        cp_handle.abort();
+        control_handle.abort();
+        let _ = supervisor.stop().await;
         info!("Daemon stopped.");
     }
 

@@ -2,18 +2,23 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
-use nexus::discovery::DiscoveryService;
+use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
+use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
+use nexus::discovery::{DiscoveryService, NodeRole};
+use nexus::registry_runtime::spawn_registry_runtime;
+use nexus::trust_auth::TrustBootstrap;
 use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
 use nexus::sysinfo::SystemProfile;
-use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
 use nexus::ui::chat::{run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
 use nexus::ui::hub::{run_hub_tui, HubApp};
 use nexus::ui::models::scan_models_dir;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +27,10 @@ use std::time::Duration;
 #[command(name = "nexus")]
 #[command(about = "Nexus-LLM CLI Orchestrator & Client")]
 struct Cli {
+    /// Tracing filter level when RUST_LOG is unset (file logs under ~/.nexus/logs/)
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -90,6 +99,16 @@ enum Commands {
         sha256: Option<String>,
     },
 
+    /// Pair with a remote node using its 6-digit control-plane pairing code
+    Pair {
+        /// Control-plane base URL (e.g. http://192.168.1.50:9998)
+        #[arg(long)]
+        host: String,
+        /// Six-digit pairing code shown on the target device
+        #[arg(long)]
+        code: String,
+    },
+
     /// Display current or generated configuration
     Config {
         /// Path to custom config file
@@ -125,9 +144,9 @@ enum Commands {
         #[arg(short, long, default_value_t = 1800)]
         mem: u64,
 
-        /// Path to llama.cpp rpc-server binary
-        #[arg(long, default_value = "rpc-server")]
-        binary: PathBuf,
+        /// Path to llama.cpp rpc-server binary (defaults to config `node.rpc_server_binary`)
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 
     /// Inspect or manage ADB USB port forwarding and reverse tunnels to phone
@@ -171,53 +190,164 @@ enum Commands {
         #[arg(long)]
         preset: Option<String>,
     },
+
+    /// Diagnose mesh / inference preconditions (binaries, ports, config, profile)
+    Doctor,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let log_path = match nexus::logging::init_file_logging(&cli.log_level) {
+        Ok(path) => {
+            eprintln!("Nexus log file: {}", path.display());
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!("Warning: file logging unavailable ({e}); continuing without subscriber");
+            None
+        }
+    };
 
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
             let config = NexusConfig::load()?;
-            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let trust = TrustBootstrap::load(config.clone())?;
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
+            discovery.send_probe().await;
 
-            // Determine default client endpoint
-            let host = if let Some(dh) = &config.network.default_host {
+            // Order: default_host → PreferAdbTunnel USB → discovery → localhost
+            let host = if let Some(dh) = &trust.config.read().unwrap().network.default_host {
                 dh.clone()
-            } else if let (Some(usb_ep), _) = AdbTunnelSupervisor::resolve_transport_endpoint(
-                TransportMode::Auto,
-                config.network.api_port,
-                config.cluster.rpc_port,
-            ) {
-                usb_ep
             } else {
-                format!("http://127.0.0.1:{}", config.network.api_port)
+                let cfg = trust.config.read().unwrap();
+                let usb_ep = if cfg.cluster.prefer_adb_tunnel {
+                    AdbTunnelSupervisor::resolve_transport_endpoint(
+                        TransportMode::Auto,
+                        cfg.network.api_port,
+                        cfg.cluster.rpc_port,
+                    )
+                    .0
+                } else {
+                    None
+                };
+                drop(cfg);
+                if let Some(usb) = usb_ep {
+                    usb
+                } else {
+                    match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3)).await
+                    {
+                        Ok(client) => client.endpoint().to_string(),
+                        Err(_) => {
+                            let port = trust.config.read().unwrap().network.api_port;
+                            format!("http://127.0.0.1:{port}")
+                        }
+                    }
+                }
             };
 
             let client = NexusClient::new(host);
-            let hub = HubApp::new(config, client, discovery);
-            return run_hub_tui(hub).await;
+            let hub = HubApp::new(
+                config,
+                client,
+                discovery,
+                trust.identity,
+                trust.config,
+                trust.config_path,
+            );
+            let result = run_hub_tui(hub).await;
+            if let Some(path) = &log_path {
+                eprintln!("Nexus log file: {}", path.display());
+            }
+            return result;
         }
     };
 
     match command {
+        Commands::Pair { host, code } => {
+            let mut config = NexusConfig::load()?;
+            let trust = TrustBootstrap::load(config.clone())?;
+            let requester_id = config.node_uuid()?;
+            let pair_req = PairRequest {
+                protocol_version: CONTROL_PLANE_VERSION,
+                requester_id,
+                requester_public_key: trust.identity.public_key_hex(),
+                pairing_code: code,
+            };
+            let client = reqwest::Client::new();
+            let resp = dispatch_pair(&client, &host, &pair_req, &trust.identity).await?;
+            if !resp.success {
+                eprintln!("Pairing failed: {}", resp.message);
+                std::process::exit(1);
+            }
+            config
+                .network
+                .security
+                .record_pair(resp.node_id, resp.public_key);
+            config.save()?;
+            println!("Paired with node {} ({})", resp.node_id, host);
+        }
+
         Commands::Host { model, host, port, ctx, binary } => {
             let config = NexusConfig::load()?;
+            let trust = TrustBootstrap::load(config.clone())?;
             let profile = SystemProfile::probe();
-            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
+            let _registry = spawn_registry_runtime(
+                discovery.clone(),
+                trust.identity.clone(),
+                discovery.node_uuid(),
+            );
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
+
+            let api_host = host.unwrap_or_else(|| config.network.api_host.clone());
+            let api_port = port.unwrap_or(config.network.api_port);
+            let supervisor = SupervisorManager::new();
+            let control_ctx = Arc::new(
+                ControlPlaneContext::new(
+                    discovery.node_uuid(),
+                    NodeRole::from_str_role(&config.node.role),
+                    supervisor.clone(),
+                    api_host.clone(),
+                    api_port,
+                    binary.clone(),
+                    trust.identity.clone(),
+                    trust.config.clone(),
+                    trust.config_path.clone(),
+                )
+        .with_discovery(discovery.clone())
+        .with_capabilities(vec!["inference".to_string(), "host".to_string()])
+        .with_memory_policy(
+            config.hardware.safety.mmap,
+            config.hardware.safety.max_ram_usage_percent,
+        ),
+            );
+            let control_handle = spawn_control_plane(
+                SocketAddr::from(([0, 0, 0, 0], config.network.control_port)),
+                control_ctx,
+            );
+            println!(
+                "Control-plane listening on port {}",
+                config.network.control_port
+            );
+
             let server_cfg = LlamaServerConfig {
                 binary_path: binary,
                 model_path: model,
-                host: host.unwrap_or(config.network.api_host),
-                port: port.unwrap_or(config.network.api_port),
+                host: api_host,
+                port: api_port,
                 gpu_layers: if config.hardware.acceleration.prefer_gpu {
                     config.hardware.acceleration.gpu_layers
                 } else {
@@ -226,13 +356,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 threads: profile.recommended_threads,
                 context_size: ctx,
                 extra_args: Vec::new(),
+                use_mmap: config.hardware.safety.mmap,
+                memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
             };
-            let mut supervisor = ProcessSupervisor::spawn_with_fallback(server_cfg).await?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = supervisor.wait() => {}
+            supervisor.spawn(server_cfg).await?;
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => { break; }
+                    _ = tick.tick() => {
+                        if let Ok(Some(_)) = supervisor.check_status().await {
+                            break;
+                        }
+                    }
+                }
             }
-            supervisor.stop().await?;
+            let _ = supervisor.stop().await;
+            control_handle.abort();
         }
 
         Commands::Info => {
@@ -414,17 +554,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut config = NexusConfig::load().unwrap_or_default();
             config.node.role = "client".to_string();
+            let control_port = config.network.control_port;
+            let api_host = config.network.api_host.clone();
+            let api_port = config.network.api_port;
+            let llama_binary = PathBuf::from(&config.node.llama_server_binary);
+            let rpc_binary = binary.unwrap_or_else(|| PathBuf::from(&config.node.rpc_server_binary));
+            let use_mmap = config.hardware.safety.mmap;
+            let memory_budget_percent = config.hardware.safety.max_ram_usage_percent;
 
             // Start discovery service advertising RPC worker readiness
-            let discovery = Arc::new(DiscoveryService::new(config, None));
+            let trust = TrustBootstrap::load(config.clone())?;
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
             discovery.set_rpc_status(true, port).await;
+            let _registry = spawn_registry_runtime(
+                discovery.clone(),
+                trust.identity.clone(),
+                discovery.node_uuid(),
+            );
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
 
-            println!("Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)", port);
+            // Workers expose a control plane for state probes; model/load may fail
+            // without a local llama-server binary, which is intentional.
+            let supervisor = SupervisorManager::new();
+            let control_ctx = Arc::new(
+                ControlPlaneContext::new(
+                    discovery.node_uuid(),
+                    NodeRole::CLIENT,
+                    supervisor.clone(),
+                    api_host,
+                    api_port,
+                    llama_binary,
+                    trust.identity.clone(),
+                    trust.config.clone(),
+                    trust.config_path.clone(),
+                )
+                .with_discovery(discovery.clone())
+                .with_rpc_ready(true)
+                .with_capabilities(vec!["rpc".to_string(), "worker".to_string()])
+                .with_memory_policy(use_mmap, memory_budget_percent),
+            );
+            let control_handle = spawn_control_plane(
+                SocketAddr::from(([0, 0, 0, 0], control_port)),
+                control_ctx,
+            );
+            println!(
+                "Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)",
+                port
+            );
+            println!("Control-plane listening on port {}", control_port);
 
-            let child = tokio::process::Command::new(&binary)
+            let child = tokio::process::Command::new(&rpc_binary)
                 .args(["-H", "0.0.0.0", "-p", &port.to_string(), "-m", &mem.to_string()])
                 .spawn();
 
@@ -442,9 +626,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("rpc-server exited: {:?}", exit);
                         }
                     }
+                    control_handle.abort();
+                    let _ = supervisor.stop().await;
                 }
                 Err(e) => {
-                    eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", binary, e);
+                    control_handle.abort();
+                    eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", rpc_binary, e);
                     std::process::exit(1);
                 }
             }
@@ -493,8 +680,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = NexusConfig::load()?;
             let trans_mode = transport.parse::<TransportMode>().unwrap_or(TransportMode::Auto);
 
-            let (usb_endpoint, is_usb) = if host.is_none() {
-                AdbTunnelSupervisor::resolve_transport_endpoint(trans_mode, 8080, 50052)
+            let (usb_endpoint, is_usb) = if host.is_none() && config.cluster.prefer_adb_tunnel {
+                AdbTunnelSupervisor::resolve_transport_endpoint(
+                    trans_mode,
+                    config.network.api_port,
+                    config.cluster.rpc_port,
+                )
             } else {
                 (None, false)
             };
@@ -587,6 +778,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let app = ChatApp::new(client, model, sys_prompt);
                 run_chat_tui(app).await?;
             }
+        }
+
+        Commands::Doctor => {
+            let config = NexusConfig::load().unwrap_or_default();
+            let report = nexus::doctor::run_doctor(&config);
+            report.print();
+            if let Some(path) = &log_path {
+                println!("Log file: {}", path.display());
+            }
+            std::process::exit(report.exit_code());
         }
     }
 

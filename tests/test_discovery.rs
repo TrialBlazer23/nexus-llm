@@ -176,14 +176,14 @@ async fn test_peer_cache_expiry_and_pruning() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
+        control_port: 9998,
                 rpc_port: 0,
-                control_port: 8081,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 30,
                 active_model: "llama-3".to_string(),
-                display_name: None,
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -224,14 +224,14 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
+        control_port: 9998,
                 rpc_port: 0,
-                control_port: 8081,
                 total_ram_mb: 4000,
                 free_ram_mb: 2000,
                 backend: AccelerationBackend::ArmCpuDotProd,
                 thermal_index: 50,
                 active_model: "qwen".to_string(),
-                display_name: None,
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -245,14 +245,14 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
                 api_port: 8080,
+        control_port: 9998,
                 rpc_port: 0,
-                control_port: 8081,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 25,
                 active_model: "llama".to_string(),
-                display_name: None,
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -266,14 +266,14 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::CLIENT,
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
                 api_port: 8080,
+        control_port: 9998,
                 rpc_port: 50052,
-                control_port: 8081,
                 total_ram_mb: 3600,
                 free_ram_mb: 1800,
                 backend: AccelerationBackend::X86Baseline,
                 thermal_index: 10,
                 active_model: "".to_string(),
-                display_name: None,
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -391,10 +391,10 @@ async fn test_record_service_endpoint_merges_mdns() {
         capabilities: vec!["inference".to_string()],
         addresses: vec!["192.168.1.200:8080".parse().unwrap()],
         api_port: 8080,
+        control_port: 9998,
+        display_name: "galaxy-s23".to_string(),
         rpc_port: 50052,
-                control_port: 8081,
-                display_name: None,
-        };
+    };
 
     discovery
         .record_service_endpoint(endpoint, ObservationSource::Mdns)
@@ -407,11 +407,81 @@ async fn test_record_service_endpoint_merges_mdns() {
     assert!(peers[0].is_rpc_ready());
     assert_eq!(peers[0].api_endpoint(), "http://192.168.1.200:8080");
     assert_eq!(peers[0].rpc_endpoint(), "192.168.1.200:50052");
+    assert_eq!(peers[0].display_name, "galaxy-s23");
+    assert_eq!(peers[0].label(), "galaxy-s23");
 
     // Also check registry
     let registry = discovery.peer_registry();
     let reg_read = registry.read().await;
     assert!(reg_read.get(node_id).is_some());
+}
+
+#[test]
+fn test_peer_label_prefers_display_name() {
+    let uuid = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+    let mut peer = PeerNode {
+        uuid,
+        addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+        role: NodeRole::HOST,
+        status: StatusFlags::READY,
+        api_port: 8080,
+        control_port: 9998,
+        rpc_port: 0,
+        total_ram_mb: 1000,
+        free_ram_mb: 500,
+        backend: AccelerationBackend::GenericCpu,
+        thermal_index: 0,
+        active_model: String::new(),
+        display_name: String::new(),
+        last_seen: Instant::now(),
+    };
+    assert_eq!(peer.label(), "Node-aaaaaaaa");
+    peer.display_name = "macrowave".to_string();
+    assert_eq!(peer.label(), "macrowave");
+}
+
+#[test]
+fn test_resolved_display_name_uses_configured_name() {
+    let mut config = NexusConfig::default();
+    config.node.name = "studio-box".to_string();
+    assert_eq!(config.resolved_display_name(), "studio-box");
+    config.node.name = "auto".to_string();
+    let resolved = config.resolved_display_name();
+    assert!(!resolved.is_empty());
+    assert_ne!(resolved, "auto");
+}
+
+#[tokio::test]
+async fn test_resolve_from_discovery_falls_back_to_best_host() {
+    use nexus::client::NexusClient;
+    let config = NexusConfig::default();
+    assert!(config.network.anchors.primary_compute_id.is_none());
+    let discovery = DiscoveryService::new(config, None);
+    let host_id = Uuid::new_v4();
+    discovery.peers().write().await.insert(
+        host_id,
+        PeerNode {
+            uuid: host_id,
+            addr: SocketAddr::from(([10, 0, 0, 42], 8080)),
+            role: NodeRole::HOST,
+            status: StatusFlags::READY,
+            api_port: 8080,
+            control_port: 9998,
+            rpc_port: 0,
+            total_ram_mb: 8000,
+            free_ram_mb: 4000,
+            backend: AccelerationBackend::Vulkan,
+            thermal_index: 10,
+            active_model: "demo".to_string(),
+            display_name: "lan-host".to_string(),
+            last_seen: Instant::now(),
+        },
+    );
+
+    let client = NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(1))
+        .await
+        .expect("default config must resolve a ready beacon host");
+    assert_eq!(client.endpoint(), "http://10.0.0.42:8080");
 }
 
 #[tokio::test]
@@ -427,53 +497,4 @@ async fn test_backend_health_tracking() {
 
     discovery.set_mdns_health(BackendHealth::Healthy).await;
     assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Healthy);
-}
-
-#[tokio::test]
-async fn test_peer_friendly_name_from_mdns_display_name() {
-    let config = NexusConfig::default();
-    let discovery = DiscoveryService::new(config, None);
-    let node_id = Uuid::new_v4();
-
-    let endpoint = ServiceEndpoint {
-        node_id,
-        cluster_id: None,
-        protocol_version: 1,
-        role: NodeRole::HOST,
-        capabilities: vec![],
-        addresses: vec!["192.168.1.50:8080".parse().unwrap()],
-        api_port: 8080,
-        rpc_port: 0,
-        control_port: 8081,
-        display_name: Some("galaxy-s23".to_string()),
-    };
-    discovery
-        .record_service_endpoint(endpoint, ObservationSource::Mdns)
-        .await;
-
-    let peers = discovery.get_active_peers().await;
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].friendly_name(), "galaxy-s23");
-
-    // Without name → Node-{uuid8}
-    let bare = ServiceEndpoint {
-        node_id: Uuid::new_v4(),
-        cluster_id: None,
-        protocol_version: 1,
-        role: NodeRole::CLIENT,
-        capabilities: vec![],
-        addresses: vec!["192.168.1.51:8080".parse().unwrap()],
-        api_port: 8080,
-        rpc_port: 0,
-        control_port: 8081,
-        display_name: None,
-    };
-    let bare_id = bare.node_id;
-    discovery
-        .record_service_endpoint(bare, ObservationSource::Mdns)
-        .await;
-    let peers = discovery.get_active_peers().await;
-    let peer = peers.iter().find(|p| p.uuid == bare_id).unwrap();
-    let expected = format!("Node-{}", &bare_id.to_string()[..8]);
-    assert_eq!(peer.friendly_name(), expected);
 }

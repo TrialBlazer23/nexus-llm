@@ -166,8 +166,14 @@ service_type = "_nexus._tcp.local."
 
 [network.security]
 protocol_version = 1
-require_pairing = false
+require_pairing = false          # Auto-set true after first successful pair (Phase 9)
 allowed_peer_ids = []
+# paired_peers = [{ id = "...", public_key_hex = "..." }]  # Filled by POST /pair
+
+# Phase 9: Ed25519 signing key at ~/.nexus/node.key (mode 0600). Control-plane
+# POST bodies use headers Nexus-Signature-* over canonical:
+#   nexus-control-v1\n{METHOD}\n{PATH}\n{sha256_hex(body)}\n{timestamp}\n{nonce}\n{signer_id}
+# Pairing: target shows a 6-digit code (5-minute window); initiator POST /nexus/control/v1/pair.
 
 [cluster]
 rpc_port = 50052

@@ -25,11 +25,11 @@ pub enum SettingType {
     EnableMdns,
     DiscoveryPort,
     ApiPort,
+    ControlPort,
     PreferAdbTunnel,
     // Hardware & Acceleration
     PreferGpu,
     GpuLayers,
-    FallbackCpu,
     CpuThreads,
     // Memory & Android LMK Safeguards
     MaxRamPercent,
@@ -120,6 +120,12 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
     },
     SettingItem {
         category: "Network & Transport",
+        name: "Control Plane Port",
+        description: "HTTP control-plane port for remote load/unload (default: 9998)",
+        setting_type: SettingType::ControlPort,
+    },
+    SettingItem {
+        category: "Network & Transport",
         name: "Prefer USB Cable Tunnel (ADB)",
         description: "Prioritize low-latency localhost USB tunnel when cable is connected",
         setting_type: SettingType::PreferAdbTunnel,
@@ -136,12 +142,6 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "GPU Offload Layer Count (-ngl)",
         description: "Number of transformer layers offloaded to GPU (99 for full offload)",
         setting_type: SettingType::GpuLayers,
-    },
-    SettingItem {
-        category: "Hardware & Acceleration",
-        name: "Automatic CPU Fallback",
-        description: "Fallback to ARM CPU dotprod if Vulkan fails to initialize",
-        setting_type: SettingType::FallbackCpu,
     },
     SettingItem {
         category: "Hardware & Acceleration",
@@ -372,9 +372,6 @@ impl SettingsView {
                     self.config.hardware.acceleration.gpu_layers = (self.config.hardware.acceleration.gpu_layers + 10).min(99);
                 }
             }
-            SettingType::FallbackCpu => {
-                self.config.hardware.acceleration.fallback_to_cpu = !self.config.hardware.acceleration.fallback_to_cpu;
-            }
             SettingType::CpuThreads => {
                 if is_left {
                     self.config.hardware.acceleration.cpu_threads = self.config.hardware.acceleration.cpu_threads.saturating_sub(1).max(1);
@@ -397,6 +394,13 @@ impl SettingsView {
                     self.config.network.api_port = self.config.network.api_port.saturating_sub(1);
                 } else if is_right {
                     self.config.network.api_port = self.config.network.api_port.saturating_add(1);
+                }
+            }
+            SettingType::ControlPort => {
+                if is_left {
+                    self.config.network.control_port = self.config.network.control_port.saturating_sub(1);
+                } else if is_right {
+                    self.config.network.control_port = self.config.network.control_port.saturating_add(1);
                 }
             }
             SettingType::PreferAdbTunnel => {
@@ -488,11 +492,11 @@ impl SettingsView {
                     SettingType::DiscoveryPort => format!("[ {} ]", self.config.network.discovery_port),
                     SettingType::PreferGpu => format!("[ {} ]", if self.config.hardware.acceleration.prefer_gpu { "ON" } else { "OFF" }),
                     SettingType::GpuLayers => format!("[ {} layers ]", self.config.hardware.acceleration.gpu_layers),
-                    SettingType::FallbackCpu => format!("[ {} ]", if self.config.hardware.acceleration.fallback_to_cpu { "ON" } else { "OFF" }),
                     SettingType::CpuThreads => format!("[ {} threads ]", self.config.hardware.acceleration.cpu_threads),
                     SettingType::MaxRamPercent => format!("[ {}% ]", self.config.hardware.safety.max_ram_usage_percent),
                     SettingType::Mmap => format!("[ {} ]", if self.config.hardware.safety.mmap { "ON" } else { "OFF" }),
                     SettingType::ApiPort => format!("[ {} ]", self.config.network.api_port),
+                    SettingType::ControlPort => format!("[ {} ]", self.config.network.control_port),
                     SettingType::PreferAdbTunnel => format!("[ {} ]", if self.config.cluster.prefer_adb_tunnel { "ON" } else { "OFF" }),
                     SettingType::EnableRpc => format!("[ {} ]", if self.config.cluster.enable_rpc { "ON" } else { "OFF" }),
                     SettingType::MaxRpcRamMb => format!("[ {} MB ]", self.config.cluster.max_rpc_ram_mb),

@@ -2,6 +2,8 @@ use clap::Parser;
 use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{NodeRole, StatusFlags};
+use nexus::registry_runtime::spawn_registry_runtime;
+use nexus::trust_auth::TrustBootstrap;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::net::SocketAddr;
@@ -71,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         NexusConfig::load()?
     };
+    let trust = TrustBootstrap::load(config.clone())?;
     info!(
         "Node Role: {}, Models Dir: {:?}",
         config.node.role, config.node.models_dir
@@ -89,10 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Recommended CPU Threads: {}", profile.recommended_threads);
 
     // 3. Start Autonomous UDP Discovery Service
-    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::new(
-        config.clone(),
+    let discovery = std::sync::Arc::new(nexus::discovery::DiscoveryService::with_shared_config(
+        trust.config.clone(),
         None,
     ));
+    let _registry_runtime = spawn_registry_runtime(
+        discovery.clone(),
+        trust.identity.clone(),
+        discovery.node_uuid(),
+    );
     let listener_handle = discovery.clone().start_listener();
     let _mdns_handle = discovery.clone().start_mdns();
     info!(
@@ -110,6 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.host.clone(),
             args.port,
             args.binary.clone(),
+            trust.identity.clone(),
+            trust.config.clone(),
+            trust.config_path.clone(),
         )
         .with_discovery(discovery.clone())
         .with_capabilities(vec!["inference".to_string(), "daemon".to_string()])
@@ -169,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         max_thermal_index: 75,
                         max_allocatable_mb: config.cluster.max_rpc_ram_mb,
                         require_pairing: config.network.security.require_pairing,
+                        protocol_version: nexus::control_plane::CONTROL_PLANE_VERSION,
                     })
                     .await
                     .map(|candidate| candidate.peer.rpc_endpoint())

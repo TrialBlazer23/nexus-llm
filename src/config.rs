@@ -1,3 +1,4 @@
+use crate::node_identity::NodeIdentity;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,13 +91,21 @@ impl NexusConfig {
         Ok(raw.node.id)
     }
 
-    fn ensure_identity(&mut self) -> Result<(), ConfigError> {
+    pub fn ensure_identity(&mut self) -> Result<(), ConfigError> {
+        let identity = NodeIdentity::load_or_create(None)
+            .map_err(|e| ConfigError::Invalid(format!("node identity: {e}")))?;
         if self.node.id.trim().is_empty() || self.node.id == "auto" {
-            self.node.id = Uuid::new_v4().to_string();
+            self.node.id = identity.node_id_from_public_key().to_string();
         }
         Uuid::parse_str(&self.node.id)
             .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))?;
         Ok(())
+    }
+
+    /// Load Ed25519 identity and align `node.id` for fresh installs.
+    pub fn load_node_identity(&self) -> Result<NodeIdentity, ConfigError> {
+        NodeIdentity::load_or_create(None)
+            .map_err(|e| ConfigError::Invalid(format!("node identity: {e}")))
     }
 
     pub fn node_uuid(&self) -> Result<Uuid, ConfigError> {
@@ -455,6 +464,12 @@ impl Default for MdnsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairedPeer {
+    pub node_id: Uuid,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecurityConfig {
     #[serde(default = "default_security_protocol_version")]
     pub protocol_version: u16,
@@ -462,6 +477,8 @@ pub struct SecurityConfig {
     pub require_pairing: bool,
     #[serde(default)]
     pub allowed_peer_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub paired_peers: Vec<PairedPeer>,
 }
 
 impl Default for SecurityConfig {
@@ -470,7 +487,36 @@ impl Default for SecurityConfig {
             protocol_version: default_security_protocol_version(),
             require_pairing: false,
             allowed_peer_ids: Vec::new(),
+            paired_peers: Vec::new(),
         }
+    }
+}
+
+impl SecurityConfig {
+    pub fn pairing_enforced(&self) -> bool {
+        self.require_pairing || !self.allowed_peer_ids.is_empty()
+    }
+
+    pub fn public_key_for(&self, node_id: Uuid) -> Option<&str> {
+        self.paired_peers
+            .iter()
+            .find(|peer| peer.node_id == node_id)
+            .map(|peer| peer.public_key_hex.as_str())
+    }
+
+    pub fn record_pair(&mut self, node_id: Uuid, public_key_hex: String) {
+        if !self.allowed_peer_ids.contains(&node_id) {
+            self.allowed_peer_ids.push(node_id);
+        }
+        if let Some(existing) = self.paired_peers.iter_mut().find(|p| p.node_id == node_id) {
+            existing.public_key_hex = public_key_hex;
+        } else {
+            self.paired_peers.push(PairedPeer {
+                node_id,
+                public_key_hex,
+            });
+        }
+        self.require_pairing = true;
     }
 }
 

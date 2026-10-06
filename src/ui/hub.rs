@@ -1,7 +1,14 @@
 use crate::client::{ChatMessage, NexusClient};
 use crate::config::NexusConfig;
+use crate::control_plane::{
+    dispatch_load_model, dispatch_load_model_signed, dispatch_pair, ModelLoadRequest,
+    ModelLoadResponse, PairRequest, CONTROL_PLANE_VERSION,
+};
+use crate::control_plane::ControlPlaneError;
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
+use crate::node_identity::NodeIdentity;
+use crate::registry_runtime::spawn_registry_runtime;
 use crate::supervisor::{LlamaServerConfig, SupervisorManager};
 use crate::sysinfo::SystemProfile;
 use crate::ui::chat::{ChatApp, StreamMsg};
@@ -113,10 +120,20 @@ pub struct HubApp {
     pub pending_hot_swap_path: Option<PathBuf>,
     pub pending_target_selection: Option<TargetSelectionState>,
     pub status_message: Option<(String, Color)>,
+    pub identity: Arc<NodeIdentity>,
+    pub shared_config: Arc<std::sync::RwLock<NexusConfig>>,
+    pub config_path: std::path::PathBuf,
 }
 
 impl HubApp {
-    pub fn new(config: NexusConfig, client: NexusClient, discovery: Arc<DiscoveryService>) -> Self {
+    pub fn new(
+        config: NexusConfig,
+        client: NexusClient,
+        discovery: Arc<DiscoveryService>,
+        identity: Arc<NodeIdentity>,
+        shared_config: Arc<std::sync::RwLock<NexusConfig>>,
+        config_path: std::path::PathBuf,
+    ) -> Self {
         let models_view = ModelsView::new(config.node.models_dir.clone());
         let cluster_view = ClusterView::new(discovery.clone());
         let settings_view = SettingsView::new(config.clone());
@@ -135,7 +152,62 @@ impl HubApp {
             pending_hot_swap_path: None,
             pending_target_selection: None,
             status_message: None,
+            identity,
+            shared_config,
+            config_path,
         }
+    }
+
+    pub fn sync_shared_config(&mut self) {
+        if let Ok(mut shared) = self.shared_config.write() {
+            *shared = self.config.clone();
+        }
+    }
+
+    async fn dispatch_remote_load_request(
+        &self,
+        endpoint: &str,
+        req: ModelLoadRequest,
+    ) -> Result<ModelLoadResponse, ControlPlaneError> {
+        let client = reqwest::Client::new();
+        if self.config.network.security.pairing_enforced() {
+            dispatch_load_model_signed(&client, endpoint, &req, &self.identity).await
+        } else {
+            dispatch_load_model(&client, endpoint, &req).await
+        }
+    }
+
+    pub async fn submit_pairing_code(&mut self, code: String) -> Result<(), String> {
+        let peer = self
+            .cluster_view
+            .selected_peer()
+            .ok_or_else(|| "No peer selected".to_string())?
+            .clone();
+        let control_ep = peer.control_endpoint();
+        let requester_id = self
+            .config
+            .node_uuid()
+            .map_err(|e| e.to_string())?;
+        let pair_req = PairRequest {
+            protocol_version: CONTROL_PLANE_VERSION,
+            requester_id,
+            requester_public_key: self.identity.public_key_hex(),
+            pairing_code: code,
+        };
+        let client = reqwest::Client::new();
+        let resp = dispatch_pair(&client, &control_ep, &pair_req, &self.identity)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.success {
+            return Err(resp.message);
+        }
+        self.config
+            .network
+            .security
+            .record_pair(resp.node_id, resp.public_key);
+        self.config.save_to_path(&self.config_path).map_err(|e| e.to_string())?;
+        self.sync_shared_config();
+        Ok(())
     }
 
     pub fn set_tab(&mut self, tab: HubTab) {
@@ -235,7 +307,6 @@ impl HubApp {
                         self.request_model_load_with_gpu(state.model_path, Some(0)).await;
                     }
                     TargetExecutionNode::Remote { endpoint, api_endpoint, name, backend, .. } => {
-                        let client = reqwest::Client::new();
                         let req = crate::control_plane::ModelLoadRequest {
                             protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
                             requester_id: self.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
@@ -247,7 +318,7 @@ impl HubApp {
                         };
 
                         info!("Dispatching remote model load to {}: {:?}", endpoint, req);
-                        match crate::control_plane::dispatch_load_model(&client, endpoint, &req).await {
+                        match self.dispatch_remote_load_request(endpoint, req).await {
                             Ok(resp) if resp.success => {
                                 self.active_model_name = state.model_name.clone();
                                 let target_api = if !resp.api_endpoint.is_empty()
@@ -387,6 +458,7 @@ impl HubApp {
                         max_thermal_index: 75,
                         max_allocatable_mb: self.config.cluster.max_rpc_ram_mb,
                         require_pairing: self.config.network.security.require_pairing,
+                        protocol_version: CONTROL_PLANE_VERSION,
                     })
                     .await
             } else {
@@ -698,6 +770,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 /// Launch and execute the main unified hub event loop.
 pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Error>> {
+    hub.cluster_view
+        .set_local_identity(hub.identity.clone());
+    let _registry_runtime = spawn_registry_runtime(
+        hub.discovery.clone(),
+        hub.identity.clone(),
+        hub.discovery.node_uuid(),
+    );
     let control_addr = SocketAddr::from(([0, 0, 0, 0], hub.config.network.control_port));
     let control_ctx = Arc::new(
         ControlPlaneContext::new(
@@ -707,6 +786,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             hub.config.network.api_host.clone(),
             hub.config.network.api_port,
             PathBuf::from(&hub.config.node.llama_server_binary),
+            hub.identity.clone(),
+            hub.shared_config.clone(),
+            hub.config_path.clone(),
         )
         .with_discovery(hub.discovery.clone())
         .with_capabilities(vec!["inference".to_string(), "hub".to_string()])
@@ -910,7 +992,39 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                         }
                         HubTab::Cluster => {
-                            if hub.cluster_view.adding_peer {
+                            if hub.cluster_view.enter_pair_code {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let code = hub.cluster_view.pair_code_input.clone();
+                                        hub.cluster_view.enter_pair_code = false;
+                                        hub.cluster_view.pair_code_input.clear();
+                                        match hub.submit_pairing_code(code).await {
+                                            Ok(()) => hub.cluster_view.status_message = Some((
+                                                "Pairing succeeded".to_string(),
+                                                Color::Green,
+                                            )),
+                                            Err(e) => hub.cluster_view.status_message = Some((
+                                                format!("Pairing failed: {e}"),
+                                                Color::Red,
+                                            )),
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        hub.cluster_view.enter_pair_code = false;
+                                        hub.cluster_view.pair_code_input.clear();
+                                    }
+                                    KeyCode::Backspace => {
+                                        hub.cluster_view.pair_code_input.pop();
+                                    }
+                                    KeyCode::Char(c) if c.is_ascii_digit()
+                                        && hub.cluster_view.pair_code_input.len() < 6 =>
+                                    {
+                                        hub.cluster_view.pair_code_input.push(c);
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            } else if hub.cluster_view.adding_peer {
                                 match key.code {
                                     KeyCode::Enter => {
                                         let input = hub.cluster_view.add_peer_input.trim().to_string();
@@ -949,6 +1063,13 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     }
                                     _ => {}
                                 }
+                            } else if hub.cluster_view.show_pair_code {
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P') => {
+                                        hub.cluster_view.show_pair_code = false;
+                                    }
+                                    _ => {}
+                                }
                             } else {
                                 match key.code {
                                     KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
@@ -959,6 +1080,18 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Down | KeyCode::Char('j') => hub.cluster_view.next(),
                                     KeyCode::Enter => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            if !hub
+                                                .discovery
+                                                .is_peer_trusted_for_routing(peer.uuid)
+                                                .await
+                                            {
+                                                hub.cluster_view.status_message = Some((
+                                                    "Peer is not paired/verified — use [O] enter pairing code"
+                                                        .to_string(),
+                                                    Color::Yellow,
+                                                ));
+                                                continue;
+                                            }
                                             let ep = peer.api_endpoint();
                                             hub.discovery.send_direct_probe_to_ip(peer.addr.ip()).await;
                                             let model = if !peer.active_model.is_empty() {
@@ -982,12 +1115,34 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.cluster_view.status_message = Some(("No peer selected to connect".to_string(), Color::Yellow));
                                         }
                                     }
+                                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                                        hub.cluster_view.show_pair_code = true;
+                                    }
+                                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                                        hub.cluster_view.enter_pair_code = true;
+                                        hub.cluster_view.pair_code_input.clear();
+                                        hub.cluster_view.status_message = Some((
+                                            "Enter 6-digit pairing code from peer | [Enter] submit | [Esc] cancel"
+                                                .to_string(),
+                                            Color::Yellow,
+                                        ));
+                                    }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            if !hub
+                                                .discovery
+                                                .is_peer_trusted_for_routing(peer.uuid)
+                                                .await
+                                            {
+                                                hub.cluster_view.status_message = Some((
+                                                    "Cannot load on unpaired/unverified peer".to_string(),
+                                                    Color::Red,
+                                                ));
+                                                continue;
+                                            }
                                             let peer_name = peer.label();
                                             let peer_ctrl = peer.control_endpoint();
                                             if let Some(m) = hub.models_view.selected_model() {
-                                                let client = reqwest::Client::new();
                                                 let model_name = m.filename.clone();
                                                 let req = crate::control_plane::ModelLoadRequest {
                                                     protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
@@ -998,7 +1153,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     threads: hub.config.hardware.acceleration.cpu_threads,
                                                     rpc_workers: Vec::new(),
                                                 };
-                                                match crate::control_plane::dispatch_load_model(&client, &peer_ctrl, &req).await {
+                                                match hub.dispatch_remote_load_request(&peer_ctrl, req).await {
                                                     Ok(resp) if resp.success => {
                                                         hub.active_model_name = model_name.clone();
                                                         let target_api = if !resp.api_endpoint.is_empty()

@@ -1,5 +1,6 @@
 use crate::config::NexusConfig;
-use crate::peer_registry::{ObservationSource, PeerRegistry};
+use crate::peer_registry::{ObservationSource, PeerLifecycle, PeerRegistry};
+use crate::trust_auth::pairing_enforced;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -334,6 +335,18 @@ pub struct RpcSelectionPolicy {
     pub max_thermal_index: u8,
     pub max_allocatable_mb: u64,
     pub require_pairing: bool,
+    pub protocol_version: u16,
+}
+
+impl Default for RpcSelectionPolicy {
+    fn default() -> Self {
+        Self {
+            max_thermal_index: 75,
+            max_allocatable_mb: 1800,
+            require_pairing: false,
+            protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,7 +402,7 @@ impl PeerNode {
 
 /// Autonomous UDP discovery and peer caching service.
 pub struct DiscoveryService {
-    config: NexusConfig,
+    config: Arc<std::sync::RwLock<NexusConfig>>,
     node_uuid: Uuid,
     peers: Arc<RwLock<HashMap<Uuid, PeerNode>>>,
     registry: Arc<RwLock<PeerRegistry>>,
@@ -405,18 +418,29 @@ pub struct DiscoveryService {
 
 impl DiscoveryService {
     pub fn new(config: NexusConfig, custom_uuid: Option<Uuid>) -> Self {
+        Self::with_shared_config(Arc::new(std::sync::RwLock::new(config)), custom_uuid)
+    }
+
+    pub fn with_shared_config(
+        config: Arc<std::sync::RwLock<NexusConfig>>,
+        custom_uuid: Option<Uuid>,
+    ) -> Self {
+        let snapshot = config.read().expect("config lock");
         let node_uuid = custom_uuid
-            .or_else(|| config.node_uuid().ok())
+            .or_else(|| snapshot.node_uuid().ok())
             .unwrap_or_else(Uuid::new_v4);
-        let max_peers = config.network.discovery.max_peers;
-        let peer_timeout = Duration::from_millis(config.network.discovery.peer_timeout_ms);
+        let max_peers = snapshot.network.discovery.max_peers;
+        let peer_timeout = Duration::from_millis(snapshot.network.discovery.peer_timeout_ms);
+        let discovery_enabled = snapshot.network.discovery.enabled;
+        let mdns_enabled_val =
+            snapshot.network.discovery.enabled && snapshot.network.discovery.mdns.enabled;
+        drop(snapshot);
         let default_status = StatusFlags(0);
-        let udp_health = Arc::new(RwLock::new(if config.network.discovery.enabled {
+        let udp_health = Arc::new(RwLock::new(if discovery_enabled {
             BackendHealth::Started
         } else {
             BackendHealth::Stopped
         }));
-        let mdns_enabled_val = config.network.discovery.enabled && config.network.discovery.mdns.enabled;
         let mdns_health = Arc::new(RwLock::new(
             if mdns_enabled_val {
                 BackendHealth::Started
@@ -495,7 +519,7 @@ impl DiscoveryService {
 
     /// Register a peer IP and transmit an immediate targeted discovery probe to its discovery port.
     pub async fn send_direct_probe_to_ip(&self, ip: std::net::IpAddr) {
-        let target = SocketAddr::new(ip, self.config.network.discovery_port);
+        let target = SocketAddr::new(ip, self.cfg().network.discovery_port);
         {
             let mut extra = self.extra_targets.write().await;
             if !extra.contains(&target) {
@@ -530,8 +554,16 @@ impl DiscoveryService {
         *self.rpc_port.read().await
     }
 
-    pub fn config(&self) -> &NexusConfig {
-        &self.config
+    pub fn config(&self) -> NexusConfig {
+        self.config.read().expect("config lock").clone()
+    }
+
+    pub fn shared_config(&self) -> Arc<std::sync::RwLock<NexusConfig>> {
+        self.config.clone()
+    }
+
+    fn cfg(&self) -> std::sync::RwLockReadGuard<'_, NexusConfig> {
+        self.config.read().expect("config lock poisoned")
     }
 
     /// Read thermal index from Linux thermal zone (0 to 100 scale).
@@ -598,7 +630,7 @@ impl DiscoveryService {
 
     /// Compute active targets including static peers added at runtime.
     pub async fn broadcast_targets(&self) -> Vec<SocketAddr> {
-        let mut targets = Self::get_broadcast_targets(&self.config);
+        let mut targets = Self::get_broadcast_targets(&self.cfg());
         let extra = self.extra_targets.read().await;
         for target in extra.iter() {
             if !targets.contains(target) {
@@ -613,7 +645,7 @@ impl DiscoveryService {
         let target_addr = if let Ok(addr) = peer_str.parse::<SocketAddr>() {
             Some(addr)
         } else if let Ok(ip) = peer_str.parse::<std::net::IpAddr>() {
-            Some(SocketAddr::new(ip, self.config.network.discovery_port))
+            Some(SocketAddr::new(ip, self.cfg().network.discovery_port))
         } else {
             None
         };
@@ -648,10 +680,10 @@ impl DiscoveryService {
         let beacon = BeaconPacket {
             magic: BEACON_MAGIC,
             version: BEACON_VERSION,
-            role: NodeRole::from_str_role(&self.config.node.role),
+            role: NodeRole::from_str_role(&self.cfg().node.role),
             status,
             uuid: self.node_uuid,
-            api_port: self.config.network.api_port,
+            api_port: self.cfg().network.api_port,
             rpc_port,
             total_ram_mb: profile.total_ram_mb as u32,
             free_ram_mb: profile.available_ram_mb as u32,
@@ -675,7 +707,7 @@ impl DiscoveryService {
     /// Spawn asynchronous UDP beacon broadcaster task.
     pub fn start_broadcaster(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            if !self.config.network.discovery.enabled {
+            if !self.cfg().network.discovery.enabled {
                 info!("Discovery broadcaster disabled by configuration");
                 return;
             }
@@ -695,10 +727,10 @@ impl DiscoveryService {
             let initial_targets = self.broadcast_targets().await;
             info!(
                 "Discovery broadcaster active: transmitting beacons to {:?} every {} ms",
-                initial_targets, self.config.network.broadcast_interval_ms
+                initial_targets, self.cfg().network.broadcast_interval_ms
             );
 
-            let interval = Duration::from_millis(self.config.network.broadcast_interval_ms);
+            let interval = Duration::from_millis(self.cfg().network.broadcast_interval_ms);
             let mut ticker = tokio::time::interval(interval);
 
             loop {
@@ -713,10 +745,10 @@ impl DiscoveryService {
                 let beacon = BeaconPacket {
                     magic: BEACON_MAGIC,
                     version: BEACON_VERSION,
-                    role: NodeRole::from_str_role(&self.config.node.role),
+                    role: NodeRole::from_str_role(&self.cfg().node.role),
                     status,
                     uuid: self.node_uuid,
-                    api_port: self.config.network.api_port,
+                    api_port: self.cfg().network.api_port,
                     rpc_port,
                     total_ram_mb: profile.total_ram_mb as u32,
                     free_ram_mb: profile.available_ram_mb as u32,
@@ -759,17 +791,26 @@ impl DiscoveryService {
         events: Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            if !self.config.network.discovery.enabled {
+            let (discovery_enabled, discovery_port, local_role, local_api_port) = {
+                let cfg = self.config.read().expect("config lock");
+                (
+                    cfg.network.discovery.enabled,
+                    cfg.network.discovery_port,
+                    cfg.node.role.clone(),
+                    cfg.network.api_port,
+                )
+            };
+            if !discovery_enabled {
                 info!("Discovery listener disabled by configuration");
                 *self.udp_health.write().await = BackendHealth::Stopped;
                 return;
             }
-            let socket = match create_listener_socket(self.config.network.discovery_port) {
+            let socket = match create_listener_socket(discovery_port) {
                 Ok(s) => s,
                 Err(e) => {
                     error!(
                         "Failed to bind discovery listener to port {}: {}",
-                        self.config.network.discovery_port, e
+                        discovery_port, e
                     );
                     *self.udp_health.write().await = BackendHealth::Failed;
                     if let Some(sender) = &events {
@@ -786,7 +827,7 @@ impl DiscoveryService {
 
             info!(
                 "Discovery listener active on port {}",
-                self.config.network.discovery_port
+                discovery_port
             );
             *self.udp_health.write().await = BackendHealth::Healthy;
             if let Some(sender) = &events {
@@ -818,9 +859,11 @@ impl DiscoveryService {
                                     // Beacon v1 has no control_port or display_name; preserve
                                     // mDNS-learned values, otherwise assume mesh defaults.
                                     let existing = peers.get(&beacon.uuid);
+                                    let default_control_port =
+                                        self.config.read().expect("config lock").network.control_port;
                                     let control_port = existing
                                         .map(|p| p.control_port)
-                                        .unwrap_or(self.config.network.control_port);
+                                        .unwrap_or(default_control_port);
                                     let display_name = existing
                                         .map(|p| p.display_name.clone())
                                         .unwrap_or_default();
@@ -860,10 +903,8 @@ impl DiscoveryService {
                                     }
 
                                     // Auto-register peer endpoint into extra_targets so ongoing periodic unicast beacons reach it
-                                    let peer_discovery_addr = SocketAddr::new(
-                                        peer_addr.ip(),
-                                        self.config.network.discovery_port,
-                                    );
+                                    let peer_discovery_addr =
+                                        SocketAddr::new(peer_addr.ip(), discovery_port);
                                     {
                                         let mut extra = self.extra_targets.write().await;
                                         if !extra.contains(&peer_discovery_addr) {
@@ -890,10 +931,10 @@ impl DiscoveryService {
                                         let reply_beacon = BeaconPacket {
                                             magic: BEACON_MAGIC,
                                             version: BEACON_VERSION,
-                                            role: NodeRole::from_str_role(&self.config.node.role),
+                                            role: NodeRole::from_str_role(&local_role),
                                             status: *self.status_flags.read().await,
                                             uuid: self.node_uuid,
-                                            api_port: self.config.network.api_port,
+                                            api_port: local_api_port,
                                             rpc_port: *self.rpc_port.read().await,
                                             total_ram_mb: profile.total_ram_mb as u32,
                                             free_ram_mb: profile.available_ram_mb as u32,
@@ -925,7 +966,7 @@ impl DiscoveryService {
 
     /// Retrieve active peers, evicting any whose last beacon is older than `peer_timeout_ms` (6000 ms).
     pub async fn get_active_peers(&self) -> Vec<PeerNode> {
-        let timeout = Duration::from_millis(self.config.network.peer_timeout_ms);
+        let timeout = Duration::from_millis(self.cfg().network.peer_timeout_ms);
         let mut peers = self.peers.write().await;
 
         peers.retain(|_, peer| peer.last_seen.elapsed() <= timeout);
@@ -952,6 +993,52 @@ impl DiscoveryService {
             })
     }
 
+    pub async fn is_peer_trusted_for_routing(&self, peer_id: Uuid) -> bool {
+        let security = self.config().network.security;
+        if !pairing_enforced(&security) {
+            return true;
+        }
+        if !security.allowed_peer_ids.contains(&peer_id) {
+            return false;
+        }
+        let registry = self.registry.read().await;
+        registry
+            .get(peer_id)
+            .map(|record| {
+                record.verified && matches!(record.lifecycle, PeerLifecycle::Healthy)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Best ready host that passes pairing + registry verification when enforced.
+    pub async fn find_best_trusted_host(&self) -> Option<PeerNode> {
+        let mut hosts: Vec<PeerNode> = self
+            .get_active_peers()
+            .await
+            .into_iter()
+            .filter(|p| p.role.is_host() && p.status.is_ready())
+            .collect();
+        hosts.sort_by_key(|p| {
+            std::cmp::Reverse({
+                let mut score = p.free_ram_mb as i64;
+                if p.status.is_ready() {
+                    score += 1000;
+                }
+                if p.backend == AccelerationBackend::Vulkan {
+                    score += 500;
+                }
+                score -= p.thermal_index as i64;
+                score
+            })
+        });
+        for host in hosts {
+            if self.is_peer_trusted_for_routing(host.uuid).await {
+                return Some(host);
+            }
+        }
+        None
+    }
+
     /// Select the best RPC peer node currently available on the subnet (highest free RAM).
     #[deprecated(note = "use select_rpc_candidate")]
     pub async fn find_best_rpc_peer(&self) -> Option<PeerNode> {
@@ -963,7 +1050,7 @@ impl DiscoveryService {
     }
 
     pub async fn resolve_primary_compute_anchor(&self) -> Option<PeerNode> {
-        let anchor = self.config.network.anchors.primary_compute_id?;
+        let anchor = self.cfg().network.anchors.primary_compute_id?;
         self.get_active_peers()
             .await
             .into_iter()
@@ -971,6 +1058,17 @@ impl DiscoveryService {
     }
 
     pub async fn rpc_candidates(&self, policy: RpcSelectionPolicy) -> Vec<RpcCandidate> {
+        let security = self.cfg().network.security.clone();
+        let enforce_registry = pairing_enforced(&security);
+        let eligible_ids: std::collections::HashSet<Uuid> = self
+            .registry
+            .read()
+            .await
+            .eligible_rpc_peers(policy.protocol_version)
+            .into_iter()
+            .map(|record| record.node_id)
+            .collect();
+
         let mut candidates = self
             .get_active_peers()
             .await
@@ -979,9 +1077,10 @@ impl DiscoveryService {
                 peer.is_rpc_ready()
                     && peer.status.is_ready()
                     && peer.thermal_index <= policy.max_thermal_index
+                    && (!enforce_registry || eligible_ids.contains(&peer.uuid))
                     && (!policy.require_pairing
                         || self
-                            .config
+                            .cfg()
                             .network
                             .security
                             .allowed_peer_ids
@@ -1026,7 +1125,7 @@ impl DiscoveryService {
         }
 
         let probe_target = endpoint.addresses.first().map(|addr| {
-            SocketAddr::new(addr.ip(), self.config.network.discovery_port)
+            SocketAddr::new(addr.ip(), self.cfg().network.discovery_port)
         });
 
         let mut peers = self.peers.write().await;
@@ -1062,7 +1161,7 @@ impl DiscoveryService {
             let control_port = if endpoint.control_port > 0 {
                 endpoint.control_port
             } else {
-                self.config.network.control_port
+                self.cfg().network.control_port
             };
             let peer = PeerNode {
                 uuid: endpoint.node_id,
@@ -1118,10 +1217,10 @@ impl DiscoveryService {
         let enabled = if let Ok(guard) = self.mdns_enabled.try_read() {
             *guard
         } else {
-            self.config.network.discovery.mdns.enabled
+            self.cfg().network.discovery.mdns.enabled
         };
 
-        if !self.config.network.discovery.enabled || !enabled {
+        if !self.cfg().network.discovery.enabled || !enabled {
             info!("mDNS discovery disabled by configuration");
             return None;
         }
@@ -1139,21 +1238,30 @@ impl DiscoveryService {
 
             let local_ip = get_local_ip();
             let rpc_port = *this.rpc_port.read().await;
-            let role = NodeRole::from_str_role(&this.config.node.role);
+            let (role, service_type, api_port, control_port, display_name) = {
+                let cfg = this.config.read().expect("config lock");
+                (
+                    NodeRole::from_str_role(&cfg.node.role),
+                    cfg.network.discovery.mdns.service_type.clone(),
+                    cfg.network.api_port,
+                    cfg.network.control_port,
+                    cfg.resolved_display_name(),
+                )
+            };
             let caps = vec!["inference".to_string(), "rpc".to_string()];
 
             if let Err(e) = mdns.register(
-                &this.config.network.discovery.mdns.service_type,
+                &service_type,
                 &this.node_uuid.to_string(),
                 &format!("{}.local.", this.node_uuid),
-                this.config.network.api_port,
+                api_port,
                 rpc_port,
-                this.config.network.control_port,
+                control_port,
                 this.node_uuid,
                 None,
                 role,
                 &caps,
-                &this.config.resolved_display_name(),
+                &display_name,
                 local_ip,
             ) {
                 warn!("Failed to register mDNS service: {}", e);
@@ -1164,10 +1272,10 @@ impl DiscoveryService {
             *this.mdns_health.write().await = BackendHealth::Healthy;
             info!(
                 "mDNS service registered on {} ({})",
-                local_ip, this.config.network.discovery.mdns.service_type
+                local_ip, service_type
             );
 
-            let (mut events, _browse_handle) = match mdns.browse(&this.config.network.discovery.mdns.service_type) {
+            let (mut events, _browse_handle) = match mdns.browse(&service_type) {
                 Ok(res) => res,
                 Err(e) => {
                     warn!("Failed to start mDNS browse: {}", e);

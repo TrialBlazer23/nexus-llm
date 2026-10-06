@@ -104,6 +104,7 @@ fn control_plane_validates_identity_protocol_and_policy() {
         rpc_ready: true,
         allocatable_memory_mb: 1800,
         active_model: None,
+        signing_public_key: None,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 
@@ -154,11 +155,19 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         .await
         .insert(worker_id, beacon_peer.clone());
 
+    discovery
+        .peer_registry()
+        .write()
+        .await
+        .mark_verified(worker_id, endpoint(worker_id, [192, 168, 1, 30]), now)
+        .unwrap();
+
     let candidate = discovery
         .select_rpc_candidate(RpcSelectionPolicy {
             max_thermal_index: 75,
             max_allocatable_mb: 2200,
             require_pairing: true,
+            protocol_version: CONTROL_PLANE_VERSION,
         })
         .await
         .unwrap();
@@ -176,6 +185,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
             max_thermal_index: 75,
             max_allocatable_mb: 1800,
             require_pairing: true,
+            protocol_version: CONTROL_PLANE_VERSION,
         })
         .await
         .is_none());

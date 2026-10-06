@@ -2,8 +2,11 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
+use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{DiscoveryService, NodeRole};
+use nexus::registry_runtime::spawn_registry_runtime;
+use nexus::trust_auth::TrustBootstrap;
 use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
@@ -94,6 +97,16 @@ enum Commands {
         /// Optional expected SHA-256 hash
         #[arg(short, long)]
         sha256: Option<String>,
+    },
+
+    /// Pair with a remote node using its 6-digit control-plane pairing code
+    Pair {
+        /// Control-plane base URL (e.g. http://192.168.1.50:9998)
+        #[arg(long)]
+        host: String,
+        /// Six-digit pairing code shown on the target device
+        #[arg(long)]
+        code: String,
     },
 
     /// Display current or generated configuration
@@ -200,39 +213,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(cmd) => cmd,
         None => {
             let config = NexusConfig::load()?;
-            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let trust = TrustBootstrap::load(config.clone())?;
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
             discovery.send_probe().await;
 
             // Order: default_host → PreferAdbTunnel USB → discovery → localhost
-            let host = if let Some(dh) = &config.network.default_host {
+            let host = if let Some(dh) = &trust.config.read().unwrap().network.default_host {
                 dh.clone()
             } else {
-                let usb_ep = if config.cluster.prefer_adb_tunnel {
+                let cfg = trust.config.read().unwrap();
+                let usb_ep = if cfg.cluster.prefer_adb_tunnel {
                     AdbTunnelSupervisor::resolve_transport_endpoint(
                         TransportMode::Auto,
-                        config.network.api_port,
-                        config.cluster.rpc_port,
+                        cfg.network.api_port,
+                        cfg.cluster.rpc_port,
                     )
                     .0
                 } else {
                     None
                 };
+                drop(cfg);
                 if let Some(usb) = usb_ep {
                     usb
                 } else {
                     match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3)).await
                     {
                         Ok(client) => client.endpoint().to_string(),
-                        Err(_) => format!("http://127.0.0.1:{}", config.network.api_port),
+                        Err(_) => {
+                            let port = trust.config.read().unwrap().network.api_port;
+                            format!("http://127.0.0.1:{port}")
+                        }
                     }
                 }
             };
 
             let client = NexusClient::new(host);
-            let hub = HubApp::new(config, client, discovery);
+            let hub = HubApp::new(
+                config,
+                client,
+                discovery,
+                trust.identity,
+                trust.config,
+                trust.config_path,
+            );
             let result = run_hub_tui(hub).await;
             if let Some(path) = &log_path {
                 eprintln!("Nexus log file: {}", path.display());
@@ -242,10 +271,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match command {
+        Commands::Pair { host, code } => {
+            let mut config = NexusConfig::load()?;
+            let trust = TrustBootstrap::load(config.clone())?;
+            let requester_id = config.node_uuid()?;
+            let pair_req = PairRequest {
+                protocol_version: CONTROL_PLANE_VERSION,
+                requester_id,
+                requester_public_key: trust.identity.public_key_hex(),
+                pairing_code: code,
+            };
+            let client = reqwest::Client::new();
+            let resp = dispatch_pair(&client, &host, &pair_req, &trust.identity).await?;
+            if !resp.success {
+                eprintln!("Pairing failed: {}", resp.message);
+                std::process::exit(1);
+            }
+            config
+                .network
+                .security
+                .record_pair(resp.node_id, resp.public_key);
+            config.save()?;
+            println!("Paired with node {} ({})", resp.node_id, host);
+        }
+
         Commands::Host { model, host, port, ctx, binary } => {
             let config = NexusConfig::load()?;
+            let trust = TrustBootstrap::load(config.clone())?;
             let profile = SystemProfile::probe();
-            let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
+            let _registry = spawn_registry_runtime(
+                discovery.clone(),
+                trust.identity.clone(),
+                discovery.node_uuid(),
+            );
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
@@ -261,6 +323,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     api_host.clone(),
                     api_port,
                     binary.clone(),
+                    trust.identity.clone(),
+                    trust.config.clone(),
+                    trust.config_path.clone(),
                 )
         .with_discovery(discovery.clone())
         .with_capabilities(vec!["inference".to_string(), "host".to_string()])
@@ -498,8 +563,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let memory_budget_percent = config.hardware.safety.max_ram_usage_percent;
 
             // Start discovery service advertising RPC worker readiness
-            let discovery = Arc::new(DiscoveryService::new(config, None));
+            let trust = TrustBootstrap::load(config.clone())?;
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
             discovery.set_rpc_status(true, port).await;
+            let _registry = spawn_registry_runtime(
+                discovery.clone(),
+                trust.identity.clone(),
+                discovery.node_uuid(),
+            );
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
@@ -515,6 +589,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     api_host,
                     api_port,
                     llama_binary,
+                    trust.identity.clone(),
+                    trust.config.clone(),
+                    trust.config_path.clone(),
                 )
                 .with_discovery(discovery.clone())
                 .with_rpc_ready(true)

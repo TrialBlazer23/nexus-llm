@@ -4,14 +4,23 @@ use nexus::control_plane::{
     dispatch_load_model, dispatch_unload_model, fetch_state, ControlPlaneRequest,
     ModelLoadRequest, ModelUnloadRequest, CONTROL_PLANE_VERSION,
 };
+use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn_ephemeral, ControlPlaneContext};
 use nexus::discovery::NodeRole;
 use nexus::supervisor::SupervisorManager;
+use nexus::trust_auth::TrustBootstrap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tempfile::TempDir;
 use uuid::Uuid;
 
 fn test_context(supervisor: SupervisorManager) -> Arc<ControlPlaneContext> {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+    let config = nexus::config::NexusConfig::default();
+    config.save_to_path(&config_path).expect("save config");
+    std::env::set_var("NEXUS_CONFIG", config_path.to_str().unwrap());
+    let trust = TrustBootstrap::load(config).expect("trust bootstrap");
     Arc::new(ControlPlaneContext::new(
         Uuid::new_v4(),
         NodeRole::HOST,
@@ -19,6 +28,9 @@ fn test_context(supervisor: SupervisorManager) -> Arc<ControlPlaneContext> {
         "127.0.0.1",
         18080,
         PathBuf::from("llama-server"),
+        trust.identity,
+        trust.config,
+        trust.config_path,
     ))
 }
 
@@ -26,6 +38,11 @@ fn test_context(supervisor: SupervisorManager) -> Arc<ControlPlaneContext> {
 async fn control_plane_http_state_round_trip() {
     let supervisor = SupervisorManager::new();
     let node_id = Uuid::new_v4();
+    let trust_dir = TempDir::new().unwrap();
+    let path = trust_dir.path().join("config.toml");
+    NexusConfig::default().save_to_path(&path).unwrap();
+    std::env::set_var("NEXUS_CONFIG", path.to_str().unwrap());
+    let trust = TrustBootstrap::load(NexusConfig::default()).unwrap();
     let ctx = Arc::new(
         ControlPlaneContext::new(
             node_id,
@@ -34,6 +51,9 @@ async fn control_plane_http_state_round_trip() {
             "127.0.0.1",
             18080,
             PathBuf::from("llama-server"),
+            trust.identity,
+            trust.config,
+            trust.config_path,
         )
         .with_capabilities(vec!["inference".to_string()]),
     );

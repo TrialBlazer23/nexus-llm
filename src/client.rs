@@ -161,18 +161,16 @@ impl NexusClient {
                 return Ok(Self::new(host.api_endpoint()));
             }
 
-            if let Some(host) = discovery.find_best_host().await {
-                if host.status.is_ready() {
-                    info!(
-                        "Discovered best host: {} ({}) at {} (Model: {:?}, Vulkan: {})",
-                        host.label(),
-                        host.uuid,
-                        host.api_endpoint(),
-                        host.active_model,
-                        host.status.is_vulkan_active()
-                    );
-                    return Ok(Self::new(host.api_endpoint()));
-                }
+            if let Some(host) = discovery.find_best_trusted_host().await {
+                info!(
+                    "Discovered trusted host: {} ({}) at {} (Model: {:?}, Vulkan: {})",
+                    host.label(),
+                    host.uuid,
+                    host.api_endpoint(),
+                    host.active_model,
+                    host.status.is_vulkan_active()
+                );
+                return Ok(Self::new(host.api_endpoint()));
             }
 
             // Probe any configured static peers via HTTP /health if UDP broadcast was blocked

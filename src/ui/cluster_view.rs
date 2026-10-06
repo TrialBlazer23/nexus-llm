@@ -1,7 +1,11 @@
 use crate::discovery::{BackendHealth, DiscoveryService, PeerNode};
+use crate::node_identity::NodeIdentity;
+use crate::peer_registry::PeerLifecycle;
+use std::collections::HashMap;
+use uuid::Uuid;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table},
@@ -40,6 +44,11 @@ pub struct ClusterView {
     pub status_message: Option<(String, Color)>,
     pub udp_status: BackendStatus,
     pub mdns_status: BackendStatus,
+    pub registry_trust: HashMap<Uuid, (PeerLifecycle, bool, Option<String>)>,
+    pub show_pair_code: bool,
+    pub enter_pair_code: bool,
+    pub pair_code_input: String,
+    pub local_identity: Option<std::sync::Arc<NodeIdentity>>,
 }
 
 impl ClusterView {
@@ -71,13 +80,36 @@ impl ClusterView {
             status_message: None,
             udp_status,
             mdns_status,
+            registry_trust: HashMap::new(),
+            show_pair_code: false,
+            enter_pair_code: false,
+            pair_code_input: String::new(),
+            local_identity: None,
         }
+    }
+
+    pub fn set_local_identity(&mut self, identity: std::sync::Arc<NodeIdentity>) {
+        self.local_identity = Some(identity);
     }
 
     pub async fn refresh(&mut self) {
         self.local_profile = SystemProfile::probe();
         self.thermal_index = DiscoveryService::probe_thermal_index();
         self.peers = self.discovery.get_active_peers().await;
+        self.registry_trust.clear();
+        let registry_arc = self.discovery.peer_registry();
+        let registry = registry_arc.read().await;
+        for record in registry.records() {
+            self.registry_trust.insert(
+                record.node_id,
+                (
+                    record.lifecycle,
+                    record.verified,
+                    record.rejection_reason.clone(),
+                ),
+            );
+        }
+        drop(registry);
         if self.selected_index >= self.peers.len() && !self.peers.is_empty() {
             self.selected_index = self.peers.len() - 1;
         }
@@ -186,6 +218,89 @@ impl ClusterView {
         if self.adding_peer {
             self.render_add_peer_modal(frame, area);
         }
+
+        if self.show_pair_code {
+            self.render_pair_code_modal(frame, area);
+        }
+
+        if self.enter_pair_code {
+            self.render_enter_pair_code_modal(frame, area);
+        }
+    }
+
+    fn trust_label(&self, peer_id: Uuid) -> String {
+        let security = self.discovery.config().network.security;
+        if !security.pairing_enforced() {
+            return "open".to_string();
+        }
+        if !security.allowed_peer_ids.contains(&peer_id) {
+            return "unpaired".to_string();
+        }
+        match self.registry_trust.get(&peer_id) {
+            Some((PeerLifecycle::Healthy, true, _)) => "verified".to_string(),
+            Some((PeerLifecycle::Rejected, _, reason)) => {
+                format!("rejected: {}", reason.as_deref().unwrap_or("?"))
+            }
+            Some((lifecycle, _, _)) => format!("{:?}", lifecycle).to_lowercase(),
+            None => "unknown".to_string(),
+        }
+    }
+
+    fn render_pair_code_modal(&self, frame: &mut Frame, area: Rect) {
+        let modal_area = centered_rect(50, 30, area);
+        frame.render_widget(Clear, modal_area);
+        let (code, remaining) = if let Some(id) = &self.local_identity {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (
+                id.current_pairing_code(now),
+                crate::node_identity::pairing_code_remaining_secs(now),
+            )
+        } else {
+            ("------".to_string(), 0)
+        };
+        let lines = vec![
+            Line::from(Span::styled(
+                " Pairing code (show on this device)",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                code,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("Rotates in {}s | [Esc] close", remaining),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let block = Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .title(" Trust / Pair ")
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(block, modal_area);
+    }
+
+    fn render_enter_pair_code_modal(&self, frame: &mut Frame, area: Rect) {
+        let modal_area = centered_rect(55, 25, area);
+        frame.render_widget(Clear, modal_area);
+        let lines = vec![
+            Line::from(" Enter pairing code from remote device"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("[ {} ]", self.pair_code_input),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        let block = Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .title(" Pair with peer ")
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(block, modal_area);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -313,7 +428,7 @@ impl ClusterView {
             Cell::from("Free RAM"),
             Cell::from("Backend"),
             Cell::from("Thermal"),
-            Cell::from("Active Model"),
+            Cell::from("Trust"),
         ])
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
@@ -344,12 +459,6 @@ impl ClusterView {
                 peer.api_endpoint()
             };
 
-            let model_display = if peer.active_model.is_empty() {
-                if peer.is_rpc_ready() { "RPC Ready".to_string() } else { "—".to_string() }
-            } else {
-                peer.active_model.clone()
-            };
-
             let label = format!("{}{}", cursor, peer.label());
 
             let row_style = if is_selected {
@@ -366,7 +475,7 @@ impl ClusterView {
                     Cell::from(format!("{} MB", peer.free_ram_mb)),
                     Cell::from(backend_str),
                     Cell::from(format!("{}/100", peer.thermal_index)),
-                    Cell::from(model_display),
+                    Cell::from(self.trust_label(peer.uuid)),
                 ])
                 .style(row_style),
             );
@@ -410,6 +519,8 @@ impl ClusterView {
             Span::styled(" [I] Inspect ", Style::default().fg(Color::Green)),
             Span::styled(" [A] Add Static ", Style::default().fg(Color::LightCyan)),
             Span::styled(" [D] Disconnect ", Style::default().fg(Color::Red)),
+            Span::styled(" [P] Show code ", Style::default().fg(Color::LightGreen)),
+            Span::styled(" [O] Pair ", Style::default().fg(Color::LightGreen)),
             Span::styled(" [R] Refresh", Style::default().fg(Color::DarkGray)),
         ]);
 

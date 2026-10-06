@@ -1,6 +1,7 @@
 use nexus::client::NexusClient;
 use nexus::config::NexusConfig;
 use nexus::discovery::DiscoveryService;
+use nexus::trust_auth::TrustBootstrap;
 use nexus::ui::hub::{HubApp, HubTab};
 use nexus::ui::models_view::ModelsView;
 use nexus::ui::settings_view::SettingsView;
@@ -16,6 +17,18 @@ use tempfile::tempdir;
 fn write_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+}
+
+fn test_hub(config: NexusConfig, client: NexusClient, discovery: Arc<DiscoveryService>) -> HubApp {
+    let trust = TrustBootstrap::load(config.clone()).expect("trust bootstrap");
+    HubApp::new(
+        config,
+        client,
+        discovery,
+        trust.identity,
+        trust.config,
+        trust.config_path,
+    )
 }
 
 fn build_synthetic_gguf(arch: &str, name: &str) -> Vec<u8> {
@@ -57,7 +70,7 @@ fn test_hub_tab_cycling_and_titles() {
     let config = NexusConfig::default();
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut hub = HubApp::new(config, client, discovery);
+    let mut hub = test_hub(config, client, discovery);
 
     // Initial state: Chat
     assert_eq!(hub.active_tab, HubTab::Chat);
@@ -232,7 +245,7 @@ async fn test_hub_app_headless_render_all_tabs() {
 
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut hub = HubApp::new(config, client, discovery);
+    let mut hub = test_hub(config, client, discovery);
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -281,7 +294,7 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     let config = NexusConfig::default();
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut hub = HubApp::new(config, client, discovery);
+    let mut hub = test_hub(config, client, discovery);
 
     // Simulate pending hot swap
     hub.pending_hot_swap_path = Some(PathBuf::from("/models/llama-3.2-3b.gguf"));
@@ -306,7 +319,7 @@ async fn test_hub_app_target_node_selection_modal() {
     let config = NexusConfig::default();
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut hub = HubApp::new(config, client, discovery);
+    let mut hub = test_hub(config, client, discovery);
 
     let model_path = PathBuf::from("/models/qwen2.5-coder-7b.gguf");
     hub.open_target_selection(model_path.clone()).await;
@@ -449,7 +462,7 @@ async fn test_hub_app_unload_model() {
     let config = NexusConfig::default();
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut hub = HubApp::new(config, client, discovery.clone());
+    let mut hub = test_hub(config, client, discovery.clone());
 
     // Initially no model loaded
     assert_eq!(hub.active_model_name, "None (Idle)");

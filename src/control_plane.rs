@@ -1,4 +1,6 @@
 use crate::discovery::{NodeRole, ServiceEndpoint};
+use crate::node_identity::NodeIdentity;
+use crate::trust_auth::{apply_auth_headers, AuthError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -19,6 +21,8 @@ pub struct ControlPlaneState {
     pub rpc_ready: bool,
     pub allocatable_memory_mb: u64,
     pub active_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,6 +43,10 @@ pub enum ControlPlaneError {
     ProtocolMismatch { expected: u16, actual: u16 },
     #[error("control-plane identity mismatch: expected {expected}, got {actual}")]
     IdentityMismatch { expected: Uuid, actual: Uuid },
+    #[error("control-plane auth failed: {0}")]
+    Auth(#[from] AuthError),
+    #[error("control-plane HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
 }
 
 pub fn validate_state(
@@ -113,6 +121,7 @@ pub async fn build_control_plane_state(
     manager: &crate::supervisor::SupervisorManager,
     allocatable_memory_mb: u64,
     rpc_ready: bool,
+    signing_public_key: Option<String>,
 ) -> ControlPlaneState {
     let healthy = manager.is_healthy().await;
     let active_model = manager.active_model().await;
@@ -126,7 +135,32 @@ pub async fn build_control_plane_state(
         rpc_ready,
         allocatable_memory_mb,
         active_model,
+        signing_public_key,
     }
+}
+
+async fn signed_post_bytes(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    body: &[u8],
+    identity: Option<&NodeIdentity>,
+    signer_id: Uuid,
+) -> Result<reqwest::Response, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path(path);
+    let mut req = client.post(url).body(body.to_vec());
+    if let Some(id) = identity {
+        req = apply_auth_headers(req, id, signer_id, "POST", path, body);
+    }
+    let response = req.send().await?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ControlPlaneError::HttpStatus { status, body });
+    }
+    Ok(response)
 }
 
 pub async fn fetch_state(
@@ -158,6 +192,73 @@ pub async fn fetch_state(
             limit: MAX_CONTROL_RESPONSE_BYTES,
         });
     }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn fetch_state_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &ControlPlaneRequest,
+    identity: &NodeIdentity,
+    signer_id: Uuid,
+) -> Result<ControlPlaneState, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/state",
+        &body,
+        Some(identity),
+        signer_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub requester_public_key: String,
+    pub pairing_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairResponse {
+    pub protocol_version: u16,
+    pub success: bool,
+    pub node_id: Uuid,
+    pub public_key: String,
+    pub message: String,
+}
+
+pub async fn dispatch_pair(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &PairRequest,
+    identity: &NodeIdentity,
+) -> Result<PairResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/pair",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
     serde_json::from_slice(&bytes)
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
@@ -221,6 +322,33 @@ pub async fn dispatch_load_model(
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
 
+pub async fn dispatch_load_model_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &ModelLoadRequest,
+    identity: &NodeIdentity,
+) -> Result<ModelLoadResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/model/load",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
 pub async fn dispatch_unload_model(
     client: &reqwest::Client,
     base_url: &str,
@@ -236,6 +364,33 @@ pub async fn dispatch_unload_model(
         .send()
         .await?
         .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_unload_model_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &ModelUnloadRequest,
+    identity: &NodeIdentity,
+) -> Result<ModelUnloadResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/model/unload",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
     let bytes = response.bytes().await?;
     if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
         return Err(ControlPlaneError::ResponseTooLarge {

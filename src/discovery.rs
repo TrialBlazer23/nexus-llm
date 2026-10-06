@@ -32,6 +32,8 @@ pub struct ServiceEndpoint {
     pub addresses: Vec<SocketAddr>,
     pub api_port: u16,
     pub rpc_port: u16,
+    /// Control-plane HTTP port (catalog / load / unload). Defaults to 8081 when unknown.
+    pub control_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +307,8 @@ pub struct PeerNode {
     pub status: StatusFlags,
     pub api_port: u16,
     pub rpc_port: u16,
+    /// Control-plane HTTP port. Beacon peers default to config/8081 (not in 64-byte UDP payload).
+    pub control_port: u16,
     pub total_ram_mb: u32,
     pub free_ram_mb: u32,
     pub backend: AccelerationBackend,
@@ -333,6 +337,10 @@ impl PeerNode {
         format!("http://{}:{}", self.addr.ip(), self.api_port)
     }
 
+    pub fn control_endpoint(&self) -> String {
+        format!("http://{}:{}", self.addr.ip(), self.control_port)
+    }
+
     pub fn is_rpc_ready(&self) -> bool {
         self.status.is_rpc_ready() && self.rpc_port > 0
     }
@@ -351,6 +359,7 @@ impl PeerNode {
             addresses: vec![self.addr],
             api_port: self.api_port,
             rpc_port: self.rpc_port,
+            control_port: self.control_port,
         }
     }
 }
@@ -789,6 +798,7 @@ impl DiscoveryService {
                                         status: beacon.status,
                                         api_port: beacon.api_port,
                                         rpc_port: beacon.rpc_port,
+                                        control_port: self.config.network.control_port,
                                         total_ram_mb: beacon.total_ram_mb,
                                         free_ram_mb: beacon.free_ram_mb,
                                         backend: beacon.backend,
@@ -995,6 +1005,7 @@ impl DiscoveryService {
             }
             existing.api_port = endpoint.api_port;
             existing.rpc_port = endpoint.rpc_port;
+            existing.control_port = endpoint.control_port;
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
@@ -1018,6 +1029,11 @@ impl DiscoveryService {
                 status,
                 api_port: endpoint.api_port,
                 rpc_port: endpoint.rpc_port,
+                control_port: if endpoint.control_port == 0 {
+                    8081
+                } else {
+                    endpoint.control_port
+                },
                 total_ram_mb: 0,
                 free_ram_mb: 0,
                 backend: AccelerationBackend::GenericCpu,
@@ -1093,6 +1109,7 @@ impl DiscoveryService {
                 &format!("{}.local.", this.node_uuid),
                 this.config.network.api_port,
                 rpc_port,
+                this.config.network.control_port,
                 this.node_uuid,
                 None,
                 role,

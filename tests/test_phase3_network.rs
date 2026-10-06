@@ -18,6 +18,7 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         addresses: vec![SocketAddr::from((address, 8080))],
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
     }
 }
 
@@ -137,6 +138,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
         total_ram_mb: 4096,
         free_ram_mb: 3000,
         backend: nexus::sysinfo::AccelerationBackend::X86Baseline,
@@ -193,6 +195,7 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             status: StatusFlags::READY,
             api_port: 8080,
             rpc_port: 0,
+                control_port: 8081,
             total_ram_mb: 16000,
             free_ram_mb: 12000,
             backend: nexus::sysinfo::AccelerationBackend::Vulkan,
@@ -231,7 +234,7 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
 
     // Test server handler with SupervisorManager (expect model not found error for non-existent model)
     let manager = SupervisorManager::new();
-    let response = handle_load_model(&manager, &load_req, "127.0.0.1", 8080).await;
+    let response = handle_load_model(&manager, &load_req, "127.0.0.1", 8080, None).await;
     assert_eq!(response.protocol_version, CONTROL_PLANE_VERSION);
     assert!(!response.success);
     assert!(response.error_message.is_some());

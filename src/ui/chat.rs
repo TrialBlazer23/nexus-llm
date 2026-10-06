@@ -1,4 +1,5 @@
 use crate::client::{ChatCompletionRequest, ChatMessage, NexusClient};
+use crate::ui::markdown::render_markdown;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -63,6 +64,12 @@ pub struct ChatApp {
     pub streaming_response: String,
     pub is_streaming: bool,
     pub input_buffer: String,
+    /// Character index of the caret within `input_buffer`.
+    pub cursor_idx: usize,
+    /// Previously submitted prompts for Alt+↑/↓ recall.
+    pub prompt_history: Vec<String>,
+    /// Current position while browsing `prompt_history` (`None` = not browsing).
+    pub history_index: Option<usize>,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
     pub tokens_streamed: usize,
@@ -87,6 +94,9 @@ impl ChatApp {
             streaming_response: String::new(),
             is_streaming: false,
             input_buffer: String::new(),
+            cursor_idx: 0,
+            prompt_history: Vec::new(),
+            history_index: None,
             scroll_offset: 0,
             auto_scroll: true,
             tokens_streamed: 0,
@@ -144,17 +154,96 @@ impl ChatApp {
         req_messages
     }
 
+    fn input_char_len(&self) -> usize {
+        self.input_buffer.chars().count()
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = self.input_char_len();
+        if self.cursor_idx > len {
+            self.cursor_idx = len;
+        }
+    }
+
+    fn insert_at_cursor(&mut self, ch: char) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let idx = self.cursor_idx.min(chars.len());
+        chars.insert(idx, ch);
+        self.input_buffer = chars.into_iter().collect();
+        self.cursor_idx = idx + 1;
+        self.history_index = None;
+    }
+
+    fn delete_before_cursor(&mut self) {
+        if self.cursor_idx == 0 {
+            return;
+        }
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let idx = self.cursor_idx.min(chars.len());
+        if idx > 0 {
+            chars.remove(idx - 1);
+            self.input_buffer = chars.into_iter().collect();
+            self.cursor_idx = idx - 1;
+            self.history_index = None;
+        }
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let mut chars: Vec<char> = self.input_buffer.chars().collect();
+        let idx = self.cursor_idx.min(chars.len());
+        if idx < chars.len() {
+            chars.remove(idx);
+            self.input_buffer = chars.into_iter().collect();
+            self.history_index = None;
+        }
+    }
+
+    fn history_prev(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            None => self.prompt_history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next);
+        self.input_buffer = self.prompt_history[next].clone();
+        self.cursor_idx = self.input_char_len();
+    }
+
+    fn history_next(&mut self) {
+        let Some(idx) = self.history_index else {
+            return;
+        };
+        if idx + 1 >= self.prompt_history.len() {
+            self.history_index = None;
+            self.input_buffer.clear();
+            self.cursor_idx = 0;
+        } else {
+            let next = idx + 1;
+            self.history_index = Some(next);
+            self.input_buffer = self.prompt_history[next].clone();
+            self.cursor_idx = self.input_char_len();
+        }
+    }
+
     /// Calculate approximate total line count across current conversation.
+    /// Non-status messages use markdown-rendered line counts.
     pub fn total_lines(&self) -> usize {
         let mut count = 0;
         if self.system_prompt.is_some() {
             count += 2;
         }
         for msg in &self.messages {
-            count += 1 + msg.content.lines().count() + 1;
+            if msg.is_status() {
+                count += 1 + msg.content.lines().count() + 1;
+            } else {
+                count += 1 + render_markdown(&msg.content).len() + 1;
+            }
         }
         if self.is_streaming || !self.streaming_response.is_empty() {
-            count += 1 + self.streaming_response.lines().count();
+            count += 1 + render_markdown(&self.streaming_response).len();
         }
         count
     }
@@ -292,11 +381,43 @@ impl ChatApp {
             KeyCode::Esc => {
                 let _ = self.abort_stream();
             }
-            KeyCode::Char(c) => {
-                self.input_buffer.push(c);
+            KeyCode::Left => {
+                if self.cursor_idx > 0 {
+                    self.cursor_idx -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.cursor_idx < self.input_char_len() {
+                    self.cursor_idx += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.cursor_idx = 0;
+            }
+            KeyCode::End => {
+                self.cursor_idx = self.input_char_len();
             }
             KeyCode::Backspace => {
-                self.input_buffer.pop();
+                self.delete_before_cursor();
+            }
+            KeyCode::Delete => {
+                self.delete_at_cursor();
+            }
+            KeyCode::Char(c) => {
+                // Shift+Enter / Alt+Enter insert a newline (some terminals emit Char('\n')).
+                if c == '\n' {
+                    self.insert_at_cursor('\n');
+                } else if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    self.insert_at_cursor(c);
+                }
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.history_prev();
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.history_next();
             }
             KeyCode::Up => {
                 let max = self.total_lines() as u16;
@@ -316,16 +437,21 @@ impl ChatApp {
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(10);
             }
-            KeyCode::PageDown | KeyCode::End => {
+            KeyCode::PageDown => {
                 self.auto_scroll = true;
             }
-            KeyCode::Home => {
-                self.auto_scroll = false;
-                self.scroll_offset = 0;
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.insert_at_cursor('\n');
             }
             KeyCode::Enter => {
                 if !self.is_streaming && !self.input_buffer.trim().is_empty() {
                     let prompt = std::mem::take(&mut self.input_buffer);
+                    self.cursor_idx = 0;
+                    self.history_index = None;
+                    self.prompt_history.push(prompt.clone());
                     self.messages.push(ChatMessage::user(&prompt));
                     self.is_streaming = true;
                     self.auto_scroll = true;
@@ -339,6 +465,7 @@ impl ChatApp {
             }
             _ => {}
         }
+        self.clamp_cursor();
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -374,7 +501,7 @@ impl ChatApp {
         if let Some(sys) = &self.system_prompt {
             lines.push(Line::from(vec![
                 Span::styled(" [System] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                Span::styled(sys, Style::default().fg(Color::DarkGray)),
+                Span::styled(sys.clone(), Style::default().fg(Color::DarkGray)),
             ]));
             lines.push(Line::from(""));
         }
@@ -411,27 +538,25 @@ impl ChatApp {
                 Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             ]));
 
-            for text_line in msg.content.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("   {}", text_line),
-                    Style::default().fg(Color::White),
-                )));
+            for md_line in render_markdown(&msg.content) {
+                let mut spans = vec![Span::raw("   ")];
+                spans.extend(md_line.spans);
+                lines.push(Line::from(spans));
             }
             lines.push(Line::from(""));
         }
 
-        // Display current active streaming generation
+        // Display current active streaming generation (markdown-rendered)
         if self.is_streaming || !self.streaming_response.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled(" [Nexus] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled("(generating...)", Style::default().fg(Color::Yellow)),
             ]));
 
-            for text_line in self.streaming_response.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("   {}", text_line),
-                    Style::default().fg(Color::LightGreen),
-                )));
+            for md_line in render_markdown(&self.streaming_response) {
+                let mut spans = vec![Span::raw("   ")];
+                spans.extend(md_line.spans);
+                lines.push(Line::from(spans));
             }
         }
 
@@ -459,17 +584,42 @@ impl ChatApp {
     }
 
     fn render_input_box(&self, frame: &mut Frame, area: Rect) {
-        let input_text = format!("> {}", self.input_buffer);
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        let idx = self.cursor_idx.min(chars.len());
+
+        let mut spans = vec![Span::raw("> ")];
+        let before: String = chars[..idx].iter().collect();
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
+
+        if idx < chars.len() {
+            spans.push(Span::styled(
+                chars[idx].to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            let after: String = chars[idx + 1..].iter().collect();
+            if !after.is_empty() {
+                spans.push(Span::raw(after));
+            }
+        } else {
+            // Caret at end of buffer
+            spans.push(Span::styled(
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        }
+
         let border_color = if self.is_streaming {
             Color::Yellow
         } else {
             Color::White
         };
 
-        let input_widget = Paragraph::new(input_text)
+        let input_widget = Paragraph::new(Line::from(spans))
             .block(
                 Block::default()
-                    .title(" Prompt Input ")
+                    .title(" Prompt Input (Alt+↑/↓ history) ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border_color)),
             );

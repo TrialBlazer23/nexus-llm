@@ -251,9 +251,13 @@ async fn test_hub_app_headless_render_all_tabs() {
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
     assert!(content.contains("[F2] 📦 Models"), "Must render Models tab active");
-    assert!(content.contains("Local Models (1)"), "Must render models list pane");
+    assert!(
+        content.contains("Models (local 1 / remote 0)") || content.contains("local 1"),
+        "Must render models list pane with local count"
+    );
     assert!(content.contains("Model Architecture & Metadata"), "Must render metadata inspector pane");
     assert!(content.contains("tiny-llama.gguf"), "Must list discovered model");
+    assert!(content.contains("[?] Help") || content.contains("Help"), "Footer should mention Help");
 
     // 3. Render Tab 2: Cluster
     hub.set_tab(HubTab::Cluster);
@@ -393,6 +397,7 @@ async fn test_cluster_view_interactions() {
         status: nexus::discovery::StatusFlags::READY,
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
         total_ram_mb: 12000,
         free_ram_mb: 8192,
         backend: AccelerationBackend::Vulkan,
@@ -407,6 +412,7 @@ async fn test_cluster_view_interactions() {
         status: nexus::discovery::StatusFlags::RPC_READY,
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
         total_ram_mb: 4000,
         free_ram_mb: 1800,
         backend: AccelerationBackend::ArmCpuDotProd,
@@ -563,6 +569,39 @@ async fn test_hub_slash_commands_and_context() {
 
     hub.adjust_context(true);
     assert_eq!(hub.selected_context, 2048 + 512);
+}
+
+#[test]
+fn test_download_dest_from_url() {
+    use nexus::ui::models_view::download_dest_from_url;
+    use std::path::Path;
+
+    let dir = Path::new("/home/user/nexus-models");
+    assert_eq!(
+        download_dest_from_url(dir, "https://example.com/models/qwen2.5.gguf"),
+        Path::new("/home/user/nexus-models/qwen2.5.gguf")
+    );
+    assert_eq!(
+        download_dest_from_url(dir, "https://cdn.example.com/weights/model.bin?token=abc"),
+        Path::new("/home/user/nexus-models/model.bin.gguf")
+    );
+    assert_eq!(
+        download_dest_from_url(dir, "https://example.com/"),
+        Path::new("/home/user/nexus-models/downloaded.gguf")
+    );
+}
+
+#[test]
+fn test_hub_app_help_and_download_fields_init() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let hub = HubApp::new(config, client, discovery);
+
+    assert!(!hub.show_help_modal);
+    assert!(hub.pending_download.is_none());
+    assert!(hub.download_progress.is_none());
+    assert!(!hub.download_active);
 }
 
 

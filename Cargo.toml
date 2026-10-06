@@ -38,6 +38,12 @@ mdns-sd = { version = "0.21.4", default-features = false, features = ["async"] }
 sha2 = "0.10"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+pulldown-cmark = { version = "0.12", default-features = false }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
 
 [dev-dependencies]
 tempfile = "3.10"

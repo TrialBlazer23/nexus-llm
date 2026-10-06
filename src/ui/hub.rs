@@ -2,14 +2,16 @@ use crate::cluster::{host_lmk_budget_mb, ModelFit, CONTEXT_STEP, DEFAULT_CONTEXT
 use crate::client::{ChatMessage, NexusClient};
 use crate::config::NexusConfig;
 use crate::control_plane::{self, ModelLoadRequest, ModelLoadResponse};
-use crate::discovery::DiscoveryService;
+use crate::control_plane_server::{spawn_control_plane, ControlPlaneServerState};
+use crate::discovery::{DiscoveryService, NodeRole};
+use crate::downloader::{DownloadProgress, ModelDownloader};
 use crate::preset::Preset;
-use crate::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use crate::supervisor::{LlamaServerConfig, ProcessSupervisor, SupervisorManager};
 use crate::sysinfo::SystemProfile;
 use crate::tunnel::AdbTunnelSupervisor;
 use crate::ui::chat::{ChatApp, StreamMsg, TransportBadge};
 use crate::ui::cluster_view::ClusterView;
-use crate::ui::models_view::ModelsView;
+use crate::ui::models_view::{download_dest_from_url, CatalogRow, ModelsView};
 use crate::ui::settings_view::SettingsView;
 use crate::ui::slash::{self, SlashCommand};
 use crossterm::{
@@ -23,7 +25,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Tabs},
     Frame, Terminal,
 };
 use std::io::stdout;
@@ -33,6 +35,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+
+/// Progress / completion events from an in-TUI model download task.
+pub enum DownloadMsg {
+    Progress(DownloadProgress),
+    Done(Result<(), String>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubTab {
@@ -138,6 +146,14 @@ pub struct HubApp {
     pub usb_tunnel_active: bool,
     /// Context window applied to local/remote model loads.
     pub selected_context: usize,
+    /// Whether the keybinding help overlay is visible.
+    pub show_help_modal: bool,
+    /// URL input buffer when the download modal is open.
+    pub pending_download: Option<String>,
+    /// Active download progress: (optional percent, status label).
+    pub download_progress: Option<(Option<f32>, String)>,
+    /// True while a background download task is running.
+    pub download_active: bool,
 }
 
 impl HubApp {
@@ -164,6 +180,10 @@ impl HubApp {
             status_message: None,
             usb_tunnel_active: false,
             selected_context: DEFAULT_CONTEXT_SIZE,
+            show_help_modal: false,
+            pending_download: None,
+            download_progress: None,
+            download_active: false,
         }
     }
 
@@ -172,12 +192,21 @@ impl HubApp {
         self.models_view.max_rpc_ram_mb = self.config.cluster.max_rpc_ram_mb;
     }
 
+    /// Context length limit from the selected catalog row (remote or local).
+    fn selected_context_limit(&self) -> Option<usize> {
+        self.models_view
+            .selected_row()
+            .map(|r| r.context_length)
+            .or_else(|| {
+                self.models_view
+                    .selected_model()
+                    .map(|m| m.context_length)
+            })
+    }
+
     /// Adjust Hub context window (+/- CONTEXT_STEP), clamped to the selected model's limit.
     pub fn adjust_context(&mut self, increase: bool) {
-        let model_limit = self
-            .models_view
-            .selected_model()
-            .map(|m| m.context_length);
+        let model_limit = self.selected_context_limit();
         let next = if increase {
             self.selected_context.saturating_add(CONTEXT_STEP)
         } else {
@@ -192,10 +221,7 @@ impl HubApp {
     }
 
     pub fn set_context(&mut self, ctx: usize) {
-        let model_limit = self
-            .models_view
-            .selected_model()
-            .map(|m| m.context_length);
+        let model_limit = self.selected_context_limit();
         self.selected_context = clamp_context_size(ctx, model_limit);
         self.sync_models_context();
     }
@@ -239,7 +265,20 @@ impl HubApp {
         });
     }
 
-    /// Open target execution device selector modal for a model.
+    /// Open target selection from the Models-tab catalog row (preferred).
+    pub async fn open_target_selection_from_row(&mut self, row: &CatalogRow) {
+        let allow_local = row.local_path.is_some();
+        let model_path = row
+            .local_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&row.filename));
+        let required_mb = row.required_mb_at(self.selected_context);
+        self.set_context(self.selected_context.min(row.context_length));
+        self.open_target_selection_inner(model_path, row.filename.clone(), required_mb, allow_local)
+            .await;
+    }
+
+    /// Open target execution device selector modal for a local model path (legacy / tests).
     pub async fn open_target_selection(&mut self, model_path: PathBuf) {
         let model_name = model_path
             .file_name()
@@ -255,10 +294,6 @@ impl HubApp {
             );
         }
 
-        let profile = SystemProfile::probe();
-        let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
-        let gpu_layers = self.config.hardware.acceleration.gpu_layers;
-
         let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
         let kv_bytes = if let Ok(gguf) = crate::gguf::GgufMetadata::open(&model_path) {
             gguf.exact_kv_cache_bytes(self.selected_context)
@@ -266,34 +301,65 @@ impl HubApp {
             SystemProfile::estimate_kv_cache_bytes(self.selected_context)
         };
         let required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
+        // PathBuf argument implies a local selection intent.
+        self.open_target_selection_inner(model_path, model_name, required_mb, true)
+            .await;
+    }
+
+    async fn open_target_selection_inner(
+        &mut self,
+        model_path: PathBuf,
+        model_name: String,
+        required_mb: u64,
+        allow_local: bool,
+    ) {
+        let profile = SystemProfile::probe();
+        let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+        let gpu_layers = self.config.hardware.acceleration.gpu_layers;
         let rpc_worker_cap_mb = self.config.cluster.max_rpc_ram_mb;
 
-        let mut candidates = vec![
-            TargetExecutionNode::Local {
+        let mut candidates = Vec::new();
+        if allow_local {
+            candidates.push(TargetExecutionNode::Local {
                 allocatable_mb: local_cap_mb,
                 backend: profile.detected_backend.to_string(),
                 gpu_layers,
-            },
-            TargetExecutionNode::LocalCpu {
+            });
+            candidates.push(TargetExecutionNode::LocalCpu {
                 allocatable_mb: local_cap_mb,
                 backend: "CPU Fallback (DotProd / Multi-thread)".to_string(),
                 threads: profile.recommended_threads,
-            },
-        ];
+            });
+        }
+
+        // Peers that advertise this filename in the merged catalog.
+        let catalog_peer_uuids: std::collections::HashSet<Uuid> = self
+            .models_view
+            .catalog
+            .iter()
+            .filter(|r| r.filename == model_name)
+            .filter_map(|r| r.peer_uuid)
+            .collect();
 
         let peers = self.discovery.get_active_peers().await;
         for p in peers {
-            if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
-                let short_id = p.uuid.to_string();
-                let name = format!("Node-{}", &short_id[..8]);
-                candidates.push(TargetExecutionNode::Remote {
-                    uuid: p.uuid,
-                    name,
-                    endpoint: p.api_endpoint(),
-                    free_ram_mb: p.free_ram_mb,
-                    backend: p.backend.to_string(),
-                });
+            if !(p.status.is_ready() || p.role.is_host() || p.is_rpc_ready()) {
+                continue;
             }
+            // Prefer catalog-backed remotes; if catalog has no remotes for this
+            // filename yet, fall back to any ready peer (legacy / empty catalog).
+            if !catalog_peer_uuids.is_empty() && !catalog_peer_uuids.contains(&p.uuid) {
+                continue;
+            }
+            let short_id = p.uuid.to_string();
+            let name = format!("Node-{}", &short_id[..8]);
+            candidates.push(TargetExecutionNode::Remote {
+                uuid: p.uuid,
+                name,
+                endpoint: p.control_endpoint(),
+                free_ram_mb: p.free_ram_mb,
+                backend: p.backend.to_string(),
+            });
         }
 
         self.pending_target_selection = Some(TargetSelectionState {
@@ -728,6 +794,16 @@ impl HubApp {
         if let Some(target_state) = &self.pending_target_selection {
             self.render_target_selection_modal(frame, area, target_state);
         }
+
+        if self.show_help_modal {
+            self.render_help_modal(frame, area);
+        }
+
+        if let Some(url_buf) = &self.pending_download {
+            self.render_download_url_modal(frame, area, url_buf);
+        } else if let Some((pct, label)) = &self.download_progress {
+            self.render_download_progress_modal(frame, area, *pct, label);
+        }
     }
 
     fn render_top_tabs(&self, frame: &mut Frame, area: Rect) {
@@ -788,10 +864,164 @@ impl HubApp {
 
         spans.push(Span::styled(" [Alt+C] Connect Peer ", Style::default().fg(Color::Cyan)));
         spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            " [?] Help ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(" [Ctrl+C] Quit", Style::default().fg(Color::Red)));
 
         let p = Paragraph::new(Line::from(spans));
         frame.render_widget(p, area);
+    }
+
+    fn render_help_modal(&self, frame: &mut Frame, area: Rect) {
+        let modal_area = centered_rect(70, 55, area);
+        frame.render_widget(Clear, modal_area);
+
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                " Keybindings ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                " Global: F1-F4 / Alt+1-4 / Tab  switch tabs   |  ? / F12  toggle help",
+                Style::default().fg(Color::White),
+            )]),
+            Line::from(""),
+        ];
+
+        match self.active_tab {
+            HubTab::Chat => {
+                lines.push(Line::from(Span::styled(
+                    " Chat: Alt+C connect peer  |  Esc abort stream  |  / slash commands",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            HubTab::Models => {
+                lines.push(Line::from(Span::styled(
+                    " Models: Enter target  |  D download  |  +/- context  |  u unload",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "         P persona  |  R refresh catalog",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            HubTab::Cluster => {
+                lines.push(Line::from(Span::styled(
+                    " Cluster: Enter connect  |  L load on peer  |  D disconnect",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "          A add peer  |  I info  |  W worker standby",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            HubTab::Settings => {
+                lines.push(Line::from(Span::styled(
+                    " Settings: j/k navigate  |  Enter edit/toggle  |  s save",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " [Esc / ? / F12] Close ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+
+        let block = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Help ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(block, modal_area);
+    }
+
+    fn render_download_url_modal(&self, frame: &mut Frame, area: Rect, url_buf: &str) {
+        let modal_area = centered_rect(70, 25, area);
+        frame.render_widget(Clear, modal_area);
+
+        let lines = vec![
+            Line::from(vec![Span::styled(
+                " Download GGUF Model ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" URL: ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}█", url_buf),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                " [Enter] Start  |  [Esc] Cancel  |  [Backspace] Delete ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let block = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Download ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(block, modal_area);
+    }
+
+    fn render_download_progress_modal(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        pct: Option<f32>,
+        label: &str,
+    ) {
+        let modal_area = centered_rect(60, 20, area);
+        frame.render_widget(Clear, modal_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(modal_area);
+
+        let title = Paragraph::new(Line::from(Span::styled(
+            format!(" {}", label),
+            Style::default().fg(Color::White),
+        )))
+        .block(
+            Block::default()
+                .title(" Download Progress ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(title, chunks[0]);
+
+        let ratio = pct.map(|p| (p as f64 / 100.0).clamp(0.0, 1.0)).unwrap_or(0.0);
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL))
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .ratio(ratio)
+            .label(match pct {
+                Some(p) => format!("{:.0}%", p),
+                None => "…".to_string(),
+            });
+        frame.render_widget(gauge, chunks[1]);
     }
 
     fn render_hot_swap_modal(&self, frame: &mut Frame, area: Rect, target_path: &PathBuf) {
@@ -939,8 +1169,33 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Spawn control-plane HTTP server (catalog / load / unload on control_port).
+    let cp_manager = SupervisorManager::new();
+    let bind_host = if hub.config.network.api_host == "0.0.0.0" {
+        "0.0.0.0"
+    } else {
+        hub.config.network.api_host.as_str()
+    };
+    let bind = format!("{}:{}", bind_host, hub.config.network.control_port)
+        .parse()
+        .unwrap_or_else(|_| ([0, 0, 0, 0], hub.config.network.control_port).into());
+    let profile = SystemProfile::probe();
+    let _cp_handle = spawn_control_plane(
+        bind,
+        ControlPlaneServerState {
+            node_id: hub.discovery.node_uuid(),
+            role: NodeRole::from_str_role(&hub.config.node.role),
+            models_dir: hub.config.node.models_dir.clone(),
+            api_host: hub.config.network.api_host.clone(),
+            api_port: hub.config.network.api_port,
+            manager: cp_manager,
+            allocatable_memory_mb: profile.max_allowed_memory_bytes() / (1024 * 1024),
+        },
+    );
+
     let mut event_stream = EventStream::new();
     let (tx, mut rx) = mpsc::channel::<StreamMsg>(100);
+    let (dl_tx, mut dl_rx) = mpsc::channel::<DownloadMsg>(32);
     let mut refresh_interval = tokio::time::interval(Duration::from_millis(500));
 
     loop {
@@ -953,6 +1208,25 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 }
                 if hub.active_tab == HubTab::Models {
                     hub.models_view.refresh_profile();
+                    // Refresh remote model catalogs from peer control planes.
+                    let peers = hub.discovery.get_active_peers().await;
+                    let client = reqwest::Client::new();
+                    let mut remotes = Vec::new();
+                    for p in peers {
+                        let ep = p.control_endpoint();
+                        if let Ok(catalog) = control_plane::fetch_models(&client, &ep).await {
+                            let label = format!("Node-{}", &p.uuid.to_string()[..8]);
+                            for entry in &catalog.models {
+                                remotes.push(CatalogRow::from_remote(
+                                    entry,
+                                    label.clone(),
+                                    p.uuid,
+                                    ep.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    hub.models_view.apply_remote_catalogs(remotes);
                 }
 
                 hub.usb_tunnel_active =
@@ -984,6 +1258,43 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         Ok(None) => {}
                         Err(e) => {
                             debug!("Failed to check supervisor status: {}", e);
+                        }
+                    }
+                }
+            }
+            Some(dl_msg) = dl_rx.recv() => {
+                match dl_msg {
+                    DownloadMsg::Progress(p) => {
+                        let label = match p.total_bytes {
+                            Some(total) => format!(
+                                "Downloading… {} / {} bytes ({:.0} KB/s)",
+                                p.downloaded_bytes,
+                                total,
+                                p.speed_bytes_per_sec / 1024.0
+                            ),
+                            None => format!(
+                                "Downloading… {} bytes ({:.0} KB/s)",
+                                p.downloaded_bytes,
+                                p.speed_bytes_per_sec / 1024.0
+                            ),
+                        };
+                        hub.download_progress = Some((p.percent, label));
+                    }
+                    DownloadMsg::Done(result) => {
+                        hub.download_active = false;
+                        hub.download_progress = None;
+                        match result {
+                            Ok(()) => {
+                                hub.models_view.refresh();
+                                hub.status_message = Some((
+                                    "Download complete — models rescanned".to_string(),
+                                    Color::Green,
+                                ));
+                            }
+                            Err(e) => {
+                                hub.status_message =
+                                    Some((format!("Download failed: {}", e), Color::Red));
+                            }
                         }
                     }
                 }
@@ -1039,6 +1350,60 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             _ => {
                                 hub.pending_hot_swap = Some((target_path, gpu_layers));
                             }
+                        }
+                        continue;
+                    }
+
+                    // Help modal: toggle / consume keys
+                    if key.code == KeyCode::Char('?') || key.code == KeyCode::F(12) {
+                        hub.show_help_modal = !hub.show_help_modal;
+                        continue;
+                    }
+                    if hub.show_help_modal {
+                        if key.code == KeyCode::Esc {
+                            hub.show_help_modal = false;
+                        }
+                        continue;
+                    }
+
+                    // Download URL modal text edit
+                    if let Some(ref mut buf) = hub.pending_download {
+                        match key.code {
+                            KeyCode::Enter => {
+                                let url = buf.trim().to_string();
+                                hub.pending_download = None;
+                                if !url.is_empty() && !hub.download_active {
+                                    hub.download_active = true;
+                                    hub.download_progress =
+                                        Some((None, "Starting download…".to_string()));
+                                    let dest = download_dest_from_url(
+                                        &hub.config.node.models_dir,
+                                        &url,
+                                    );
+                                    let dl_tx = dl_tx.clone();
+                                    tokio::spawn(async move {
+                                        let downloader = ModelDownloader::new();
+                                        let progress_tx = dl_tx.clone();
+                                        let result = downloader
+                                            .download(&url, &dest, None, move |p| {
+                                                let _ = progress_tx.try_send(DownloadMsg::Progress(p));
+                                            })
+                                            .await;
+                                        let done = result.map_err(|e| e.to_string());
+                                        let _ = dl_tx.send(DownloadMsg::Done(done)).await;
+                                    });
+                                }
+                            }
+                            KeyCode::Esc => {
+                                hub.pending_download = None;
+                            }
+                            KeyCode::Backspace => {
+                                buf.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                buf.push(c);
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -1108,13 +1473,6 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         }
                         HubTab::Models => {
                             match key.code {
-                                KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
-                                KeyCode::Char('2') => hub.models_view.refresh(),
-                                KeyCode::Char('3') => {
-                                    hub.set_tab(HubTab::Cluster);
-                                    hub.cluster_view.refresh().await;
-                                }
-                                KeyCode::Char('4') => hub.set_tab(HubTab::Settings),
                                 KeyCode::Up | KeyCode::Char('k') => hub.models_view.previous(),
                                 KeyCode::Down | KeyCode::Char('j') => hub.models_view.next(),
                                 KeyCode::Char('r') | KeyCode::Char('R') => hub.models_view.refresh(),
@@ -1122,10 +1480,14 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 KeyCode::Char('+') | KeyCode::Char('=') => hub.adjust_context(true),
                                 KeyCode::Char('-') | KeyCode::Char('_') => hub.adjust_context(false),
                                 KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
+                                KeyCode::Char('d') | KeyCode::Char('D') => {
+                                    if !hub.download_active {
+                                        hub.pending_download = Some(String::new());
+                                    }
+                                }
                                 KeyCode::Enter => {
-                                    if let Some(m) = hub.models_view.selected_model() {
-                                        let path = m.path.clone();
-                                        hub.open_target_selection(path).await;
+                                    if let Some(row) = hub.models_view.selected_row().cloned() {
+                                        hub.open_target_selection_from_row(&row).await;
                                     }
                                 }
                                 KeyCode::Tab => hub.next_tab(),
@@ -1175,10 +1537,6 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             } else {
                                 match key.code {
-                                    KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
-                                    KeyCode::Char('2') => hub.set_tab(HubTab::Models),
-                                    KeyCode::Char('3') => hub.cluster_view.refresh().await,
-                                    KeyCode::Char('4') => hub.set_tab(HubTab::Settings),
                                     KeyCode::Up | KeyCode::Char('k') => hub.cluster_view.previous(),
                                     KeyCode::Down | KeyCode::Char('j') => hub.cluster_view.next(),
                                     KeyCode::Enter => {
@@ -1208,10 +1566,18 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
                                             let peer_uuid = peer.uuid;
                                             let peer_name = format!("Node-{}", &peer_uuid.to_string()[..8]);
-                                            let peer_ep = peer.api_endpoint();
-                                            let peer_api_port = peer.api_port;
-                                            if let Some(m) = hub.models_view.selected_model() {
-                                                let model_name = m.filename.clone();
+                                            let peer_ep = peer.control_endpoint();
+                                            let peer_control_port = peer.control_port;
+                                            let model_name = hub
+                                                .models_view
+                                                .selected_row()
+                                                .map(|r| r.filename.clone())
+                                                .or_else(|| {
+                                                    hub.models_view
+                                                        .selected_model()
+                                                        .map(|m| m.filename.clone())
+                                                });
+                                            if let Some(model_name) = model_name {
                                                 let ctx = hub.selected_context;
                                                 let gpu = hub.configured_gpu_layers();
                                                 match hub
@@ -1228,8 +1594,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     Err(e) => {
                                                         let hint = if e.contains("error sending request") {
                                                             format!(
-                                                                "Dispatch error to {}: node has no active server on port {}. Launch model locally on that device first.",
-                                                                peer_name, peer_api_port
+                                                                "Dispatch error to {}: control plane unreachable on port {}. Ensure nexusd/hub is running with control_port open.",
+                                                                peer_name, peer_control_port
                                                             )
                                                         } else {
                                                             e
@@ -1280,13 +1646,6 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             } else {
                                 match key.code {
-                                    KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
-                                    KeyCode::Char('2') => hub.set_tab(HubTab::Models),
-                                    KeyCode::Char('3') => {
-                                        hub.set_tab(HubTab::Cluster);
-                                        hub.cluster_view.refresh().await;
-                                    }
-                                    KeyCode::Char('4') => {}
                                     KeyCode::Up | KeyCode::Char('k') => hub.settings_view.previous(),
                                     KeyCode::Down | KeyCode::Char('j') => hub.settings_view.next(),
                                     KeyCode::Enter => {

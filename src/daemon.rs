@@ -1,8 +1,13 @@
 use clap::Parser;
 use nexus::config::NexusConfig;
-use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
+use nexus::discovery::{NodeRole, StatusFlags};
+use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -93,7 +98,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         discovery.node_uuid()
     );
 
-    // 4. Optional Model Launch
+    // 4. Shared supervisor + control-plane HTTP server (dedicated control_port)
+    let supervisor = SupervisorManager::new();
+    let control_ctx = Arc::new(
+        ControlPlaneContext::new(
+            discovery.node_uuid(),
+            NodeRole::from_str_role(&config.node.role),
+            supervisor.clone(),
+            args.host.clone(),
+            args.port,
+            args.binary.clone(),
+        )
+        .with_discovery(discovery.clone())
+        .with_capabilities(vec!["inference".to_string(), "daemon".to_string()]),
+    );
+    let control_addr = SocketAddr::from(([0, 0, 0, 0], config.network.control_port));
+    let control_handle = spawn_control_plane(control_addr, control_ctx);
+    info!(
+        "Control-plane HTTP server listening on port {}",
+        config.network.control_port
+    );
+
+    // 5. Optional Model Launch
     if let Some(model_path) = args.model {
         let model_name = model_path
             .file_stem()
@@ -194,54 +220,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Launching model {:?} with context size {}",
             model_path, args.ctx
         );
-        match ProcessSupervisor::spawn_with_fallback(server_cfg).await {
-            Ok(mut supervisor) => {
-                info!(
-                    "Server supervisor active on backend: {}",
-                    supervisor.active_backend()
-                );
-                let mut status = nexus::discovery::StatusFlags::READY;
-                if supervisor.active_backend() == AccelerationBackend::Vulkan {
-                    status.0 |= nexus::discovery::StatusFlags::VULKAN_ACTIVE.0;
+        match supervisor.spawn(server_cfg).await {
+            Ok(()) => {
+                let mut status = StatusFlags::READY;
+                if profile.detected_backend == AccelerationBackend::Vulkan {
+                    status.0 |= StatusFlags::VULKAN_ACTIVE.0;
                 }
                 discovery.set_status_flags(status).await;
                 let broadcaster_handle = discovery.clone().start_broadcaster();
                 info!("Listening for termination signal (Ctrl+C)...");
-                tokio::select! {
-                    res = tokio::signal::ctrl_c() => {
-                        if let Err(e) = res {
-                            error!("Error listening for Ctrl+C: {}", e);
-                        } else {
-                            info!("Termination signal received. Shutting down llama-server...");
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                loop {
+                    tokio::select! {
+                        res = tokio::signal::ctrl_c() => {
+                            if let Err(e) = res {
+                                error!("Error listening for Ctrl+C: {}", e);
+                            } else {
+                                info!("Termination signal received. Shutting down llama-server...");
+                            }
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            match supervisor.check_status().await {
+                                Ok(Some((exit_status, _))) => {
+                                    error!("llama-server process exited unexpectedly: {:?}", exit_status);
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    error!("Failed to poll supervisor: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
-                    exit_res = supervisor.wait() => {
-                        error!("llama-server process exited unexpectedly: {:?}", exit_res);
-                    }
                 }
-                discovery
-                    .set_status_flags(nexus::discovery::StatusFlags(0))
-                    .await;
-                supervisor.stop().await?;
+                discovery.set_status_flags(StatusFlags(0)).await;
+                let _ = supervisor.stop().await;
                 broadcaster_handle.abort();
                 listener_handle.abort();
+                control_handle.abort();
                 info!("Shutdown complete.");
             }
             Err(e) => {
                 listener_handle.abort();
+                control_handle.abort();
                 error!("Failed to launch supervisor: {}", e);
                 std::process::exit(1);
             }
         }
     } else {
         let broadcaster_handle = discovery.clone().start_broadcaster();
-        info!("No model specified. Daemon idle. Broadcasting beacon. Press Ctrl+C to exit.");
+        info!(
+            "No model specified. Daemon idle with control-plane on port {}. Broadcasting beacon. Press Ctrl+C to exit.",
+            config.network.control_port
+        );
         tokio::signal::ctrl_c().await?;
-        discovery
-            .set_status_flags(nexus::discovery::StatusFlags(0))
-            .await;
+        discovery.set_status_flags(StatusFlags(0)).await;
         broadcaster_handle.abort();
         listener_handle.abort();
+        control_handle.abort();
+        let _ = supervisor.stop().await;
         info!("Daemon stopped.");
     }
 

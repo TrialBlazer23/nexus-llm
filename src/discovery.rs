@@ -32,6 +32,10 @@ pub struct ServiceEndpoint {
     pub addresses: Vec<SocketAddr>,
     pub api_port: u16,
     pub rpc_port: u16,
+    /// HTTP control-plane port (`POST /nexus/control/v1/...`). Defaults to the
+    /// local `network.control_port` when a peer is learned only via UDP beacon
+    /// (beacon v1 has no on-wire control port; see AGENT_LEARNINGS).
+    pub control_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +309,8 @@ pub struct PeerNode {
     pub status: StatusFlags,
     pub api_port: u16,
     pub rpc_port: u16,
+    #[serde(default = "default_peer_control_port")]
+    pub control_port: u16,
     pub total_ram_mb: u32,
     pub free_ram_mb: u32,
     pub backend: AccelerationBackend,
@@ -312,6 +318,10 @@ pub struct PeerNode {
     pub active_model: String,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
+}
+
+fn default_peer_control_port() -> u16 {
+    9998
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +343,10 @@ impl PeerNode {
         format!("http://{}:{}", self.addr.ip(), self.api_port)
     }
 
+    pub fn control_endpoint(&self) -> String {
+        format!("http://{}:{}", self.addr.ip(), self.control_port)
+    }
+
     pub fn is_rpc_ready(&self) -> bool {
         self.status.is_rpc_ready() && self.rpc_port > 0
     }
@@ -351,6 +365,7 @@ impl PeerNode {
             addresses: vec![self.addr],
             api_port: self.api_port,
             rpc_port: self.rpc_port,
+            control_port: self.control_port,
         }
     }
 }
@@ -782,6 +797,13 @@ impl DiscoveryService {
                                         "Received valid beacon from {:?} ({:?})",
                                         peer_addr, beacon.uuid
                                     );
+                                    let mut peers = self.peers.write().await;
+                                    // Beacon v1 has no control_port field; preserve an
+                                    // mDNS-learned value, otherwise assume the mesh default.
+                                    let control_port = peers
+                                        .get(&beacon.uuid)
+                                        .map(|p| p.control_port)
+                                        .unwrap_or(self.config.network.control_port);
                                     let peer = PeerNode {
                                         uuid: beacon.uuid,
                                         addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
@@ -789,6 +811,7 @@ impl DiscoveryService {
                                         status: beacon.status,
                                         api_port: beacon.api_port,
                                         rpc_port: beacon.rpc_port,
+                                        control_port,
                                         total_ram_mb: beacon.total_ram_mb,
                                         free_ram_mb: beacon.free_ram_mb,
                                         backend: beacon.backend,
@@ -797,7 +820,6 @@ impl DiscoveryService {
                                         last_seen: Instant::now(),
                                     };
 
-                                    let mut peers = self.peers.write().await;
                                     let event = if peers.contains_key(&beacon.uuid) {
                                         DiscoveryEvent::ServiceUpdated(peer.service_endpoint())
                                     } else {
@@ -995,6 +1017,9 @@ impl DiscoveryService {
             }
             existing.api_port = endpoint.api_port;
             existing.rpc_port = endpoint.rpc_port;
+            if endpoint.control_port > 0 {
+                existing.control_port = endpoint.control_port;
+            }
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
@@ -1011,6 +1036,11 @@ impl DiscoveryService {
             if endpoint.rpc_port > 0 {
                 status.0 |= StatusFlags::RPC_READY.0;
             }
+            let control_port = if endpoint.control_port > 0 {
+                endpoint.control_port
+            } else {
+                self.config.network.control_port
+            };
             let peer = PeerNode {
                 uuid: endpoint.node_id,
                 addr,
@@ -1018,6 +1048,7 @@ impl DiscoveryService {
                 status,
                 api_port: endpoint.api_port,
                 rpc_port: endpoint.rpc_port,
+                control_port,
                 total_ram_mb: 0,
                 free_ram_mb: 0,
                 backend: AccelerationBackend::GenericCpu,
@@ -1093,6 +1124,7 @@ impl DiscoveryService {
                 &format!("{}.local.", this.node_uuid),
                 this.config.network.api_port,
                 rpc_port,
+                this.config.network.control_port,
                 this.node_uuid,
                 None,
                 role,

@@ -323,7 +323,8 @@ async fn test_hub_app_target_node_selection_modal() {
     state.candidates.push(TargetExecutionNode::Remote {
         uuid: peer_id,
         name: "Galaxy-S23".to_string(),
-        endpoint: "http://192.168.1.100:8080".to_string(),
+        endpoint: "http://192.168.1.100:9998".to_string(),
+        api_endpoint: "http://192.168.1.100:8080".to_string(),
         free_ram_mb: 8500,
         backend: "Vulkan".to_string(),
     });
@@ -366,6 +367,7 @@ async fn test_cluster_view_interactions() {
         role: nexus::discovery::NodeRole::HOST,
         status: nexus::discovery::StatusFlags::READY,
         api_port: 8080,
+        control_port: 9998,
         rpc_port: 50052,
         total_ram_mb: 12000,
         free_ram_mb: 8192,
@@ -380,6 +382,7 @@ async fn test_cluster_view_interactions() {
         role: nexus::discovery::NodeRole::CLIENT,
         status: nexus::discovery::StatusFlags::RPC_READY,
         api_port: 8080,
+        control_port: 9998,
         rpc_port: 50052,
         total_ram_mb: 4000,
         free_ram_mb: 1800,

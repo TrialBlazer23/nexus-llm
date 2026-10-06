@@ -100,6 +100,7 @@ fn test_config_defaults_and_serde() {
     assert_eq!(config.hardware.acceleration.cpu_threads, 6);
     assert_eq!(config.hardware.safety.max_ram_usage_percent, 75);
     assert_eq!(config.network.api_port, 8080);
+    assert_eq!(config.network.control_port, 9998);
     assert_eq!(config.network.discovery_port, 9999);
 
     // Round-trip TOML serialization

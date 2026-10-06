@@ -32,17 +32,40 @@ echo "commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 echo
 echo "########################################################################"
-echo "# S0/S1.1 — control-plane handlers have no server binding them"
+echo "# S0/S1.1 — control-plane server wiring (Phase 7)"
 echo "########################################################################"
-expect_no_callers "handle_load_model / handle_unload_model" \
-    'handle_load_model|handle_unload_model' '^src/control_plane\.rs'
-expect_no_callers "fetch_state (peer state verification)" \
+rule "control_plane_server module exists"
+if [ -f src/control_plane_server.rs ]; then
+    echo "PRESENT: src/control_plane_server.rs"
+else
+    echo "MISSING: src/control_plane_server.rs"
+fi
+rule "handle_load_model / handle_unload_model called from server"
+hits=$(search 'handle_load_model|handle_unload_model' | grep -E 'src/control_plane_server\.rs' || true)
+if [ -n "$hits" ]; then
+    echo "$hits"
+else
+    echo "MISSING: server does not call handlers"
+fi
+rule "HTTP listener in src/ (hyper TcpListener)"
+hits=$(search 'TcpListener::bind|hyper::server|control_plane_server' || true)
+if [ -n "$hits" ]; then
+    echo "$hits"
+else
+    echo "MISSING: no HTTP server in src/"
+fi
+rule "hub dispatches to control_endpoint (not api_endpoint for load)"
+hits=$(search 'control_endpoint\(\)|dispatch_load_model' | grep -E 'src/ui/hub\.rs' || true)
+if [ -n "$hits" ]; then
+    echo "$hits"
+else
+    echo "MISSING: hub does not use control_endpoint / dispatch_load_model"
+fi
+# Still expected: client-only helpers unused at runtime until Phase 9/1.4
+expect_no_callers "fetch_state (peer state verification; still Phase 9/1.4)" \
     'fetch_state' '^src/control_plane\.rs'
-expect_no_callers "dispatch_unload_model (remote unload)" \
-    'dispatch_unload_model' '^src/control_plane\.rs'
-rule "any HTTP listener in src/ (axum/hyper/TcpListener::bind)"
-search 'TcpListener::bind|axum::|hyper::server|Server::bind' || \
-    echo "NO HTTP SERVER IN src/ (claim holds)"
+expect_no_callers "dispatch_unload_model (remote unload; still unwired from UI)" \
+    'dispatch_unload_model' '^src/control_plane\.rs|^src/control_plane_server\.rs'
 
 echo
 echo "########################################################################"

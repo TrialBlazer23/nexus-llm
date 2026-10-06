@@ -100,6 +100,31 @@ pub fn endpoint_from_state(
         } else {
             0
         },
+        control_port: endpoint.control_port,
+    }
+}
+
+/// Build a control-plane state snapshot from live supervisor + discovery signals.
+pub async fn build_control_plane_state(
+    node_id: Uuid,
+    role: NodeRole,
+    capabilities: Vec<String>,
+    manager: &crate::supervisor::SupervisorManager,
+    allocatable_memory_mb: u64,
+    rpc_ready: bool,
+) -> ControlPlaneState {
+    let healthy = manager.is_healthy().await;
+    let active_model = manager.active_model().await;
+    ControlPlaneState {
+        node_id,
+        protocol_version: CONTROL_PLANE_VERSION,
+        role,
+        capabilities,
+        ready: true,
+        inferring: healthy,
+        rpc_ready,
+        allocatable_memory_mb,
+        active_model,
     }
 }
 
@@ -225,7 +250,21 @@ pub async fn handle_load_model(
     request: &ModelLoadRequest,
     api_host: &str,
     api_port: u16,
+    binary_path: &std::path::Path,
 ) -> ModelLoadResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return ModelLoadResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            active_model: String::new(),
+            api_endpoint: String::new(),
+            error_message: Some(format!(
+                "protocol mismatch: expected {}, got {}",
+                CONTROL_PLANE_VERSION, request.protocol_version
+            )),
+        };
+    }
+
     let raw_path = std::path::PathBuf::from(&request.model_path);
     let model_path = if raw_path.exists() {
         raw_path
@@ -255,7 +294,7 @@ pub async fn handle_load_model(
     }
 
     let config = crate::supervisor::LlamaServerConfig {
-        binary_path: std::path::PathBuf::from("llama-server"),
+        binary_path: binary_path.to_path_buf(),
         model_path,
         host: api_host.to_string(),
         port: api_port,

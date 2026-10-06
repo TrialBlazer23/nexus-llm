@@ -35,6 +35,7 @@ impl MdnsBackend {
         host_name: &str,
         api_port: u16,
         rpc_port: u16,
+        control_port: u16,
         node_id: Uuid,
         cluster_id: Option<Uuid>,
         role: NodeRole,
@@ -51,6 +52,7 @@ impl MdnsBackend {
             ("caps".to_string(), capability_list),
             ("api".to_string(), api_port.to_string()),
             ("rpc".to_string(), rpc_port.to_string()),
+            ("ctrl".to_string(), control_port.to_string()),
         ]);
         let info = ServiceInfo::new(
             service_type,
@@ -147,6 +149,10 @@ fn endpoint_from_resolved(
         .and_then(|port| port.parse().ok())
         .unwrap_or(service.port);
     let rpc_port = properties.get("rpc").and_then(|port| port.parse().ok()).unwrap_or(0);
+    let control_port = properties
+        .get("ctrl")
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(9998);
     let capabilities = properties
         .get("caps")
         .map(|caps| caps.split(',').filter(|cap| !cap.is_empty()).map(str::to_string).collect())
@@ -161,6 +167,7 @@ fn endpoint_from_resolved(
         addresses,
         api_port,
         rpc_port,
+        control_port,
     })
 }
 

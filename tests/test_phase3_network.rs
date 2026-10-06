@@ -17,6 +17,7 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         capabilities: vec!["inference".to_string()],
         addresses: vec![SocketAddr::from((address, 8080))],
         api_port: 8080,
+        control_port: 9998,
         rpc_port: 50052,
     }
 }
@@ -136,6 +137,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         role: NodeRole::HOST,
         status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
         api_port: 8080,
+        control_port: 9998,
         rpc_port: 50052,
         total_ram_mb: 4096,
         free_ram_mb: 3000,
@@ -192,6 +194,7 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             role: NodeRole::HOST,
             status: StatusFlags::READY,
             api_port: 8080,
+        control_port: 9998,
             rpc_port: 0,
             total_ram_mb: 16000,
             free_ram_mb: 12000,
@@ -231,7 +234,14 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
 
     // Test server handler with SupervisorManager (expect model not found error for non-existent model)
     let manager = SupervisorManager::new();
-    let response = handle_load_model(&manager, &load_req, "127.0.0.1", 8080).await;
+    let response = handle_load_model(
+        &manager,
+        &load_req,
+        "127.0.0.1",
+        8080,
+        std::path::Path::new("llama-server"),
+    )
+    .await;
     assert_eq!(response.protocol_version, CONTROL_PLANE_VERSION);
     assert!(!response.success);
     assert!(response.error_message.is_some());

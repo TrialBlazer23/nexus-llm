@@ -1,7 +1,8 @@
 use crate::client::{ChatMessage, NexusClient};
 use crate::config::NexusConfig;
-use crate::discovery::DiscoveryService;
-use crate::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
+use crate::discovery::{DiscoveryService, NodeRole};
+use crate::supervisor::{LlamaServerConfig, SupervisorManager};
 use crate::sysinfo::SystemProfile;
 use crate::ui::chat::{ChatApp, StreamMsg};
 use crate::ui::cluster_view::ClusterView;
@@ -22,6 +23,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::stdout;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +66,10 @@ pub enum TargetExecutionNode {
     Remote {
         uuid: Uuid,
         name: String,
+        /// Control-plane base URL used for `dispatch_load_model`.
         endpoint: String,
+        /// OpenAI-compatible inference URL used after a successful remote load.
+        api_endpoint: String,
         free_ram_mb: u32,
         backend: String,
     },
@@ -103,7 +108,7 @@ pub struct HubApp {
     pub models_view: ModelsView,
     pub cluster_view: ClusterView,
     pub settings_view: SettingsView,
-    pub supervisor: Option<ProcessSupervisor>,
+    pub supervisor: SupervisorManager,
     pub active_model_name: String,
     pub pending_hot_swap_path: Option<PathBuf>,
     pub pending_target_selection: Option<TargetSelectionState>,
@@ -125,7 +130,7 @@ impl HubApp {
             models_view,
             cluster_view,
             settings_view,
-            supervisor: None,
+            supervisor: SupervisorManager::new(),
             active_model_name: "None (Idle)".to_string(),
             pending_hot_swap_path: None,
             pending_target_selection: None,
@@ -201,7 +206,8 @@ impl HubApp {
                 candidates.push(TargetExecutionNode::Remote {
                     uuid: p.uuid,
                     name,
-                    endpoint: p.api_endpoint(),
+                    endpoint: p.control_endpoint(),
+                    api_endpoint: p.api_endpoint(),
                     free_ram_mb: p.free_ram_mb,
                     backend: p.backend.to_string(),
                 });
@@ -229,7 +235,7 @@ impl HubApp {
                         self.chat.set_target_hardware("Local Host", "Local CPU (DotProd / Multi-thread)");
                         self.request_model_load_with_gpu(state.model_path, Some(0)).await;
                     }
-                    TargetExecutionNode::Remote { endpoint, name, backend, .. } => {
+                    TargetExecutionNode::Remote { endpoint, api_endpoint, name, backend, .. } => {
                         let client = reqwest::Client::new();
                         let req = crate::control_plane::ModelLoadRequest {
                             protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
@@ -245,10 +251,12 @@ impl HubApp {
                         match crate::control_plane::dispatch_load_model(&client, endpoint, &req).await {
                             Ok(resp) if resp.success => {
                                 self.active_model_name = state.model_name.clone();
-                                let target_api = if !resp.api_endpoint.is_empty() {
+                                let target_api = if !resp.api_endpoint.is_empty()
+                                    && !resp.api_endpoint.contains("0.0.0.0")
+                                {
                                     resp.api_endpoint
                                 } else {
-                                    endpoint.clone()
+                                    api_endpoint.clone()
                                 };
                                 self.chat.client = NexusClient::new(target_api.clone());
                                 self.chat.model_name = state.model_name.clone();
@@ -272,10 +280,16 @@ impl HubApp {
                                 ));
                             }
                             Err(e) => {
-                                self.status_message = Some((
-                                    format!("Remote dispatch failed to {}: {}", name, e),
-                                    Color::Red,
-                                ));
+                                let err_str = e.to_string();
+                                let hint = if err_str.contains("error sending request") {
+                                    format!(
+                                        "Remote dispatch failed to {}: no control-plane listener on {}. Is nexus/nexusd running on that device?",
+                                        name, endpoint
+                                    )
+                                } else {
+                                    format!("Remote dispatch failed to {}: {}", name, e)
+                                };
+                                self.status_message = Some((hint, Color::Red));
                             }
                         }
                     }
@@ -291,7 +305,7 @@ impl HubApp {
 
     /// Request model load specifying optional explicit GPU layer offload.
     pub async fn request_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
-        if self.supervisor.is_some() {
+        if self.supervisor.is_running().await {
             self.pending_hot_swap_path = Some(model_path);
         } else {
             self.execute_model_load_with_gpu(model_path, custom_gpu_layers).await;
@@ -300,10 +314,10 @@ impl HubApp {
 
     /// Unload the currently running model and terminate its supervisor process.
     pub async fn unload_active_model(&mut self) {
-        let had_supervisor = self.supervisor.is_some();
-        if let Some(mut sup) = self.supervisor.take() {
+        let had_supervisor = self.supervisor.is_running().await;
+        if had_supervisor {
             info!("Unloading active model supervisor...");
-            let _ = sup.stop().await;
+            let _ = self.supervisor.stop().await;
         }
 
         if had_supervisor || self.active_model_name != "None (Idle)" {
@@ -336,9 +350,9 @@ impl HubApp {
 
     /// Load model process locally with optional GPU layer count override (0 forces CPU mode).
     pub async fn execute_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
-        if let Some(mut old_sup) = self.supervisor.take() {
+        if self.supervisor.is_running().await {
             info!("Unloading active model supervisor...");
-            let _ = old_sup.stop().await;
+            let _ = self.supervisor.stop().await;
         }
 
         let model_name = model_path
@@ -420,11 +434,13 @@ impl HubApp {
         };
 
         info!("Spawning llama-server for model: {:?}", model_path);
-        match ProcessSupervisor::spawn_with_fallback(server_cfg).await {
-            Ok(sup) => {
-                self.supervisor = Some(sup);
+        match self.supervisor.spawn(server_cfg).await {
+            Ok(()) => {
                 self.active_model_name = model_name.clone();
                 self.discovery.set_active_model(&model_name).await;
+                self.discovery
+                    .set_status_flags(crate::discovery::StatusFlags::READY)
+                    .await;
 
                 // Reconfigure chat client to local host
                 let endpoint = format!("http://127.0.0.1:{}", self.config.network.api_port);
@@ -534,7 +550,7 @@ impl HubApp {
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         ];
 
-        if self.supervisor.is_some() {
+        if self.supervisor.is_running_blocking() {
             spans.push(Span::styled(
                 " [u] Unload Model ",
                 Style::default()
@@ -676,6 +692,25 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 /// Launch and execute the main unified hub event loop.
 pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Error>> {
+    let control_addr = SocketAddr::from(([0, 0, 0, 0], hub.config.network.control_port));
+    let control_ctx = Arc::new(
+        ControlPlaneContext::new(
+            hub.discovery.node_uuid(),
+            NodeRole::from_str_role(&hub.config.node.role),
+            hub.supervisor.clone(),
+            hub.config.network.api_host.clone(),
+            hub.config.network.api_port,
+            PathBuf::from(&hub.config.node.llama_server_binary),
+        )
+        .with_discovery(hub.discovery.clone())
+        .with_capabilities(vec!["inference".to_string(), "hub".to_string()]),
+    );
+    let control_handle = spawn_control_plane(control_addr, control_ctx);
+    info!(
+        "Hub control-plane listening on port {}",
+        hub.config.network.control_port
+    );
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -696,30 +731,29 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 }
 
                 // Supervise local model child process
-                if let Some(sup) = &mut hub.supervisor {
-                    match sup.check_status() {
-                        Ok(Some(exit_status)) => {
-                            let err_lines = sup.last_stderr_lines();
-                            let last_err = err_lines.last().map(|s| s.as_str()).unwrap_or("No stderr output captured");
-                            let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
-                            hub.supervisor = None;
-                            hub.discovery.set_active_model("").await;
-                            hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
-                            let msg = format!(
-                                "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
-                                exit_status.code(),
-                                last_err
-                            );
-                            hub.chat.messages.push(ChatMessage::assistant(msg));
-                            hub.status_message = Some((
-                                format!("Local server crashed for '{}' ({:?})", model, exit_status.code()),
-                                Color::Red,
-                            ));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            debug!("Failed to check supervisor status: {}", e);
-                        }
+                match hub.supervisor.check_status().await {
+                    Ok(Some((exit_status, err_lines))) => {
+                        let last_err = err_lines
+                            .last()
+                            .map(|s| s.as_str())
+                            .unwrap_or("No stderr output captured");
+                        let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
+                        hub.discovery.set_active_model("").await;
+                        hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
+                        let msg = format!(
+                            "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
+                            exit_status.code(),
+                            last_err
+                        );
+                        hub.chat.messages.push(ChatMessage::assistant(msg));
+                        hub.status_message = Some((
+                            format!("Local server crashed for '{}' ({:?})", model, exit_status.code()),
+                            Color::Red,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!("Failed to check supervisor status: {}", e);
                     }
                 }
             }
@@ -942,7 +976,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
                                             let peer_uuid = peer.uuid;
                                             let peer_name = format!("Node-{}", &peer_uuid.to_string()[..8]);
-                                            let peer_ep = peer.api_endpoint();
+                                            let peer_ctrl = peer.control_endpoint();
                                             if let Some(m) = hub.models_view.selected_model() {
                                                 let client = reqwest::Client::new();
                                                 let model_name = m.filename.clone();
@@ -955,10 +989,16 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     threads: hub.config.hardware.acceleration.cpu_threads,
                                                     rpc_workers: Vec::new(),
                                                 };
-                                                match crate::control_plane::dispatch_load_model(&client, &peer_ep, &req).await {
+                                                match crate::control_plane::dispatch_load_model(&client, &peer_ctrl, &req).await {
                                                     Ok(resp) if resp.success => {
                                                         hub.active_model_name = model_name.clone();
-                                                        let target_api = if !resp.api_endpoint.is_empty() { resp.api_endpoint } else { peer_ep.clone() };
+                                                        let target_api = if !resp.api_endpoint.is_empty()
+                                                            && !resp.api_endpoint.contains("0.0.0.0")
+                                                        {
+                                                            resp.api_endpoint
+                                                        } else {
+                                                            peer.api_endpoint()
+                                                        };
                                                         hub.chat.client = NexusClient::new(target_api);
                                                         hub.chat.model_name = model_name.clone();
                                                         hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
@@ -976,7 +1016,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     Err(e) => {
                                                         let err_str = e.to_string();
                                                         let hint = if err_str.contains("error sending request") {
-                                                            format!("Dispatch error to {}: node has no active server on port {}. Launch model locally on that device first.", peer_name, peer.api_port)
+                                                            format!(
+                                                                "Dispatch error to {}: no control-plane listener on {} (port {}). Is nexus/nexusd running on that device?",
+                                                                peer_name, peer_ctrl, peer.control_port
+                                                            )
                                                         } else {
                                                             format!("Dispatch error to {}: {}", peer_name, e)
                                                         };
@@ -1104,9 +1147,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Some(mut sup) = hub.supervisor {
+    control_handle.abort();
+    if hub.supervisor.is_running().await {
         info!("Stopping active supervisor process on hub exit...");
-        let _ = sup.stop().await;
+        let _ = hub.supervisor.stop().await;
     }
 
     Ok(())

@@ -550,6 +550,20 @@ impl SupervisorManager {
         }
     }
 
+    /// True when a supervisor child process slot is occupied (may still be starting).
+    pub async fn is_running(&self) -> bool {
+        let lock = self.inner.lock().await;
+        lock.is_some()
+    }
+
+    /// Non-async check for UI rendering (best-effort; treats a held lock as running).
+    pub fn is_running_blocking(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
+    }
+
     /// Check if a supervisor child process is currently running and healthy.
     pub async fn is_healthy(&self) -> bool {
         let lock = self.inner.lock().await;
@@ -570,6 +584,34 @@ impl SupervisorManager {
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "active_model".to_string())
         })
+    }
+
+    /// Poll child process exit status. On exit, returns `(status, last_stderr_lines)`
+    /// and clears the supervisor slot.
+    pub async fn check_status(
+        &self,
+    ) -> Result<Option<(std::process::ExitStatus, Vec<String>)>, std::io::Error> {
+        let mut lock = self.inner.lock().await;
+        if let Some(sup) = lock.as_mut() {
+            match sup.check_status()? {
+                Some(status) => {
+                    let lines = sup.last_stderr_lines();
+                    *lock = None;
+                    Ok(Some((status, lines)))
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Last stderr lines from the active supervisor, if any.
+    pub async fn last_stderr_lines(&self) -> Vec<String> {
+        let lock = self.inner.lock().await;
+        lock.as_ref()
+            .map(|sup| sup.last_stderr_lines())
+            .unwrap_or_default()
     }
 
     /// Spawn a new model supervisor, stopping any previously running instance.

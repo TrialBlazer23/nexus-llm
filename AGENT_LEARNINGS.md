@@ -25,7 +25,17 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
-## 2026-10-06 — Full-System Capability Review: Implemented-But-Unreachable Subsystems
+## 2026-10-06 — Phase 7: control plane HTTP server on dedicated port
+- Category: design-decision
+- Context: Implementing CAPABILITY_REVIEW.md §1.1 + §1.2 (Phase 7 MVP) so remote model load from the TUI can succeed.
+- Finding:
+  1. Serving control routes on `api_port` (8080) collides with llama-server; clients must target a dedicated `network.control_port` (default 9998).
+  2. Beacon v1 is a full 64-byte layout with no spare field for a control port. Advertising `ctrl` via mDNS TXT plus falling back to the local config default for UDP-only peers is enough for Phase 7; a beacon v2 layout is deferred.
+  3. Hub previously owned `Option<ProcessSupervisor>` while handlers used `SupervisorManager`. Without unifying those, a remote load and a local load would manage different subprocess slots.
+  4. `hyper` was only transitive via `reqwest`; an explicit `hyper` + `hyper-util` + `http-body-util` dependency is required for a hand-rolled server and should stay preferred over `axum` to keep the footprint small (AGENTS.md Directive 4 intent).
+- Action: Added `src/control_plane_server.rs`, `network.control_port`, mDNS `ctrl` TXT, `PeerNode::control_endpoint()`, hub/nexusd/worker lifecycle startup, and SupervisorManager as the shared inference owner. Deferred SSE events, pairing, and catalog GET to later phases.
+- Verification: `cargo test --locked` (including new `tests/test_control_plane_server.rs` loopback HTTP round-trips) and `scripts/verify_review_findings.sh` S1.1 positive wiring checks.
+
 - Category: research
 - Context: End-to-end review of the TUI, cross-device control plane, model handling, and model download/transfer paths at commit `213ee12`, recorded in [CAPABILITY_REVIEW.md](CAPABILITY_REVIEW.md).
 - Finding:

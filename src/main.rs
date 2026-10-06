@@ -2,18 +2,20 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
-use nexus::discovery::DiscoveryService;
+use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
+use nexus::discovery::{DiscoveryService, NodeRole};
 use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
 use nexus::sysinfo::SystemProfile;
-use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
 use nexus::ui::chat::{run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
 use nexus::ui::hub::{run_hub_tui, HubApp};
 use nexus::ui::models::scan_models_dir;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -213,11 +215,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
+
+            let api_host = host.unwrap_or_else(|| config.network.api_host.clone());
+            let api_port = port.unwrap_or(config.network.api_port);
+            let supervisor = SupervisorManager::new();
+            let control_ctx = Arc::new(
+                ControlPlaneContext::new(
+                    discovery.node_uuid(),
+                    NodeRole::from_str_role(&config.node.role),
+                    supervisor.clone(),
+                    api_host.clone(),
+                    api_port,
+                    binary.clone(),
+                )
+                .with_discovery(discovery.clone())
+                .with_capabilities(vec!["inference".to_string(), "host".to_string()]),
+            );
+            let control_handle = spawn_control_plane(
+                SocketAddr::from(([0, 0, 0, 0], config.network.control_port)),
+                control_ctx,
+            );
+            println!(
+                "Control-plane listening on port {}",
+                config.network.control_port
+            );
+
             let server_cfg = LlamaServerConfig {
                 binary_path: binary,
                 model_path: model,
-                host: host.unwrap_or(config.network.api_host),
-                port: port.unwrap_or(config.network.api_port),
+                host: api_host,
+                port: api_port,
                 gpu_layers: if config.hardware.acceleration.prefer_gpu {
                     config.hardware.acceleration.gpu_layers
                 } else {
@@ -227,12 +254,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_size: ctx,
                 extra_args: Vec::new(),
             };
-            let mut supervisor = ProcessSupervisor::spawn_with_fallback(server_cfg).await?;
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = supervisor.wait() => {}
+            supervisor.spawn(server_cfg).await?;
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => { break; }
+                    _ = tick.tick() => {
+                        if let Ok(Some(_)) = supervisor.check_status().await {
+                            break;
+                        }
+                    }
+                }
             }
-            supervisor.stop().await?;
+            let _ = supervisor.stop().await;
+            control_handle.abort();
         }
 
         Commands::Info => {
@@ -414,6 +449,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut config = NexusConfig::load().unwrap_or_default();
             config.node.role = "client".to_string();
+            let control_port = config.network.control_port;
+            let api_host = config.network.api_host.clone();
+            let api_port = config.network.api_port;
+            let llama_binary = PathBuf::from(&config.node.llama_server_binary);
 
             // Start discovery service advertising RPC worker readiness
             let discovery = Arc::new(DiscoveryService::new(config, None));
@@ -422,7 +461,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
 
-            println!("Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)", port);
+            // Workers expose a control plane for state probes; model/load may fail
+            // without a local llama-server binary, which is intentional.
+            let supervisor = SupervisorManager::new();
+            let control_ctx = Arc::new(
+                ControlPlaneContext::new(
+                    discovery.node_uuid(),
+                    NodeRole::CLIENT,
+                    supervisor.clone(),
+                    api_host,
+                    api_port,
+                    llama_binary,
+                )
+                .with_discovery(discovery.clone())
+                .with_rpc_ready(true)
+                .with_capabilities(vec!["rpc".to_string(), "worker".to_string()]),
+            );
+            let control_handle = spawn_control_plane(
+                SocketAddr::from(([0, 0, 0, 0], control_port)),
+                control_ctx,
+            );
+            println!(
+                "Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)",
+                port
+            );
+            println!("Control-plane listening on port {}", control_port);
 
             let child = tokio::process::Command::new(&binary)
                 .args(["-H", "0.0.0.0", "-p", &port.to_string(), "-m", &mem.to_string()])
@@ -442,8 +505,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("rpc-server exited: {:?}", exit);
                         }
                     }
+                    control_handle.abort();
+                    let _ = supervisor.stop().await;
                 }
                 Err(e) => {
+                    control_handle.abort();
                     eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", binary, e);
                     std::process::exit(1);
                 }

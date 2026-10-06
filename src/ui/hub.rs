@@ -13,9 +13,13 @@ use crate::ui::chat::{ChatApp, StreamMsg, TransportBadge};
 use crate::ui::cluster_view::ClusterView;
 use crate::ui::models_view::{download_dest_from_url, CatalogRow, ModelsView};
 use crate::ui::settings_view::SettingsView;
+use crate::ui::mouse::{list_row_at, tab_index_at};
 use crate::ui::slash::{self, SlashCommand};
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -31,7 +35,7 @@ use ratatui::{
 use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -141,7 +145,7 @@ pub struct HubApp {
     /// Pending hot-swap: (model path, optional GPU layer override).
     pub pending_hot_swap: Option<(PathBuf, Option<u32>)>,
     pub pending_target_selection: Option<TargetSelectionState>,
-    pub status_message: Option<(String, Color)>,
+    pub status_message: Option<(String, Color, Instant)>,
     /// Cached ADB forward state; refreshed on the 500ms tick.
     pub usb_tunnel_active: bool,
     /// Context window applied to local/remote model loads.
@@ -158,12 +162,22 @@ pub struct HubApp {
 
 impl HubApp {
     pub fn new(config: NexusConfig, client: NexusClient, discovery: Arc<DiscoveryService>) -> Self {
+        // Ensure models_dir exists for first-run (empty pane otherwise).
+        if let Err(e) = std::fs::create_dir_all(&config.node.models_dir) {
+            tracing::warn!(
+                "Failed to create models_dir {:?}: {}",
+                config.node.models_dir,
+                e
+            );
+        }
+
         let mut models_view = ModelsView::new(config.node.models_dir.clone());
         models_view.max_rpc_ram_mb = config.cluster.max_rpc_ram_mb;
         models_view.selected_context = DEFAULT_CONTEXT_SIZE;
         let cluster_view = ClusterView::new(discovery.clone());
         let settings_view = SettingsView::new(config.clone());
-        let chat = ChatApp::new(client, "default", None);
+        let mut chat = ChatApp::new(client, "default", None);
+        chat.set_context_budget(DEFAULT_CONTEXT_SIZE);
 
         Self {
             config,
@@ -190,6 +204,30 @@ impl HubApp {
     fn sync_models_context(&mut self) {
         self.models_view.selected_context = self.selected_context;
         self.models_view.max_rpc_ram_mb = self.config.cluster.max_rpc_ram_mb;
+        self.chat.set_context_budget(self.selected_context);
+    }
+
+    /// Expire non-red status toasts after 5 seconds.
+    pub fn tick_status(&mut self) {
+        if let Some((_, color, created_at)) = &self.status_message {
+            if *color == Color::Red {
+                return;
+            }
+            if created_at.elapsed() >= Duration::from_secs(5) {
+                self.status_message = None;
+            }
+        }
+    }
+
+    /// True while any modal consumes input (ignore mouse clicks).
+    fn modal_open(&self) -> bool {
+        self.pending_hot_swap.is_some()
+            || self.pending_target_selection.is_some()
+            || self.show_help_modal
+            || self.pending_download.is_some()
+            || self.download_progress.is_some()
+            || self.cluster_view.show_info_modal
+            || self.cluster_view.adding_peer
     }
 
     /// Context length limit from the selected catalog row (remote or local).
@@ -216,7 +254,7 @@ impl HubApp {
         self.sync_models_context();
         self.status_message = Some((
             format!("Context size: {} tokens", self.selected_context),
-            Color::Cyan,
+                        Color::Cyan, Instant::now()
         ));
     }
 
@@ -351,8 +389,7 @@ impl HubApp {
             if !catalog_peer_uuids.is_empty() && !catalog_peer_uuids.contains(&p.uuid) {
                 continue;
             }
-            let short_id = p.uuid.to_string();
-            let name = format!("Node-{}", &short_id[..8]);
+            let name = p.friendly_name();
             candidates.push(TargetExecutionNode::Remote {
                 uuid: p.uuid,
                 name,
@@ -389,7 +426,7 @@ impl HubApp {
     pub fn cycle_persona(&mut self) {
         let names = Preset::list_names(&self.config.node.presets_dir);
         if names.is_empty() {
-            self.status_message = Some(("No personas found".to_string(), Color::Yellow));
+            self.status_message = Some(("No personas found".to_string(), Color::Yellow, Instant::now()));
             return;
         }
 
@@ -411,11 +448,11 @@ impl HubApp {
                 );
                 self.status_message = Some((
                     format!("Persona: {} (temp={:.2}, max_tokens={})", preset.name, preset.temperature, preset.max_tokens),
-                    Color::Cyan,
-                ));
+                                Color::Cyan, Instant::now()
+        ));
             }
             Err(e) => {
-                self.status_message = Some((format!("Failed to load persona '{}': {}", next_name, e), Color::Red));
+                self.status_message = Some((format!("Failed to load persona '{}': {}", next_name, e), Color::Red, Instant::now()));
             }
         }
     }
@@ -429,7 +466,7 @@ impl HubApp {
             Ok(SlashCommand::Clear) => {
                 self.chat.messages.clear();
                 self.chat.streaming_response.clear();
-                self.status_message = Some(("Conversation cleared".to_string(), Color::Cyan));
+                self.status_message = Some(("Conversation cleared".to_string(), Color::Cyan, Instant::now()));
             }
             Ok(SlashCommand::Help) => {
                 let help = slash::SLASH_HINTS.join("\n");
@@ -437,7 +474,7 @@ impl HubApp {
                     "Slash commands:\n{}",
                     help
                 )));
-                self.status_message = Some(("Help listed in chat".to_string(), Color::Cyan));
+                self.status_message = Some(("Help listed in chat".to_string(), Color::Cyan, Instant::now()));
             }
             Ok(SlashCommand::Preset(name)) => {
                 match Preset::load_by_name(&name, &self.config.node.presets_dir) {
@@ -454,12 +491,12 @@ impl HubApp {
                         )));
                         self.status_message = Some((
                             format!("Persona: {}", preset.name),
-                            Color::Cyan,
-                        ));
+                                        Color::Cyan, Instant::now()
+        ));
                     }
                     Err(e) => {
                         self.status_message =
-                            Some((format!("Preset '{}': {}", name, e), Color::Red));
+                            Some((format!("Preset '{}': {}", name, e), Color::Red, Instant::now()));
                     }
                 }
             }
@@ -475,7 +512,7 @@ impl HubApp {
                     "Chat host set to {}",
                     ep
                 )));
-                self.status_message = Some((format!("Host: {}", ep), Color::Green));
+                self.status_message = Some((format!("Host: {}", ep), Color::Green, Instant::now()));
             }
             Ok(SlashCommand::Context(n)) => {
                 self.set_context(n);
@@ -485,8 +522,8 @@ impl HubApp {
                 )));
                 self.status_message = Some((
                     format!("Context: {} tokens", self.selected_context),
-                    Color::Cyan,
-                ));
+                                Color::Cyan, Instant::now()
+        ));
             }
             Ok(SlashCommand::Temp(t)) => {
                 self.chat.temperature = t;
@@ -494,10 +531,10 @@ impl HubApp {
                     "Temperature set to {:.2}",
                     t
                 )));
-                self.status_message = Some((format!("temp={:.2}", t), Color::Cyan));
+                self.status_message = Some((format!("temp={:.2}", t), Color::Cyan, Instant::now()));
             }
             Err(e) => {
-                self.status_message = Some((e, Color::Red));
+                self.status_message = Some((e, Color::Red, Instant::now()));
             }
         }
     }
@@ -530,12 +567,12 @@ impl HubApp {
                             Ok(_) => {
                                 self.status_message = Some((
                                     format!("Active on {}: {}", name, model_name),
-                                    Color::Green,
-                                ));
+                                                Color::Green, Instant::now()
+        ));
                                 self.set_tab(HubTab::Chat);
                             }
                             Err(e) => {
-                                self.status_message = Some((e, Color::Red));
+                                self.status_message = Some((e, Color::Red, Instant::now()));
                             }
                         }
                     }
@@ -628,13 +665,13 @@ impl HubApp {
             )));
             self.status_message = Some((
                 format!("Unloaded model '{}'", unloaded_model),
-                Color::Cyan,
-            ));
+                            Color::Cyan, Instant::now()
+        ));
         } else {
             self.status_message = Some((
                 "No local model is currently active to unload".to_string(),
-                Color::Yellow,
-            ));
+                            Color::Yellow, Instant::now()
+        ));
         }
     }
 
@@ -715,7 +752,7 @@ impl HubApp {
                     extra_args = split.build_llama_args();
                 }
                 Err(e) => {
-                    self.status_message = Some((format!("Memory budget error: {}", e), Color::Red));
+                    self.status_message = Some((format!("Memory budget error: {}", e), Color::Red, Instant::now()));
                     return;
                 }
             }
@@ -751,13 +788,13 @@ impl HubApp {
                 )));
 
                 self.status_message =
-                    Some((format!("Active: {}", self.active_model_name), Color::Green));
+                    Some((format!("Active: {}", self.active_model_name), Color::Green, Instant::now()));
                 // Automatically switch to Chat tab!
                 self.set_tab(HubTab::Chat);
             }
             Err(e) => {
                 error!("Failed to launch model supervisor: {}", e);
-                self.status_message = Some((format!("Launch failed: {}", e), Color::Red));
+                self.status_message = Some((format!("Launch failed: {}", e), Color::Red, Instant::now()));
             }
         }
     }
@@ -835,6 +872,17 @@ impl HubApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if let Some((msg, color, _)) = &self.status_message {
+            let toast = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", msg),
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            frame.render_widget(toast, area);
+            return;
+        }
+
         let active_str = format!(
             "Model: {} | Host: {}",
             self.active_model_name,
@@ -899,7 +947,7 @@ impl HubApp {
         match self.active_tab {
             HubTab::Chat => {
                 lines.push(Line::from(Span::styled(
-                    " Chat: Alt+C connect peer  |  Esc abort stream  |  / slash commands",
+                    " Chat: Alt+C connect  |  Esc abort  |  Ctrl+R regenerate  |  / slash commands",
                     Style::default().fg(Color::Yellow),
                 )));
             }
@@ -1165,7 +1213,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
     crate::ui::install_tui_panic_hook();
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1203,6 +1251,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
         tokio::select! {
             _ = refresh_interval.tick() => {
+                hub.tick_status();
                 if hub.active_tab == HubTab::Cluster {
                     hub.cluster_view.refresh().await;
                 }
@@ -1215,7 +1264,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                     for p in peers {
                         let ep = p.control_endpoint();
                         if let Ok(catalog) = control_plane::fetch_models(&client, &ep).await {
-                            let label = format!("Node-{}", &p.uuid.to_string()[..8]);
+                            let label = p.friendly_name();
                             for entry in &catalog.models {
                                 remotes.push(CatalogRow::from_remote(
                                     entry,
@@ -1252,8 +1301,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             hub.chat.messages.push(ChatMessage::status(msg));
                             hub.status_message = Some((
                                 format!("Local server crashed for '{}' ({:?})", model, exit_status.code()),
-                                Color::Red,
-                            ));
+                                            Color::Red, Instant::now()
+        ));
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -1288,19 +1337,72 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.models_view.refresh();
                                 hub.status_message = Some((
                                     "Download complete — models rescanned".to_string(),
-                                    Color::Green,
-                                ));
+                                                Color::Green, Instant::now()
+        ));
                             }
                             Err(e) => {
                                 hub.status_message =
-                                    Some((format!("Download failed: {}", e), Color::Red));
+                                    Some((format!("Download failed: {}", e), Color::Red, Instant::now()));
                             }
                         }
                     }
                 }
             }
             Some(event_res) = event_stream.next() => {
-                if let Ok(Event::Key(key)) = event_res {
+                let Ok(event) = event_res else { continue };
+
+                // Mouse: tab clicks, list selection, chat wheel (ignored while modals open).
+                if let Event::Mouse(mouse) = event {
+                    if !hub.modal_open() {
+                        let area = terminal.size()?;
+                        let full = Rect::new(0, 0, area.width, area.height);
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(3),
+                                Constraint::Min(10),
+                                Constraint::Length(1),
+                            ])
+                            .split(full);
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                if let Some(idx) = tab_index_at(mouse.column, mouse.row, chunks[0], 4)
+                                {
+                                    let tab = match idx {
+                                        0 => HubTab::Chat,
+                                        1 => HubTab::Models,
+                                        2 => HubTab::Cluster,
+                                        _ => HubTab::Settings,
+                                    };
+                                    hub.set_tab(tab);
+                                    if tab == HubTab::Cluster {
+                                        hub.cluster_view.refresh().await;
+                                    }
+                                } else if hub.active_tab == HubTab::Models {
+                                    let n = hub.models_view.catalog.len();
+                                    if let Some(idx) = list_row_at(mouse.row, chunks[1], n) {
+                                        hub.models_view.selected_index = idx;
+                                    }
+                                } else if hub.active_tab == HubTab::Cluster {
+                                    let n = hub.cluster_view.peers.len();
+                                    if let Some(idx) = list_row_at(mouse.row, chunks[1], n) {
+                                        hub.cluster_view.selected_index = idx;
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                                if hub.active_tab == HubTab::Chat =>
+                            {
+                                hub.chat.handle_mouse_scroll(mouse.kind);
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+
+                let Event::Key(key) = event else { continue };
+
                     // Global quit: Ctrl+C
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                         break;
@@ -1329,7 +1431,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                             KeyCode::Esc => {
                                 hub.pending_target_selection = None;
-                                hub.status_message = Some(("Target selection cancelled".to_string(), Color::DarkGray));
+                                hub.status_message = Some(("Target selection cancelled".to_string(), Color::DarkGray, Instant::now()));
                                 continue;
                             }
                             _ => {
@@ -1345,7 +1447,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.execute_model_load_with_gpu(target_path, gpu_layers).await;
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                hub.status_message = Some(("Hot-swap cancelled".to_string(), Color::DarkGray));
+                                hub.status_message = Some(("Hot-swap cancelled".to_string(), Color::DarkGray, Instant::now()));
                             }
                             _ => {
                                 hub.pending_hot_swap = Some((target_path, gpu_layers));
@@ -1436,7 +1538,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.previous_tab();
                             } else if key.code == KeyCode::Esc {
                                 if hub.chat.abort_stream() {
-                                    hub.status_message = Some(("Generation aborted".to_string(), Color::Yellow));
+                                    hub.status_message = Some(("Generation aborted".to_string(), Color::Yellow, Instant::now()));
                                 }
                             } else if key.modifiers.contains(KeyModifiers::CONTROL) && (key.code == KeyCode::Char('u') || key.code == KeyCode::Char('U')) {
                                 hub.unload_active_model().await;
@@ -1460,12 +1562,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     hub.chat.model_name = model.clone();
                                     hub.chat.transport_badge = TransportBadge::Wifi;
                                     hub.active_model_name = model.clone();
-                                    hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green));
+                                    hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green, Instant::now()));
                                     hub.chat.messages.push(ChatMessage::status(format!(
                                         "Connected to active cluster host at {}. Ready for chat.", ep
                                     )));
                                 } else {
-                                    hub.status_message = Some(("No active cluster host found".to_string(), Color::Yellow));
+                                    hub.status_message = Some(("No active cluster host found".to_string(), Color::Yellow, Instant::now()));
                                 }
                             } else {
                                 hub.chat.handle_key_input(key, &tx);
@@ -1510,8 +1612,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.cluster_view.add_peer_input.clear();
                                             hub.cluster_view.status_message = Some((
                                                 format!("Static peer '{}' added & probed", input),
-                                                Color::Green,
-                                            ));
+                                                            Color::Green
+        ));
                                             hub.cluster_view.refresh().await;
                                         } else {
                                             hub.cluster_view.cancel_add_peer();
@@ -1552,10 +1654,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.chat.model_name = model.clone();
                                             hub.chat.transport_badge = TransportBadge::Wifi;
                                             hub.active_model_name = model.clone();
-                                            hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
+                                            hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green, Instant::now()));
                                             hub.chat.messages.push(ChatMessage::status(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
-                                                peer.uuid, ep
+                                                peer.friendly_name(), ep
                                             )));
                                             hub.set_tab(HubTab::Chat);
                                         } else {
@@ -1564,8 +1666,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
-                                            let peer_uuid = peer.uuid;
-                                            let peer_name = format!("Node-{}", &peer_uuid.to_string()[..8]);
+                                            let peer_name = peer.friendly_name();
                                             let peer_ep = peer.control_endpoint();
                                             let peer_control_port = peer.control_port;
                                             let model_name = hub
@@ -1588,6 +1689,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                         hub.status_message = Some((
                                                             format!("Active on {}: {}", peer_name, model_name),
                                                             Color::Green,
+                                                            Instant::now(),
                                                         ));
                                                         hub.set_tab(HubTab::Chat);
                                                     }
@@ -1611,9 +1713,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Char('w') | KeyCode::Char('W') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
                                             let ep = peer.api_endpoint();
-                                            let short_id = &peer.uuid.to_string()[..8];
+                                            let label = peer.friendly_name();
                                             hub.cluster_view.status_message = Some((
-                                                format!("Requested Node-{} at {} to stand by for RPC worker offload", short_id, ep),
+                                                format!(
+                                                    "Requested {} at {} to stand by for RPC worker offload",
+                                                    label, ep
+                                                ),
                                                 Color::Cyan,
                                             ));
                                         }
@@ -1624,7 +1729,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         let local_ep = format!("http://127.0.0.1:{}", hub.config.network.api_port);
                                         hub.chat.client = NexusClient::new(local_ep.clone());
                                         hub.refresh_transport_badge();
-                                        hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
+                                        hub.status_message = Some((
+                                            "Reset chat target to local node".to_string(),
+                                            Color::Green,
+                                            Instant::now(),
+                                        ));
                                         hub.chat.messages.push(ChatMessage::status(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
                                     }
                                     KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
@@ -1667,7 +1776,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                 hub.chat.client = NexusClient::new(host.clone());
                                             }
                                             hub.discovery.set_mdns_enabled(hub.config.network.discovery.mdns.enabled).await;
-                                            hub.status_message = Some(("Settings saved & hot-reloaded".to_string(), Color::Green));
+                                            hub.status_message = Some(("Settings saved & hot-reloaded".to_string(), Color::Green, Instant::now()));
                                         }
                                     }
                                     KeyCode::Tab => hub.next_tab(),
@@ -1677,7 +1786,6 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                         }
                     }
-                }
             }
             Some(stream_msg) = rx.recv() => {
                 match stream_msg {
@@ -1713,7 +1821,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
     // Cleanup terminal on exit
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     if let Some(mut sup) = hub.supervisor {

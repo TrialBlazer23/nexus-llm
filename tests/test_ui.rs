@@ -294,3 +294,79 @@ fn test_markdown_rendering_and_boxed_code() {
     );
 }
 
+
+#[test]
+fn test_scroll_offset_usize_no_wrap() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    app.auto_scroll = false;
+    app.scroll_offset = 70_000;
+    assert_eq!(app.scroll_offset, 70_000);
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| app.render(f))
+        .expect("large scroll_offset must not panic at Paragraph::scroll");
+}
+
+#[test]
+fn test_context_header_chunks_label() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", Some("sys".into()));
+    app.set_context_budget(4096);
+    app.messages.push(ChatMessage::user("hello world this is a prompt"));
+    app.is_streaming = true;
+    app.tokens_per_sec = 12.5;
+    app.stream_start_time = Some(Instant::now());
+
+    let used = app.estimated_context_used();
+    assert!(used > 0);
+    assert_eq!(ChatApp::context_usage_color(100, 4096), ratatui::style::Color::Green);
+    assert_eq!(ChatApp::context_usage_color(3000, 4096), ratatui::style::Color::Yellow);
+    assert_eq!(ChatApp::context_usage_color(3900, 4096), ratatui::style::Color::Red);
+
+    let backend = TestBackend::new(200, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("chunks/s"), "rate must be labeled chunks/s not tok/s");
+    assert!(
+        content.contains("4096") && (content.contains("ctx") || content.contains("/ ")),
+        "header must show context budget fraction; got snippet without budget. content_len={}",
+        content.len()
+    );
+}
+
+#[tokio::test]
+async fn test_regenerate_and_enter_while_streaming() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    let (tx, _rx) = mpsc::channel(8);
+
+    app.messages.push(ChatMessage::user("prompt"));
+    app.messages.push(ChatMessage::assistant("old answer"));
+    app.messages.push(ChatMessage::status("note"));
+
+    assert!(app.regenerate_last(&tx));
+    assert!(app.is_streaming);
+    assert_eq!(app.messages.len(), 1);
+    assert_eq!(app.messages[0].role, "user");
+
+    // Enter while streaming must refuse visibly
+    app.handle_key_input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(
+        app.status_message
+            .as_ref()
+            .unwrap()
+            .contains("Busy"),
+        "Enter while streaming must set refuse status"
+    );
+
+    // Mid-stream regenerate refuses
+    assert!(!app.regenerate_last(&tx));
+    assert!(app.status_message.as_ref().unwrap().contains("Busy"));
+}

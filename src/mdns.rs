@@ -41,10 +41,11 @@ impl MdnsBackend {
         role: NodeRole,
         capabilities: &[String],
         address: IpAddr,
+        display_name: Option<&str>,
     ) -> Result<(), MdnsError> {
         let capability_list = capabilities.join(",");
         let cluster = cluster_id.map(|id| id.to_string()).unwrap_or_default();
-        let properties = HashMap::from([
+        let mut properties = HashMap::from([
             ("id".to_string(), node_id.to_string()),
             ("cluster".to_string(), cluster),
             ("proto".to_string(), "1".to_string()),
@@ -54,6 +55,12 @@ impl MdnsBackend {
             ("rpc".to_string(), rpc_port.to_string()),
             ("ctrl".to_string(), control_port.to_string()),
         ]);
+        if let Some(name) = display_name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && trimmed != "auto" {
+                properties.insert("name".to_string(), trimmed.to_string());
+            }
+        }
         let info = ServiceInfo::new(
             service_type,
             instance_name,
@@ -157,6 +164,14 @@ fn endpoint_from_resolved(
         .get("caps")
         .map(|caps| caps.split(',').filter(|cap| !cap.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
+    let display_name = properties.get("name").and_then(|n| {
+        let trimmed = n.trim();
+        if trimmed.is_empty() || trimmed == "auto" {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     Ok(ServiceEndpoint {
         node_id,
@@ -168,6 +183,7 @@ fn endpoint_from_resolved(
         api_port,
         rpc_port,
         control_port,
+        display_name,
     })
 }
 

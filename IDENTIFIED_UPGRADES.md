@@ -2,7 +2,7 @@
 
 ## Status legend
 
-- ✅ **Done** — shipped (Phase 1: `cursor/phase1-p0-bugs-probe-cache-80f9`; Phase 2: `cursor/phase2-model-loop-0d08`; Phase 3: `cursor/phase3-completeness-6a2f`)
+- ✅ **Done** — shipped (Phase 1: `cursor/phase1-p0-bugs-probe-cache-80f9`; Phase 2: `cursor/phase2-model-loop-0d08`; Phase 3: `cursor/phase3-completeness-6a2f`; Phase 4: `cursor/phase4-polish-e793`)
 - ⬜ **Open** — not yet implemented
 
 ---
@@ -43,7 +43,7 @@
 **10. ✅ In-TUI downloads.** ~~Empty Models tab was a dead end.~~
 **Done:** Models `[D]` opens a URL modal; `ModelDownloader` runs with a progress Gauge into `models_dir`; empty state tells operators to press `D` or use `nexus download --help`.
 
-**11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running.
+**11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running. *(Deferred past Phase 4 polish.)*
 
 **12. ✅ Unify the two remote-dispatch code paths.** ~~Duplicated `ModelLoadRequest` construction.~~
 **Done:** `HubApp::dispatch_remote_load` shared by target-selection Remote arm and Cluster `L`; callers map errors to hub vs cluster status (Cluster keeps connection-refused hint).
@@ -61,12 +61,14 @@
 **15. ✅ Stop filtering banners by string prefix.** ~~Prefix-based `is_conversation_message`.~~
 **Done:** `ChatMessage::status` (`role: "status"`) for UI chrome; API filter drops status by role; history renders `[Status]` dim/italic. User text like `Model 'x' is great` is preserved.
 
-**16. ⬜ Generation context display.** You track tokens/s — also show token count vs. context budget (`1,240 / 4,096 ctx`), ideally colored as it approaches the limit, since llama.cpp silently truncates. And label the metric honestly: you're counting SSE chunks, which is usually tokens for llama-server, but say "tok/s" only if verified.
+**16. ✅ Generation context display.** ~~SSE rate labeled as tokens/s; no used/budget.~~
+**Done:** Header shows `{used}/{budget} ctx` (char/4 estimate) with yellow ≥70% / red ≥90%; live rate labeled `chunks/s` (SSE chunk count). `ChatApp::context_budget` synced from Hub `selected_context`.
 
 **17. ✅ Markdown-ish rendering.** ~~Assistant output was raw text.~~
 **Done:** `ui/markdown.rs` + `pulldown-cmark` with fenced code boxes, bold/italic/headers; chat history and streaming use `render_markdown`. Status lines stay plain.
 
-**18. ⬜ Retry/regenerate + clear.** `[R]`egenerate last response (pop last assistant message, resend) and `/clear` are the two most-missed chat affordances. Also: pressing Enter while streaming should queue or visibly refuse — right now input is silently ignored. *(`/clear` now exists via #14; regenerate remains open.)*
+**18. ✅ Retry/regenerate + clear.** ~~No regenerate; Enter while streaming silently ignored.~~
+**Done:** Chat `Ctrl+R` → `regenerate_last` (pop trailing status + last assistant, resend). Enter while streaming sets visible "Busy — Esc to abort, or wait". `/clear` already from #14.
 
 ---
 
@@ -75,18 +77,23 @@
 **19. ✅ Consistent keybinding scheme.** ~~Bare `1–4` conflicted with Chat digits; no help modal.~~
 **Done:** Global tabs are F1–F4 / Alt+1–4 / Tab / BackTab only (bare digits removed from Models/Cluster/Settings). Models `D` = download; Cluster `D` = disconnect. `?` / F12 opens a per-tab help modal; footer shows `[?] Help`. Chat connect remains Alt+C.
 
-**20. ⬜ Status messages that expire.** `status_message` persists until overwritten — a stale green "Active: model-x" survives the model crashing. Add timestamps and auto-clear info/success messages after 5s (keep errors until dismissed).
+**20. ✅ Status messages that expire.** ~~Hub `status_message` written but never rendered; toasts never expired.~~
+**Done:** Footer renders hub toast when set; non-red messages auto-clear after 5s on the 500ms tick (`tick_status`); Red stays sticky.
 
 **21. ✅ `SystemProfile::probe()` runs every frame.** ~~`render_model_details` called it inside `render()`.~~
 **Done:** `ModelsView` caches `cached_profile` and exposes `refresh_profile()`; Hub refreshes it on the existing 500ms tick when the Models tab is active (same pattern as `ClusterView::refresh`).
 
-**22. ⬜ Scroll offset overflow.** `scroll_offset: u16` + `total_lines() as u16` truncates at 65,535 lines — reachable in a long chat with code output. Use `usize` internally, clamp to `u16` only at the `Paragraph::scroll` call.
+**22. ✅ Scroll offset overflow.** ~~`scroll_offset: u16` truncated at 65,535.~~
+**Done:** `scroll_offset: usize` with scroll math in `usize`; clamped to `u16::MAX` only at `Paragraph::scroll`.
 
-**23. ⬜ Mouse support.** No `EnableMouseCapture` anywhere. With ratatui/crossterm this is 30 lines: click to select tabs/models/peers, scroll wheel for chat history. Optional, but cheap and expected in modern TUIs.
+**23. ✅ Mouse support.** ~~No `EnableMouseCapture`.~~
+**Done:** Hub + standalone chat enable mouse capture; `ui/mouse.rs` hit-tests for tab / list clicks; wheel scrolls chat. Mouse ignored while modals are open. Panic hook already disables mouse.
 
-**24. ⬜ Friendly peer names.** Remote candidates show as `Node-<uuid8>` even though `config.node` has an identity name. Advertise the configured name in the discovery beacon (there's room in/around the 64-byte payload or via mDNS TXT) and fall back to the UUID prefix only if absent.
+**24. ✅ Friendly peer names.** ~~Always `Node-<uuid8>`.~~
+**Done:** mDNS TXT `name=` advertises `config.node.name` (when set and not `auto`); `PeerNode.display_name` + `friendly_name()`. Beacon wire format unchanged (no spare bytes). UDP-only peers keep `Node-{uuid8}` fallback.
 
-**25. ⬜ Small robustness wins.** Terminal resize: you're fine (loop redraws), but `frame.render_widget(Clear, ...)` for modals — verify both modals clear first (target-selection does; check hot-swap). And on startup, if `models_dir` doesn't exist, create it or offer to — first-run experience currently shows an empty pane.
+**25. ✅ Small robustness wins.** ~~Missing `models_dir` → empty pane; modal Clear audit.~~
+**Done:** All Hub/Cluster modals already `Clear` first. `HubApp::new` and `nexusd` call `create_dir_all` on `models_dir` (warn on failure, no panic).
 
 ---
 
@@ -97,4 +104,4 @@
 | 1 | #1–#6 (bugs) + #21 | Restores promised behavior, cheap | ✅ Complete |
 | 2 | #7, #8, #12, #14, #15 | Core model-handling loop becomes trustworthy | ✅ Complete |
 | 3 | #9, #10, #13, #17, #19 | Completeness: remote catalogs, downloads, real input | ✅ Complete |
-| 4 | #16, #18, #20, #22–#25 | Polish | ⬜ Open |
+| 4 | #16, #18, #20, #22–#25 | Polish | ✅ Complete |

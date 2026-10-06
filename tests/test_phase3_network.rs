@@ -19,7 +19,8 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         api_port: 8080,
         rpc_port: 50052,
                 control_port: 8081,
-    }
+                display_name: None,
+        }
 }
 
 #[test]
@@ -144,7 +145,8 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         backend: nexus::sysinfo::AccelerationBackend::X86Baseline,
         thermal_index: 20,
         active_model: String::new(),
-        last_seen: now,
+        display_name: None,
+                last_seen: now,
     };
     discovery
         .peers()
@@ -201,7 +203,8 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             backend: nexus::sysinfo::AccelerationBackend::Vulkan,
             thermal_index: 0,
             active_model: String::new(),
-            last_seen: Instant::now(),
+            display_name: None,
+                last_seen: Instant::now(),
         },
     );
 

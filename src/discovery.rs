@@ -34,6 +34,8 @@ pub struct ServiceEndpoint {
     pub rpc_port: u16,
     /// Control-plane HTTP port (catalog / load / unload). Defaults to 8081 when unknown.
     pub control_port: u16,
+    /// Optional friendly display name from mDNS TXT `name=`.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +316,9 @@ pub struct PeerNode {
     pub backend: AccelerationBackend,
     pub thermal_index: u8,
     pub active_model: String,
+    /// Optional friendly name from mDNS TXT (beacon has no room for names).
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
 }
@@ -333,6 +338,18 @@ pub struct RpcCandidate {
 }
 
 impl PeerNode {
+    /// Operator-facing label: configured mDNS name, else `Node-{uuid8}`.
+    pub fn friendly_name(&self) -> String {
+        if let Some(name) = self.display_name.as_ref() {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && trimmed != "auto" {
+                return trimmed.to_string();
+            }
+        }
+        let id = self.uuid.to_string();
+        format!("Node-{}", &id[..8.min(id.len())])
+    }
+
     pub fn api_endpoint(&self) -> String {
         format!("http://{}:{}", self.addr.ip(), self.api_port)
     }
@@ -360,6 +377,7 @@ impl PeerNode {
             api_port: self.api_port,
             rpc_port: self.rpc_port,
             control_port: self.control_port,
+            display_name: self.display_name.clone(),
         }
     }
 }
@@ -791,6 +809,10 @@ impl DiscoveryService {
                                         "Received valid beacon from {:?} ({:?})",
                                         peer_addr, beacon.uuid
                                     );
+                                    let existing_name = {
+                                        let peers = self.peers.read().await;
+                                        peers.get(&beacon.uuid).and_then(|p| p.display_name.clone())
+                                    };
                                     let peer = PeerNode {
                                         uuid: beacon.uuid,
                                         addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
@@ -804,6 +826,7 @@ impl DiscoveryService {
                                         backend: beacon.backend,
                                         thermal_index: beacon.thermal_index,
                                         active_model: beacon.active_model,
+                                        display_name: existing_name,
                                         last_seen: Instant::now(),
                                     };
 
@@ -1006,6 +1029,9 @@ impl DiscoveryService {
             existing.api_port = endpoint.api_port;
             existing.rpc_port = endpoint.rpc_port;
             existing.control_port = endpoint.control_port;
+            if let Some(name) = &endpoint.display_name {
+                existing.display_name = Some(name.clone());
+            }
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
@@ -1039,6 +1065,7 @@ impl DiscoveryService {
                 backend: AccelerationBackend::GenericCpu,
                 thermal_index: 0,
                 active_model: String::new(),
+                display_name: endpoint.display_name.clone(),
                 last_seen: Instant::now(),
             };
             peers.insert(endpoint.node_id, peer.clone());
@@ -1115,6 +1142,7 @@ impl DiscoveryService {
                 role,
                 &caps,
                 local_ip,
+                Some(this.config.node.name.as_str()),
             ) {
                 warn!("Failed to register mDNS service: {}", e);
                 *this.mdns_health.write().await = BackendHealth::Failed;

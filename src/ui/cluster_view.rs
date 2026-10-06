@@ -350,8 +350,7 @@ impl ClusterView {
                 peer.active_model.clone()
             };
 
-            let short_id = peer.uuid.to_string();
-            let label = format!("{}{}", cursor, &short_id[..13]);
+            let label = format!("{}{}", cursor, peer.friendly_name());
 
             let row_style = if is_selected {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -445,7 +444,7 @@ impl ClusterView {
 
         let lines = vec![
             Line::from(vec![Span::styled(
-                format!(" Node Inspection: {}", peer.uuid),
+                format!(" Node Inspection: {}", peer.friendly_name()),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),

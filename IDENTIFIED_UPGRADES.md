@@ -2,7 +2,7 @@
 
 ## Status legend
 
-- ✅ **Done** — shipped in Phase 1 (`cursor/phase1-p0-bugs-probe-cache-80f9`)
+- ✅ **Done** — shipped (Phase 1: `cursor/phase1-p0-bugs-probe-cache-80f9`; Phase 2: `cursor/phase2-model-loop-0d08`)
 - ⬜ **Open** — not yet implemented
 
 ---
@@ -31,9 +31,11 @@
 
 ## 🟠 P1 — Model handling (the "complete and effective" part)
 
-**7. ⬜ Show fit-per-target in the node selection modal.** The modal lists candidates with free RAM, but doesn't say whether *this model* fits there. You already compute `[OK]/[RPC]/[OOM]` badges for the local host — extend that to each candidate (you have `free_ram_mb` from beacons): `✅ fits`, `⚠️ needs RPC offload`, `❌ won't fit`. This turns the modal from a list into a decision tool, which is your project's core pitch.
+**7. ✅ Show fit-per-target in the node selection modal.** ~~Modal listed free RAM only.~~
+**Done:** Shared `cluster::ModelFit::{Fits,NeedsRpc,WontFit}` classifies each candidate from required MB (weights+KV at `selected_context`) vs host LMK budget and `config.cluster.max_rpc_ram_mb`. Modal shows `✅ fits` / `⚠️ needs RPC` / `❌ won't fit`; Models list `[OK]`/`[RPC]`/`[OOM]` uses the same classifier (no more hardcoded `10300`).
 
-**8. ⬜ Kill the magic numbers.** `10300` MB as the RPC/OOM threshold (models_view), `4096` context (hub.rs, 4+ call sites), `0.7` temp / `2048` max_tokens (chat.rs), `99` GPU layers — all hardcoded. Context size especially should be per-model adjustable (a `+`/`-` or `[C]` context selector in the model details pane, defaulting from the GGUF's `context_length` metadata you already parse, capped by the KV budget math you already have). *(Partial: Hub chat temp/max_tokens now come from the active persona; context size and other magic numbers remain.)*
+**8. ✅ Kill the magic numbers.** ~~`10300`, bare `4096`/`99` in Hub load paths.~~
+**Done:** Dynamic host+RPC budgets; `HubApp::selected_context` (default 4096) with Models `[+/-]` and `/context`; remote/local loads use `selected_context` and `config.hardware.acceleration.gpu_layers` (via `configured_gpu_layers()`). Temp/max_tokens remain on `ChatApp` (Phase 1 personas + `/temp`).
 
 **9. ⬜ Remote model awareness.** Right now you can only browse *local* `.gguf` files, and remote-load blindly hopes the peer has the same file. Add a `GET /cluster/models` control-plane endpoint so the Models tab can show a merged view: local models + each peer's models (with host column). That also completes the long-term fix for #4 — you'd dispatch a path the peer actually has. Longer term: a `push`-style model transfer or a shared "download on target" command.
 
@@ -41,7 +43,8 @@
 
 **11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running.
 
-**12. ⬜ Unify the two remote-dispatch code paths.** `execute_target_selection` (Remote arm) and the Cluster-view `L` handler duplicate the same `ModelLoadRequest` construction with divergent error handling. Extract one `dispatch_remote_load(peer, model, params) -> Result<...>` helper so fixes apply once.
+**12. ✅ Unify the two remote-dispatch code paths.** ~~Duplicated `ModelLoadRequest` construction.~~
+**Done:** `HubApp::dispatch_remote_load` shared by target-selection Remote arm and Cluster `L`; callers map errors to hub vs cluster status (Cluster keeps connection-refused hint).
 
 ---
 
@@ -49,15 +52,17 @@
 
 **13. ⬜ Real input editing.** The input box only supports push/pop of chars — no cursor, no Left/Right/Home/End, no Ctrl+W/Ctrl+U, no multiline, no prompt history. Add at minimum: cursor movement + prompt history on `Alt+↑/↓` (since ↑/↓ scroll). Consider `tui-textarea` rather than hand-rolling — it's a small dependency and handles paste properly (bracketed paste currently sprays `Char` events).
 
-**14. ⬜ Slash-command system.** `/unload` is special-cased as a raw string compare in the hub's key router — the only command, and invisible to users. Add a `SlashCommand` parser (`/unload`, `/preset <name>`, `/host <endpoint>`, `/context <n>`, `/temp <f>`, `/clear`, `/help`) with a `/`-triggered hint popup. This is also the natural UI companion to #1: `/preset coder` applies `presets/coder.yaml`'s system prompt + temperature to the hub chat.
+**14. ✅ Slash-command system.** ~~Only `/unload` special-cased.~~
+**Done:** `ui/slash.rs` parser + `/`-triggered hint popup; Hub Chat Enter dispatches `/unload`, `/preset`, `/host`, `/context`, `/temp`, `/clear`, `/help`.
 
-**15. ⬜ Stop filtering banners by string prefix.** `is_conversation_message` drops any message starting with `"Model '"`, `"Connected to"`, `"⚠️"`, etc. — fragile (a *user* typing "Model 'x' is great" loses their message) and format-coupled. Give status events their own role (`Role::System`-style enum or a separate `events: Vec<StatusEvent>` rendered inline) so conversation history is cleanly separated from UI chrome.
+**15. ✅ Stop filtering banners by string prefix.** ~~Prefix-based `is_conversation_message`.~~
+**Done:** `ChatMessage::status` (`role: "status"`) for UI chrome; API filter drops status by role; history renders `[Status]` dim/italic. User text like `Model 'x' is great` is preserved.
 
 **16. ⬜ Generation context display.** You track tokens/s — also show token count vs. context budget (`1,240 / 4,096 ctx`), ideally colored as it approaches the limit, since llama.cpp silently truncates. And label the metric honestly: you're counting SSE chunks, which is usually tokens for llama-server, but say "tok/s" only if verified.
 
 **17. ⬜ Markdown-ish rendering.** Assistant output renders as raw text — fenced code blocks lose all affordance. Even lightweight styling (dim the ` fences, background-color code spans, bold headers) makes long coding answers dramatically more readable. `tui-markdown` or a small custom highlighter.
 
-**18. ⬜ Retry/regenerate + clear.** `[R]`egenerate last response (pop last assistant message, resend) and `/clear` are the two most-missed chat affordances. Also: pressing Enter while streaming should queue or visibly refuse — right now input is silently ignored.
+**18. ⬜ Retry/regenerate + clear.** `[R]`egenerate last response (pop last assistant message, resend) and `/clear` are the two most-missed chat affordances. Also: pressing Enter while streaming should queue or visibly refuse — right now input is silently ignored. *(`/clear` now exists via #14; regenerate remains open.)*
 
 ---
 
@@ -85,6 +90,6 @@
 | Phase | Items | Why | Status |
 | --- | --- | --- | --- |
 | 1 | #1–#6 (bugs) + #21 | Restores promised behavior, cheap | ✅ Complete |
-| 2 | #7, #8, #12, #14, #15 | Core model-handling loop becomes trustworthy | ⬜ Next |
-| 3 | #9, #10, #13, #17, #19 | Completeness: remote catalogs, downloads, real input | ⬜ Open |
+| 2 | #7, #8, #12, #14, #15 | Core model-handling loop becomes trustworthy | ✅ Complete |
+| 3 | #9, #10, #13, #17, #19 | Completeness: remote catalogs, downloads, real input | ⬜ Next |
 | 4 | #16, #18, #20, #22–#25 | Polish | ⬜ Open |

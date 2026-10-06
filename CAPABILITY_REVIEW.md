@@ -36,7 +36,8 @@ inert — are mechanically reproducible:
 | Zero-config host resolution (`find_best_host` fallback + hub discovery) | **Done** | `src/client.rs`, hub bootstrap in `src/main.rs` |
 | File logging + `nexus doctor` | **Done** | `src/logging.rs`, `src/doctor.rs` |
 | Settings displayed ⇒ consumed | **Done** for Settings UI | wired ram%/mmap/enable_rpc/prefer_adb/rpc binary/name; hid FallbackCpu; added control_port |
-| `GET /models`, SSE `/events` | **Deferred** | Phase 10 / later |
+| `GET /models` (filename catalog) | **Done** (restored on main merge) | `control_plane_server` GET `/nexus/control/v1/models` |
+| SSE `/events` | **Deferred** | later |
 | `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
 | Peer registry as runtime SoT | **Done** | `src/registry_runtime.rs`, `src/discovery.rs`, Cluster UI |
 | TUI responsiveness / hub split | **Done — Phase 8** | `src/ui/hub/` command/event + ChatEntry |
@@ -59,8 +60,9 @@ The five findings that mattered most at review time (with current status):
    PR #9).** `src/control_plane_server.rs` (hyper) serves
    `POST /nexus/control/v1/{state,model/load,model/unload}` on
    `network.control_port` (default 9998) from hub, nexusd, host, and worker.
-   `SupervisorManager` is the shared inference owner. Still deferred:
-   `GET /models`, SSE `/events`. **`POST /pair` and signed POSTs are Done (Phase 9).**
+   `SupervisorManager` is the shared inference owner. `GET /models` catalog is
+   available (filename-based; content digests are Phase 10). SSE `/events` still
+   deferred. **`POST /pair` and signed POSTs are Done (Phase 9).**
 
 2. ~~**Auto-discovery of a chat host cannot succeed with a default config.**~~
    **Resolved (Phase 7 remainder / PR #10).** `resolve_from_discovery` prefers a

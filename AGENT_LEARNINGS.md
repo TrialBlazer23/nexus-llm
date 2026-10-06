@@ -25,6 +25,21 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Full-System Capability Review: Implemented-But-Unreachable Subsystems
+- Category: research
+- Context: End-to-end review of the TUI, cross-device control plane, model handling, and model download/transfer paths at commit `213ee12`, recorded in [CAPABILITY_REVIEW.md](CAPABILITY_REVIEW.md).
+- Finding:
+  1. The dominant defect class is not bad code but unreachable code. `handle_load_model`/`handle_unload_model`/`fetch_state`/`dispatch_unload_model` (`src/control_plane.rs`), the entire `PeerRegistry` lifecycle (`expire`, `remove_terminal`, `mark_verified`, `eligible_rpc_peers`), `Preset::format_prompt`, `NexusClient::complete_chat`, `TunnelView`, and `ModelDownloader` (outside the CLI) have no callers in `src/`. No HTTP server binds the control-plane paths, so every remote model-load path in `src/ui/hub.rs` dispatches to an endpoint that cannot answer.
+  2. `cargo test` passed all 73 tests against this state, because the tests call library functions directly rather than driving behavior through `main.rs`/`nexusd` entry points. A green suite is not evidence that a documented feature is reachable.
+  3. Ten configuration fields are read and written only by `src/ui/settings_view.rs` and never consulted elsewhere: `node.name`, `node.runtime_role`, `node.capabilities`, `acceleration.fallback_to_cpu`, `acceleration.cpu_threads_batch`, `safety.mmap`, `safety.mlock`, `safety.max_ram_usage_percent`, `cluster.enable_rpc`, `cluster.prefer_adb_tunnel`. `SystemProfile::max_allowed_memory_bytes` hardcodes 75% and ignores `safety.max_ram_usage_percent` because `SystemProfile` has no access to config.
+  4. `NexusClient::resolve_from_discovery` only consults `resolve_primary_compute_anchor`, which returns `None` unless `network.anchors.primary_compute_id` is set. The default config therefore cannot auto-discover a host; the migration to pinned anchors deprecated `find_best_host` without replacing the zero-config path.
+  5. `src/main.rs` installs no `tracing` subscriber, so every log line emitted in TUI mode is discarded. Only `src/daemon.rs` configures one.
+  6. Hardcoded device constants survive outside `cluster.rs` despite Directive 3: `config.rs::validate()` rejects `cluster.max_rpc_ram_mb > 1800` (a Core 2 Duo limit enforced globally, so a 32 GB worker's config will not load), and `models_view.rs` compares against a bare `10300` MB for badge colors.
+  7. `src/ui/models_view.rs::render_model_details` calls `GgufMetadata::open()` and `SystemProfile::probe()` inside render, so a multi-megabyte tokenizer array is parsed several times per second. `src/gguf.rs` is documented as "zero-copy" but materializes every metadata array, and sizes `HashMap::with_capacity`/`Vec::with_capacity`/`vec![0u8; len]` directly from file-supplied lengths, so a corrupt GGUF can abort the process.
+  8. `message_metrics` is a `Vec` parallel to `messages` indexed positionally at render time; `src/ui/hub.rs` lines 256–257, 316, 439–440, and 713 mutate `messages` without the matching metrics operation, permanently misaligning telemetry badges.
+- Action: Recorded findings, proposals, and a Phase 7–12 plan in `CAPABILITY_REVIEW.md`. Two rules worth carrying forward: (a) treat "reachable from a user action" as an acceptance criterion alongside "unit tested", and build a fake `llama-server` harness so integration tests can drive real entry points; (b) when a config field is added to `SettingsView`, the same change must wire it into behavior or it must not be displayed.
+- Verification: Claims were each confirmed by `rg` over `src/` and `tests/` for call sites, and by reading the cited files. Baseline recorded: `cargo test` 73 passing, `cargo clippy --all-targets` 19 lib warnings and 0 errors, no CI workflows in `.github/`. The proposals themselves are unimplemented and unverified.
+
 ## 2026-10-05 — Chat TUI Overhaul: Pure-Rust Markdown, Cursor Ergonomics, Stream Abort, and Telemetry Badges
 - Category: design-decision
 - Context: Upgrading the interactive Chat TUI (`src/ui/chat.rs`) following successful cross-device GPU offload across Snapdragon 8 Gen 2 and legacy MacBook nodes.

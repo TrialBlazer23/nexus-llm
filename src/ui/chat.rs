@@ -16,6 +16,7 @@ use ratatui::{
 use std::io::stdout;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 pub enum StreamMsg {
     Token(String),
@@ -23,11 +24,41 @@ pub enum StreamMsg {
     Error(String),
 }
 
+/// How the chat client endpoint is being reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportBadge {
+    Local,
+    Usb,
+    Wifi,
+}
+
+impl TransportBadge {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "[Local]",
+            Self::Usb => "[USB Cable]",
+            Self::Wifi => "[Wi-Fi]",
+        }
+    }
+
+    /// Infer a sensible default from an endpoint URL (never assumes USB).
+    pub fn from_endpoint(endpoint: &str) -> Self {
+        if endpoint.contains("127.0.0.1") || endpoint.contains("localhost") {
+            Self::Local
+        } else {
+            Self::Wifi
+        }
+    }
+}
+
 /// State container for the interactive TUI chat session.
 pub struct ChatApp {
     pub client: NexusClient,
     pub model_name: String,
     pub system_prompt: Option<String>,
+    pub persona_name: Option<String>,
+    pub temperature: f32,
+    pub max_tokens: usize,
     pub messages: Vec<ChatMessage>,
     pub streaming_response: String,
     pub is_streaming: bool,
@@ -38,14 +69,20 @@ pub struct ChatApp {
     pub tokens_per_sec: f64,
     pub stream_start_time: Option<Instant>,
     pub status_message: Option<String>,
+    pub transport_badge: TransportBadge,
+    stream_handle: Option<JoinHandle<()>>,
 }
 
 impl ChatApp {
     pub fn new(client: NexusClient, model_name: impl Into<String>, system_prompt: Option<String>) -> Self {
+        let transport_badge = TransportBadge::from_endpoint(client.endpoint());
         Self {
             client,
             model_name: model_name.into(),
             system_prompt,
+            persona_name: None,
+            temperature: 0.7,
+            max_tokens: 2048,
             messages: Vec::new(),
             streaming_response: String::new(),
             is_streaming: false,
@@ -56,6 +93,32 @@ impl ChatApp {
             tokens_per_sec: 0.0,
             stream_start_time: None,
             status_message: None,
+            transport_badge,
+            stream_handle: None,
+        }
+    }
+
+    /// Apply a persona's system prompt and generation hyperparameters.
+    pub fn apply_preset(&mut self, name: &str, system_prompt: String, temperature: f32, max_tokens: usize) {
+        self.persona_name = Some(name.to_string());
+        self.system_prompt = Some(system_prompt);
+        self.temperature = temperature;
+        self.max_tokens = max_tokens;
+    }
+
+    /// Abort an in-flight generation. Returns true if a stream was aborted.
+    pub fn abort_stream(&mut self) -> bool {
+        let had_handle = self.stream_handle.take().map(|h| {
+            h.abort();
+            true
+        }).unwrap_or(false);
+
+        if self.is_streaming || had_handle {
+            self.finalize_stream();
+            self.status_message = Some("Generation aborted (Esc)".to_string());
+            true
+        } else {
+            false
         }
     }
 
@@ -104,6 +167,9 @@ impl ChatApp {
 
     /// Process a stream chunk received from background worker.
     pub fn handle_stream_token(&mut self, token: String) {
+        if !self.is_streaming {
+            return;
+        }
         self.streaming_response.push_str(&token);
         self.tokens_streamed += 1;
 
@@ -123,6 +189,7 @@ impl ChatApp {
         }
         self.is_streaming = false;
         self.stream_start_time = None;
+        self.stream_handle = None;
     }
 
     /// Prepare and render the UI frame for full window.
@@ -150,9 +217,50 @@ impl ChatApp {
         self.render_footer(frame, chunks[3]);
     }
 
+    fn spawn_stream(&mut self, tx: &mpsc::Sender<StreamMsg>) {
+        let req_messages =
+            Self::clean_conversation_messages(&self.messages, self.system_prompt.as_deref());
+
+        let req = ChatCompletionRequest {
+            model: self.model_name.clone(),
+            messages: req_messages,
+            temperature: Some(self.temperature),
+            max_tokens: Some(self.max_tokens),
+            stream: true,
+        };
+
+        let client = self.client.clone();
+        let tx_clone = tx.clone();
+
+        self.stream_handle = Some(tokio::spawn(async move {
+            match client.stream_chat(req).await {
+                Ok(mut stream) => {
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(token) => {
+                                let _ = tx_clone.send(StreamMsg::Token(token)).await;
+                            }
+                            Err(e) => {
+                                let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
+                                break;
+                            }
+                        }
+                    }
+                    let _ = tx_clone.send(StreamMsg::Done).await;
+                }
+                Err(e) => {
+                    let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
+                }
+            }
+        }));
+    }
+
     /// Handle key event for input buffering, scrolling, or dispatching streaming requests.
     pub fn handle_key_input(&mut self, key: crossterm::event::KeyEvent, tx: &mpsc::Sender<StreamMsg>) {
         match key.code {
+            KeyCode::Esc => {
+                let _ = self.abort_stream();
+            }
             KeyCode::Char(c) => {
                 self.input_buffer.push(c);
             }
@@ -195,41 +303,7 @@ impl ChatApp {
                     self.tokens_streamed = 0;
                     self.tokens_per_sec = 0.0;
                     self.stream_start_time = Some(Instant::now());
-
-                    let req_messages = Self::clean_conversation_messages(&self.messages, self.system_prompt.as_deref());
-
-                    let req = ChatCompletionRequest {
-                        model: self.model_name.clone(),
-                        messages: req_messages,
-                        temperature: Some(0.7),
-                        max_tokens: Some(2048),
-                        stream: true,
-                    };
-
-                    let client = self.client.clone();
-                    let tx_clone = tx.clone();
-
-                    tokio::spawn(async move {
-                        match client.stream_chat(req).await {
-                            Ok(mut stream) => {
-                                while let Some(chunk) = stream.next().await {
-                                    match chunk {
-                                        Ok(token) => {
-                                            let _ = tx_clone.send(StreamMsg::Token(token)).await;
-                                        }
-                                        Err(e) => {
-                                            let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
-                                            break;
-                                        }
-                                    }
-                                }
-                                let _ = tx_clone.send(StreamMsg::Done).await;
-                            }
-                            Err(e) => {
-                                let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
-                            }
-                        }
-                    });
+                    self.spawn_stream(tx);
                 }
             }
             _ => {}
@@ -243,16 +317,10 @@ impl ChatApp {
             String::new()
         };
 
-        let transport_badge = if self.client.endpoint().contains("127.0.0.1") || self.client.endpoint().contains("localhost") {
-            "[USB Cable]"
-        } else {
-            "[Wi-Fi]"
-        };
-
         let title = format!(
             " Nexus-LLM Terminal | Host: {} {} | Model: {}{}",
             self.client.endpoint(),
-            transport_badge,
+            self.transport_badge.label(),
             self.model_name,
             stream_info
         );
@@ -365,9 +433,15 @@ impl ChatApp {
                 Color::Yellow
             };
             (status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD))
+        } else if self.is_streaming {
+            (
+                "[Esc] Abort generation  |  [Ctrl+C] Quit  |  [Up/Down/PgUp/PgDn] Scroll".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )
         } else {
             (
-                "[Enter] Submit  |  [Esc / Ctrl+C] Exit  |  [Up/Down/PgUp/PgDn] Scroll".to_string(),
+                "[Enter] Submit  |  [Esc] Abort (when generating)  |  [Ctrl+C / q] Quit  |  [Up/Down] Scroll"
+                    .to_string(),
                 Style::default().fg(Color::DarkGray),
             )
         };
@@ -382,6 +456,7 @@ impl ChatApp {
 
 /// Run full interactive Ratatui TUI chat session.
 pub async fn run_chat_tui(mut app: ChatApp) -> Result<(), Box<dyn std::error::Error>> {
+    crate::ui::install_tui_panic_hook();
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -418,90 +493,18 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 break;
                             }
-                            KeyCode::Esc => {
+                            KeyCode::Char('q') if !app.is_streaming && app.input_buffer.is_empty() => {
                                 break;
                             }
-                            KeyCode::Char(c) => {
-                                app.input_buffer.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                app.input_buffer.pop();
-                            }
-                            KeyCode::Up => {
-                                let max = app.total_lines() as u16;
-                                let current = if app.auto_scroll { max } else { app.scroll_offset };
-                                app.auto_scroll = false;
-                                app.scroll_offset = current.saturating_sub(1);
-                            }
-                            KeyCode::Down => {
-                                app.scroll_offset = app.scroll_offset.saturating_add(1);
-                                if app.scroll_offset >= app.total_lines() as u16 {
-                                    app.auto_scroll = true;
+                            KeyCode::Esc => {
+                                if app.is_streaming {
+                                    let _ = app.abort_stream();
                                 }
+                                // Esc never quits the standalone chat TUI
                             }
-                            KeyCode::PageUp => {
-                                let max = app.total_lines() as u16;
-                                let current = if app.auto_scroll { max } else { app.scroll_offset };
-                                app.auto_scroll = false;
-                                app.scroll_offset = current.saturating_sub(10);
+                            _ => {
+                                app.handle_key_input(key, &tx);
                             }
-                            KeyCode::PageDown | KeyCode::End => {
-                                app.auto_scroll = true;
-                            }
-                            KeyCode::Home => {
-                                app.auto_scroll = false;
-                                app.scroll_offset = 0;
-                            }
-                            KeyCode::Enter => {
-                                if !app.is_streaming && !app.input_buffer.trim().is_empty() {
-                                    let prompt = std::mem::take(&mut app.input_buffer);
-                                    app.messages.push(ChatMessage::user(&prompt));
-                                    app.is_streaming = true;
-                                    app.auto_scroll = true;
-                                    app.status_message = None;
-                                    app.streaming_response.clear();
-                                    app.tokens_streamed = 0;
-                                    app.tokens_per_sec = 0.0;
-                                    app.stream_start_time = Some(Instant::now());
-
-                                    // Build full request messages
-                                    let req_messages = ChatApp::clean_conversation_messages(&app.messages, app.system_prompt.as_deref());
-
-                                    let req = ChatCompletionRequest {
-                                        model: app.model_name.clone(),
-                                        messages: req_messages,
-                                        temperature: Some(0.7),
-                                        max_tokens: Some(2048),
-                                        stream: true,
-                                    };
-
-                                    let client = app.client.clone();
-                                    let tx_clone = tx.clone();
-
-                                    tokio::spawn(async move {
-                                        match client.stream_chat(req).await {
-                                            Ok(mut stream) => {
-                                                while let Some(chunk) = stream.next().await {
-                                                    match chunk {
-                                                        Ok(token) => {
-                                                            let _ = tx_clone.send(StreamMsg::Token(token)).await;
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                let _ = tx_clone.send(StreamMsg::Done).await;
-                                            }
-                                            Err(e) => {
-                                                let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            _ => {}
                         }
                     }
                     _ => {}
@@ -513,23 +516,29 @@ async fn event_loop<B: ratatui::backend::Backend>(
             Some(msg) = rx.recv() => {
                 match msg {
                     StreamMsg::Token(token) => {
-                        app.handle_stream_token(token);
-                        app.auto_scroll = true;
+                        if app.is_streaming {
+                            app.handle_stream_token(token);
+                            app.auto_scroll = true;
+                        }
                     }
                     StreamMsg::Done => {
-                        app.finalize_stream();
-                        app.auto_scroll = true;
+                        if app.is_streaming {
+                            app.finalize_stream();
+                            app.auto_scroll = true;
+                        }
                     }
                     StreamMsg::Error(err) => {
-                        app.finalize_stream();
-                        let hint = if err.contains("Transport Error") || err.contains("error sending request") {
-                            "\n💡 Hint: If running on mobile GPU (Vulkan), try unloading ('u') and loading via 'Local (CPU Mode)' in [F2] Models to bypass mobile GPU driver freezes."
-                        } else {
-                            ""
-                        };
-                        app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
-                        app.status_message = Some(format!("Error: {}", err));
-                        app.auto_scroll = true;
+                        if app.is_streaming {
+                            app.finalize_stream();
+                            let hint = if err.contains("Transport Error") || err.contains("error sending request") {
+                                "\n💡 Hint: If running on mobile GPU (Vulkan), try unloading ('u') and loading via 'Local (CPU Mode)' in [F2] Models to bypass mobile GPU driver freezes."
+                            } else {
+                                ""
+                            };
+                            app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
+                            app.status_message = Some(format!("Error: {}", err));
+                            app.auto_scroll = true;
+                        }
                     }
                 }
                 terminal.draw(|f| app.render(f))?;

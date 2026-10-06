@@ -283,8 +283,8 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut hub = HubApp::new(config, client, discovery);
 
-    // Simulate pending hot swap
-    hub.pending_hot_swap_path = Some(PathBuf::from("/models/llama-3.2-3b.gguf"));
+    // Simulate pending hot swap with an explicit CPU Safe Mode layer override
+    hub.pending_hot_swap = Some((PathBuf::from("/models/llama-3.2-3b.gguf"), Some(0)));
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -296,6 +296,10 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     assert!(content.contains("Hot-Swap"), "Must render modal title");
     assert!(content.contains("llama-3.2-3b.gguf"), "Must display target model filename in modal");
     assert!(content.contains("[Y / N]"), "Must display confirmation prompt");
+
+    let pending = hub.pending_hot_swap.as_ref().expect("pending hot swap must remain");
+    assert_eq!(pending.0, PathBuf::from("/models/llama-3.2-3b.gguf"));
+    assert_eq!(pending.1, Some(0), "GPU layer override must survive into the confirm modal");
 }
 
 #[tokio::test]
@@ -313,7 +317,7 @@ async fn test_hub_app_target_node_selection_modal() {
 
     assert!(hub.pending_target_selection.is_some());
     let state = hub.pending_target_selection.as_mut().unwrap();
-    assert_eq!(state.model_name, "qwen2.5-coder-7b");
+    assert_eq!(state.model_name, "qwen2.5-coder-7b.gguf");
     assert_eq!(state.candidates.len(), 2); // Local GPU and Local CPU options
     assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
     assert!(matches!(state.candidates[1], TargetExecutionNode::LocalCpu { .. }));
@@ -468,5 +472,43 @@ async fn test_hub_app_unload_model() {
     // Verify chat received unload notice
     let last_msg = hub.chat.messages.last().expect("Must have unload notice message");
     assert!(last_msg.content.contains("Model 'test-model-3b' unloaded"));
+}
+
+#[tokio::test]
+async fn test_hub_cycle_persona_applies_preset() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    assert!(hub.chat.persona_name.is_none());
+    assert!(hub.chat.system_prompt.is_none());
+
+    hub.cycle_persona();
+    assert!(hub.chat.persona_name.is_some());
+    assert!(hub.chat.system_prompt.is_some());
+    let first = hub.chat.persona_name.clone().unwrap();
+    let first_temp = hub.chat.temperature;
+    let first_max = hub.chat.max_tokens;
+
+    hub.cycle_persona();
+    let second = hub.chat.persona_name.clone().unwrap();
+    assert_ne!(first, second, "cycling should advance to a different persona");
+    assert!(hub.chat.system_prompt.is_some());
+    // Built-ins differ in temperature (coder=0.2, general=0.7)
+    assert!(
+        hub.chat.temperature != first_temp || hub.chat.max_tokens != first_max || first != second,
+        "persona hyperparameters should update with cycle"
+    );
+
+    let (msg, _) = hub.status_message.as_ref().expect("status toast after persona");
+    assert!(msg.starts_with("Persona:"));
+}
+
+#[test]
+fn test_models_view_cached_profile_refresh() {
+    let mut view = ModelsView::new(PathBuf::from("/tmp/nonexistent-nexus-models"));
+    view.refresh_profile();
+    assert!(view.cached_profile.total_ram_mb > 0 || view.cached_profile.available_ram_mb == 0);
 }
 

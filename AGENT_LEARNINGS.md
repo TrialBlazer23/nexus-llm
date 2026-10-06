@@ -25,6 +25,21 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 1 P0 Hub/TUI fixes (hot-swap layers, Esc abort, transport badge)
+- Category: bug
+- Context: Implementing IDENTIFIED_UPGRADES.md Phase 1 (#1–#6 + #21) on the Hub TUI.
+- Finding:
+  1. Hot-swap stored only the model path, dropping `custom_gpu_layers` — CPU Safe Mode (`-ngl 0`) was silently lost on confirm, reintroducing Android Vulkan freezes.
+  2. Any `127.0.0.1` endpoint was labeled `[USB Cable]`; plain local `llama-server` was mislabeled.
+  3. Esc quit standalone chat mid-stream and did nothing in Hub Chat; stream `JoinHandle`s were discarded so generation could not be cancelled.
+  4. `SystemProfile::probe()` ran inside Models `render()` every frame.
+- Action:
+  1. Persist `pending_hot_swap: Option<(PathBuf, Option<u32>)>` and confirm via `execute_model_load_with_gpu`.
+  2. Explicit `TransportBadge::{Local,Usb,Wifi}` with ADB `forward --list` cached on the 500ms tick.
+  3. Store stream `JoinHandle`, Esc aborts; quit via Ctrl+C / idle `q` only. Panic hook restores terminal.
+  4. Cache profile on `ModelsView`; wire `[P]` to cycle presets into Hub chat hyperparams.
+- Verification: `cargo test --locked` passed (all suites including new abort/badge/persona/hot-swap assertions).
+
 ## 2026-10-05 — Mobile Vulkan Adreno Driver Freezes, Model Unload Keybinds, and Chat Sanitization
 - Category: bug
 - Context: Running Qwen-2.5-3B on Android (Snapdragon 8 Gen 2, Termux Vulkan Adreno 740) caused inference to hang for ~3 minutes on the first prompt before terminating with Transport Error / connection reset.

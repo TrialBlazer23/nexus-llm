@@ -90,6 +90,36 @@ impl Preset {
         }
     }
 
+    /// List available preset names from a directory (stems of `*.yaml` / `*.yml`).
+    /// Always includes built-in `coder` and `general` if not present as files.
+    pub fn list_names(presets_dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(presets_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_yaml = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e == "yaml" || e == "yml")
+                    .unwrap_or(false);
+                if is_yaml {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if !names.iter().any(|n| n == stem) {
+                            names.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        for builtin in ["coder", "general"] {
+            if !names.iter().any(|n| n == builtin) {
+                names.push(builtin.to_string());
+            }
+        }
+        names
+    }
+
     /// Default built-in "coder" persona.
     pub fn coder() -> Self {
         Self {

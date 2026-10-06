@@ -135,6 +135,18 @@ fn test_preset_loading_from_file() {
 }
 
 #[test]
+fn test_preset_list_names_includes_builtins() {
+    use std::path::Path;
+    let names = Preset::list_names(Path::new("/tmp/nonexistent-nexus-presets-dir"));
+    assert!(names.contains(&"coder".to_string()));
+    assert!(names.contains(&"general".to_string()));
+
+    let from_repo = Preset::list_names(Path::new("presets"));
+    assert!(from_repo.contains(&"coder".to_string()));
+    assert!(from_repo.contains(&"general".to_string()));
+}
+
+#[test]
 fn test_preset_chatml_formatting() {
     let preset = Preset::coder();
     let messages = vec![

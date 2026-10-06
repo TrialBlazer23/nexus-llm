@@ -189,6 +189,22 @@ impl AdbTunnelSupervisor {
         })
     }
 
+    /// Lightweight check: whether an ADB forward for `api_port` is already listed.
+    /// Does not create tunnels; safe to call on a periodic UI tick.
+    pub fn is_forward_active(api_port: u16) -> bool {
+        if !Self::is_adb_available() {
+            return false;
+        }
+        let output = match Command::new("adb").args(["forward", "--list"]).output() {
+            Ok(o) if o.status.success() => o,
+            _ => return false,
+        };
+        let needle = format!("tcp:{}", api_port);
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.contains(&needle))
+    }
+
     /// Teardown ADB port forwarding and reverse tunnels.
     pub fn teardown_tunnel(api_port: u16, rpc_port: u16) -> Result<(), TunnelError> {
         let forward_arg = format!("tcp:{}", api_port);

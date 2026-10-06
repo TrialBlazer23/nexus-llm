@@ -1,7 +1,7 @@
 use nexus::client::{ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
 use nexus::discovery::DiscoveryService;
-use nexus::ui::chat::ChatApp;
+use nexus::ui::chat::{ChatApp, TransportBadge};
 use nexus::ui::dashboard::DashboardApp;
 use nexus::ui::models::scan_models_dir;
 use ratatui::backend::TestBackend;
@@ -148,5 +148,66 @@ fn test_clean_conversation_messages() {
     assert_eq!(cleaned[2].content, "The capital of France is Paris.");
     assert_eq!(cleaned[3].role, "user");
     assert_eq!(cleaned[3].content, "And its population?");
+}
+
+#[test]
+fn test_transport_badge_localhost_is_local_not_usb() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let app = ChatApp::new(client, "llama-3-8b", None);
+    assert_eq!(app.transport_badge, TransportBadge::Local);
+    assert_eq!(app.transport_badge.label(), "[Local]");
+
+    let wifi = NexusClient::new("http://192.168.1.50:8080");
+    let app_wifi = ChatApp::new(wifi, "llama-3-8b", None);
+    assert_eq!(app_wifi.transport_badge, TransportBadge::Wifi);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = ChatApp::new(NexusClient::new("http://127.0.0.1:8080"), "m", None);
+    app.transport_badge = TransportBadge::Local;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("[Local]"), "localhost supervised inference must show [Local]");
+    assert!(!content.contains("[USB Cable]"), "must not mislabel local as USB Cable");
+
+    app.transport_badge = TransportBadge::Usb;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("[USB Cable]"), "explicit USB badge must render");
+}
+
+#[test]
+fn test_abort_stream_clears_streaming_state() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    app.is_streaming = true;
+    app.stream_start_time = Some(Instant::now());
+    app.streaming_response = "partial reply".to_string();
+
+    assert!(app.abort_stream());
+    assert!(!app.is_streaming);
+    assert!(app.stream_start_time.is_none());
+    assert_eq!(app.messages.last().unwrap().content, "partial reply");
+    assert!(app
+        .status_message
+        .as_ref()
+        .unwrap()
+        .contains("aborted"));
+
+    // Late tokens after abort must be ignored
+    app.handle_stream_token("should-ignore".to_string());
+    assert!(app.streaming_response.is_empty());
+    assert!(!app.is_streaming);
+}
+
+#[test]
+fn test_apply_preset_sets_hyperparams() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    app.apply_preset("coder", "Be terse.".to_string(), 0.2, 4096);
+    assert_eq!(app.persona_name.as_deref(), Some("coder"));
+    assert_eq!(app.system_prompt.as_deref(), Some("Be terse."));
+    assert_eq!(app.temperature, 0.2);
+    assert_eq!(app.max_tokens, 4096);
 }
 

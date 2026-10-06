@@ -17,6 +17,7 @@ pub struct ModelsView {
     pub models: Vec<ModelEntry>,
     pub selected_index: usize,
     pub status_message: Option<String>,
+    pub cached_profile: SystemProfile,
 }
 
 impl ModelsView {
@@ -27,6 +28,7 @@ impl ModelsView {
             models,
             selected_index: 0,
             status_message: None,
+            cached_profile: SystemProfile::probe(),
         }
     }
 
@@ -35,6 +37,12 @@ impl ModelsView {
         if self.selected_index >= self.models.len() && !self.models.is_empty() {
             self.selected_index = self.models.len() - 1;
         }
+        self.refresh_profile();
+    }
+
+    /// Re-probe `/proc` memory/backend info. Call from the Hub 500ms tick, not every paint.
+    pub fn refresh_profile(&mut self) {
+        self.cached_profile = SystemProfile::probe();
     }
 
     pub fn next(&mut self) {
@@ -134,7 +142,7 @@ impl ModelsView {
             let embed_len = meta.as_ref().and_then(|g| g.embedding_length).unwrap_or(0);
             let version = meta.as_ref().map(|g| g.version).unwrap_or(3);
 
-            let profile = SystemProfile::probe();
+            let profile = &self.cached_profile;
             let total_ram_mb = profile.total_ram_mb;
             let avail_ram_mb = profile.available_ram_mb;
             let lmk_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);

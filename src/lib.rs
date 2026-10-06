@@ -14,6 +14,7 @@ pub mod peer_registry;
 pub mod registry_runtime;
 pub mod trust_auth;
 pub mod preset;
+pub mod store;
 pub mod supervisor;
 pub mod sysinfo;
 pub mod tunnel;

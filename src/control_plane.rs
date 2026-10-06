@@ -269,6 +269,11 @@ pub struct ModelCatalogEntry {
     pub size_mb: u64,
     pub architecture: String,
     pub context_length: usize,
+    /// Lowercase hex SHA-256 of the model bytes (empty if unknown).
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,15 +283,19 @@ pub struct ModelCatalogResponse {
     pub models: Vec<ModelCatalogEntry>,
 }
 
-/// Build a catalog response by scanning `models_dir` for `.gguf` files.
+/// Build a catalog response from the content-addressed model index.
 pub fn build_model_catalog(node_id: Uuid, models_dir: &std::path::Path) -> ModelCatalogResponse {
-    let models = crate::ui::models::scan_models_dir(models_dir)
+    let index = crate::store::ModelIndex::reconcile_default(models_dir).unwrap_or_default();
+    let models = index
+        .models
         .into_iter()
         .map(|m| ModelCatalogEntry {
             filename: m.filename,
-            size_mb: m.size_mb,
+            size_mb: m.size_bytes / (1024 * 1024),
             architecture: m.architecture,
             context_length: m.context_length,
+            digest: m.digest,
+            size_bytes: m.size_bytes,
         })
         .collect();
     ModelCatalogResponse {
@@ -317,6 +326,58 @@ pub async fn fetch_models(
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobFetchRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub digest: String,
+    pub source_base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlobFetchResponse {
+    pub protocol_version: u16,
+    pub accepted: bool,
+    pub message: String,
+}
+
+/// Ask a peer to pull `digest` from `source_base_url` (push convenience).
+pub async fn request_blob_fetch(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &BlobFetchRequest,
+    identity: Option<&NodeIdentity>,
+) -> Result<BlobFetchResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/blob/fetch",
+        &body,
+        identity,
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+/// Build the blob URL for a digest on a control-plane base URL.
+pub fn blob_url(base_url: &str, digest: &str) -> Result<String, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    let digest = digest.trim().to_lowercase();
+    url.set_path(&format!("/nexus/control/v1/blob/{digest}"));
+    Ok(url.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

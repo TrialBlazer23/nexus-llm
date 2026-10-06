@@ -99,6 +99,23 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
   ```
 - **Target Architecture Verification**: Ensure build instructions check the target architecture (`uname -m`) to apply the appropriate Snapdragon or Penryn compiler flags.
 
+## Cursor Cloud specific instructions
+
+Cloud Agent VMs are Ubuntu Linux. Rust lives in `/usr/local/cargo` and `/usr/local/rustup`, which are on the login-shell `PATH`. Run Cargo directly from the repository root. The `wsl bash -l -c ...` wrapper above is for the Windows host, where PowerShell has no Cargo.
+
+The base image's Rust 1.83.0 cannot compile `Cargo.lock`. `indexmap` 2.14.2 requires Cargo edition 2024 (Rust 1.85+). Environment install pins Rust 1.99.0, the same major version recorded for the WSL workstation in `AGENT_LEARNINGS.md`.
+
+`.cargo/config.toml` keeps x86_64 rustflags at `-C target-feature=-avx,-avx2,-fma,-sse4.2`. Leave those flags in place on Cloud Agent VMs.
+
+Checks that do not need a GGUF file or an external `llama-server` binary:
+
+- `cargo test --locked`
+- `cargo run --locked --bin nexus -- info` prints the probed memory and acceleration profile. Pass `--bin nexus`; the package also builds `nexusd`.
+- `cargo run --locked --bin nexus -- check -m <file> -c 2048` evaluates the 75% memory guard.
+- `cargo run --locked --bin nexusd` starts the headless discovery daemon with no model loaded.
+
+`llama-server` and `rpc-server` are external llama.cpp binaries. `nexus host` and `nexusd --model` need those binaries plus a GGUF file, which are not in this repository.
+
 ---
 
 # Maintainability and Quality Standards

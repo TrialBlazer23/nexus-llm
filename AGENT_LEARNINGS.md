@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Cloud Agent base image Rust 1.83 cannot compile Cargo.lock
+- Category: environment
+- Context: Setting up the Cursor Cloud Agent environment for nexus-llm on Ubuntu 24.04.
+- Finding: The base image ships Rust 1.83.0. `cargo fetch --locked` fails because `indexmap` 2.14.2 requires the `edition2024` Cargo feature, stabilized in Rust 1.85. `cargo run` also needs `--bin nexus` because the package builds both `nexus` and `nexusd`. A second `nexus discover` process using the same `~/.nexus` identity does not list the local `nexusd` beacon as a peer.
+- Action: Install and default to Rust 1.99.0 with rustup (`--profile minimal`, plus rustfmt and clippy). Run Cargo directly on Cloud Agent VMs. Keep the Penryn rustflags in `.cargo/config.toml`.
+- Verification: `cargo test --locked` passed 73 tests on Rust 1.99.0. `nexus info`, `nexus check`, and `nexusd` startup (UDP 9999 plus mDNS) succeeded.
+
 ## 2026-10-05 — Chat TUI Overhaul: Pure-Rust Markdown, Cursor Ergonomics, Stream Abort, and Telemetry Badges
 - Category: design-decision
 - Context: Upgrading the interactive Chat TUI (`src/ui/chat.rs`) following successful cross-device GPU offload across Snapdragon 8 Gen 2 and legacy MacBook nodes.

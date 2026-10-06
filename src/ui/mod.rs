@@ -5,11 +5,8 @@ pub mod hub;
 pub mod markdown;
 pub mod models;
 pub mod models_view;
-<<<<<<< HEAD
-pub mod session_logger;
-=======
 pub mod mouse;
->>>>>>> d04de08 (feat(ui): Phase 4 polish — ctx display, regen, toasts, mouse, peer names)
+pub mod session_logger;
 pub mod settings_view;
 pub mod slash;
 pub mod tunnel_view;

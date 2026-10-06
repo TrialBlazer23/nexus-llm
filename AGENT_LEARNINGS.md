@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Merge conflict markers in src/ui/mod.rs broke cargo build
+- Category: bug
+- Context: Running `cargo build --release` after commit b9f1d16501e6 (Phase 4 polish).
+- Finding: `src/ui/mod.rs` contained unmerged Git conflict markers around `session_logger` and `mouse` modules (`<<<<<<< HEAD`, `=======`, `>>>>>>> d04de08`), causing syntax errors with Unicode em-dash and unexpected tokens during `cargo build`.
+- Action: Removed conflict markers and registered both `pub mod mouse;` and `pub mod session_logger;` in `src/ui/mod.rs`.
+- Verification: `cargo build --release` compiled cleanly; all unit and integration test suites passed via `cargo test`.
+
 ## 2026-10-06 — Phase 4 peer names via mDNS TXT (not beacon)
 - Category: design-decision
 - Context: IDENTIFIED_UPGRADES Phase 4 #24 on `cursor/phase4-polish-e793`.

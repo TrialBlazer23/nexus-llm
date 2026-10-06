@@ -25,6 +25,18 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 9 trust: signing canonical, node.key, pairing migration
+- Category: design-decision
+- Context: CAPABILITY_REVIEW §1.4 + §1.5 — authenticated control plane and registry as runtime source of truth on `cursor/phase9-trust-4865`.
+- Finding:
+  1. Control-plane auth uses header-based envelopes (`Nexus-Signature-*`) and canonical string `nexus-control-v1\n{METHOD}\n{PATH}\n{sha256_hex(body)}\n{timestamp}\n{nonce}\n{signer_id}` with ±120s skew and a per-peer nonce LRU (~10 min).
+  2. `~/.nexus/node.key` stores the Ed25519 secret with Unix mode **0600**; existing `node.id` UUIDs are preserved; fresh installs get UUID v5 from the public key.
+  3. Pairing codes are HMAC-SHA256 over 5-minute windows (6 digits, zero-padded). First successful pair appends `allowed_peer_ids` + `paired_peers` and sets `require_pairing = true`.
+  4. Beacons stay advisory; when pairing is enforced, chat/RPC use `registry_runtime` verification + `eligible_rpc_peers` / `find_best_trusted_host`, not beacon UUID alone.
+  5. `DiscoveryService` holds `Arc<RwLock<NexusConfig>>` — clone security policy before `.await` in listener tasks (`RwLockReadGuard` is not `Send`).
+- Action: Modules `node_identity`, `trust_auth`, `registry_runtime`; signed client POSTs; server gate on state/load/unload/pair; Cluster `[P]`/`[O]` and `nexus pair --host --code`.
+- Verification: `cargo test --locked` including `tests/test_trust.rs` (signatures, replay, forged beacon, pair-then-load).
+
 ## 2026-10-06 — Phase 7 remainder: names, zero-config resolve, doctor, settings honesty
 - Category: design-decision
 - Context: Finishing CAPABILITY_REVIEW §7 Phase 7 acceptance after PR #9 shipped the control-plane server.

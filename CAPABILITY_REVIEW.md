@@ -7,9 +7,10 @@
 
 **Implementation status (2026-10-06):** Phase 7 mesh work is **shipped** on
 `cursor/phase7-control-plane-server-e680` (PR #9) + `cursor/phase7-mesh-remainder-7787`
-(PR #10). Historical findings below are preserved; status markers call out what
-is done vs still open. **Recommended next phase: Phase 9 (Trust)** before
-Phase 8 (TUI) — remote `model/load` is live and unauthenticated on the LAN.
+(PR #10). Phase 9 trust is **shipped** on `cursor/phase9-trust-4865` (Ed25519
+identity, signed control plane, TOFU pairing, registry verification at runtime).
+Historical findings below are preserved; status markers call out what is done vs
+still open. **Recommended next phase: Phase 8 (TUI)** or Phase 10 (model store).
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -25,7 +26,7 @@ inert — are mechanically reproducible:
 
 ---
 
-## Status snapshot (post–Phase 7)
+## Status snapshot (post–Phase 9)
 
 | Area | Status | Where |
 |---|---|---|
@@ -36,8 +37,8 @@ inert — are mechanically reproducible:
 | File logging + `nexus doctor` | **Done** | `src/logging.rs`, `src/doctor.rs` |
 | Settings displayed ⇒ consumed | **Done** for Settings UI | wired ram%/mmap/enable_rpc/prefer_adb/rpc binary/name; hid FallbackCpu; added control_port |
 | `GET /models`, SSE `/events` | **Deferred** | Phase 10 / later |
-| `POST /pair`, Ed25519, signed control plane | **Open — Phase 9** | §1.5; now urgent |
-| Peer registry as runtime SoT | **Open — Phase 9** | §1.4 |
+| `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
+| Peer registry as runtime SoT | **Done** | `src/registry_runtime.rs`, `src/discovery.rs`, Cluster UI |
 | TUI responsiveness / hub split | **Open — Phase 8** | §2.1–§2.6, §2.8 |
 | Model store / LAN transfer | **Open — Phase 10** | §4 |
 
@@ -59,7 +60,7 @@ The five findings that mattered most at review time (with current status):
    `POST /nexus/control/v1/{state,model/load,model/unload}` on
    `network.control_port` (default 9998) from hub, nexusd, host, and worker.
    `SupervisorManager` is the shared inference owner. Still deferred:
-   `GET /models`, SSE `/events`, `POST /pair`.
+   `GET /models`, SSE `/events`. **`POST /pair` and signed POSTs are Done (Phase 9).**
 
 2. ~~**Auto-discovery of a chat host cannot succeed with a default config.**~~
    **Resolved (Phase 7 remainder / PR #10).** `resolve_from_discovery` prefers a
@@ -79,12 +80,11 @@ The five findings that mattered most at review time (with current status):
    fetch from the internet, and `ModelDownloader` is reachable only from
    `nexus download` on the CLI — it is not wired into the TUI at all.
 
-5. **Nothing on the wire is authenticated.** *(Still open — Phase 9; now more
-   urgent.)* The beacon's CRC-16-CCITT is error detection, not integrity. Any
-   host on the LAN can forge a beacon carrying another node's UUID and redirect
-   every TUI client's chat traffic to itself. **With the control-plane server
-   live, the same applies to remote model loads** — this is the recommended
-   next phase.
+5. ~~**Nothing on the wire is authenticated.**~~ **Partially resolved (Phase
+   9).** Control-plane `POST` routes require Ed25519 signatures, replay
+   protection, and pairing when enforced; chat/RPC routing uses verified registry
+   peers plus `allowed_peer_ids`. **Beacons remain advisory** (CRC only; no
+   beacon HMAC yet) — forged UUIDs no longer rebind chat when pairing is on.
 
 ---
 
@@ -96,9 +96,9 @@ accounts for most of the gap between the documented system and the running one.
 | Subsystem | Where it lives | Status at runtime |
 |---|---|---|
 | Control-plane request handlers | `src/control_plane.rs` + `src/control_plane_server.rs` | **Done** — hyper server binds them on `control_port` |
-| Control-plane state fetch | `src/control_plane.rs` (`fetch_state`) | Used by doctor / tests; peer-registry verification still Phase 9 |
-| Remote unload dispatch | `src/control_plane.rs` (`dispatch_unload_model`) | Library ready; TUI remote unload still limited |
-| Peer lifecycle registry | `src/peer_registry.rs` | Still parallel to `DiscoveryService` HashMap — Phase 9 |
+| Control-plane state fetch | `src/control_plane.rs` (`fetch_state`) | Signed when pairing enforced; drives registry verifier |
+| Remote unload dispatch | `src/control_plane.rs` (`dispatch_unload_model`) | Signed when pairing enforced; TUI remote unload still limited |
+| Peer lifecycle registry | `src/peer_registry.rs` + `src/registry_runtime.rs` | **Done** — reaper/verifier; RPC/chat gate on `eligible_rpc_peers` |
 | Chat template engine | `src/preset.rs` (`format_prompt`, `ChatTemplate`) | No callers; llama-server applies its own template |
 | Non-streaming completion | `src/client.rs` (`complete_chat`) | No callers |
 | ADB tunnel view | `src/ui/tunnel_view.rs` | Not wired into any hub tab; tested but unreachable |
@@ -225,7 +225,9 @@ only advertising via beacon.
 
 ### 1.4 The peer registry does not participate at runtime
 
-> **Status (2026-10-06): Open — Phase 9.** Composes with pairing/verification.
+> **Status (2026-10-06): Done (Phase 9).** `registry_runtime` reaper/verifier;
+> `rpc_candidates` and chat resolution intersect verified + paired peers when
+> enforcement is on.
 
 `src/peer_registry.rs` implements the lifecycle the design spec describes —
 `Discovered`, `Verifying`, `Healthy`, `Stale`, `Removed`, `Rejected` — with
@@ -259,9 +261,9 @@ particular, `verified` is never set to `true` anywhere, which means
 
 ### 1.5 Nothing on the wire is authenticated or integrity-protected
 
-> **Status (2026-10-06): Open — Phase 9 (now highest priority).** Control-plane
-> remote load works without pairing; forgeable beacons remain. Do this before
-> Phase 8 TUI polish.
+> **Status (2026-10-06): Done (Phase 9).** Ed25519 identity (`~/.nexus/node.key`),
+> signed control-plane POSTs, `POST /nexus/control/v1/pair` with rotating 6-digit
+> code, `paired_peers` in config. Beacons still unauthenticated (deferred HMAC).
 
 The beacon carries a 16-byte UUID and a CRC-16-CCITT over the first 62 bytes.
 CRC detects accidental corruption; it provides no defense against a crafted
@@ -1179,20 +1181,23 @@ choosing CPU-safe mode during a hot-swap launches with `-ngl 0`.
 
 ### Phase 9 — Trust
 
-> **Recommended next shippable slice** after Phase 7.
+> **Status (2026-10-06): Done** — branch `cursor/phase9-trust-4865`.
+> `require_pairing` defaults false until first successful pair (then auto-enabled).
+> Unsigned localhost `POST /state` remains for doctor/tests.
 
-- Ed25519 node identity; pairing with a short code (§1.5)
-- Signed control-plane requests with replay protection (§1.5)
-- Peer verification promotes registry entries; unverified peers cannot be routed
-  to or offloaded to (§1.4, §1.5)
-- `require_pairing` enforced everywhere and defaulted on
+- ~~Ed25519 node identity; pairing with a short code (§1.5)~~ **Done**
+- ~~Signed control-plane requests with replay protection (§1.5)~~ **Done**
+- ~~Peer verification promotes registry entries; unverified peers cannot be routed
+  to or offloaded to (§1.4, §1.5)~~ **Done**
+- ~~`require_pairing` enforced on inbound control + routing~~ **Done** (auto-on after pair)
 
 *Invasiveness:* new crypto dependency; touches discovery, registry, control
 plane, and the Cluster tab. Needs a compatibility story for unpaired nodes during
 rollout.
 *Acceptance:* a forged beacon carrying a known UUID does not redirect chat
-traffic; an unpaired node cannot load a model remotely; pairing two devices takes
-one code entry.
+traffic when pairing is enforced; an unpaired node cannot load a model remotely;
+pairing two devices takes one code entry. Covered by `tests/test_trust.rs` and
+extended network/control-plane tests.
 
 ### Phase 10 — Model store and LAN transfer
 

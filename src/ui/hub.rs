@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,12 @@ pub enum TargetExecutionNode {
     Local {
         allocatable_mb: u64,
         backend: String,
+        gpu_layers: u32,
+    },
+    LocalCpu {
+        allocatable_mb: u64,
+        backend: String,
+        threads: usize,
     },
     Remote {
         uuid: Uuid,
@@ -67,8 +73,11 @@ pub enum TargetExecutionNode {
 impl TargetExecutionNode {
     pub fn display_label(&self) -> String {
         match self {
-            Self::Local { allocatable_mb, backend } => {
-                format!("🖥️  Local Machine (This Device) - {} MB allocatable | {}", allocatable_mb, backend)
+            Self::Local { allocatable_mb, backend, gpu_layers } => {
+                format!("⚡ Local GPU (Accelerated - {} layers) - {} MB allocatable | {}", gpu_layers, allocatable_mb, backend)
+            }
+            Self::LocalCpu { allocatable_mb, backend, threads } => {
+                format!("🛡️  Local CPU (Safe Mode - 0 GPU layers, {} threads) - {} MB allocatable | {}", threads, allocatable_mb, backend)
             }
             Self::Remote { name, endpoint, free_ram_mb, backend, .. } => {
                 format!("📱 {} ({}) - {} MB free | {}", name, endpoint, free_ram_mb, backend)
@@ -165,10 +174,24 @@ impl HubApp {
 
         let profile = SystemProfile::probe();
         let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
-        let mut candidates = vec![TargetExecutionNode::Local {
-            allocatable_mb: local_cap_mb,
-            backend: profile.detected_backend.to_string(),
-        }];
+        let gpu_layers = if self.config.hardware.acceleration.prefer_gpu {
+            self.config.hardware.acceleration.gpu_layers
+        } else {
+            99
+        };
+
+        let mut candidates = vec![
+            TargetExecutionNode::Local {
+                allocatable_mb: local_cap_mb,
+                backend: profile.detected_backend.to_string(),
+                gpu_layers,
+            },
+            TargetExecutionNode::LocalCpu {
+                allocatable_mb: local_cap_mb,
+                backend: "CPU Fallback (DotProd / Multi-thread)".to_string(),
+                threads: profile.recommended_threads,
+            },
+        ];
 
         let peers = self.discovery.get_active_peers().await;
         for p in peers {
@@ -198,8 +221,11 @@ impl HubApp {
         if let Some(state) = self.pending_target_selection.take() {
             if let Some(target) = state.candidates.get(state.selected_idx) {
                 match target {
-                    TargetExecutionNode::Local { .. } => {
-                        self.request_model_load(state.model_path).await;
+                    TargetExecutionNode::Local { gpu_layers, .. } => {
+                        self.request_model_load_with_gpu(state.model_path, Some(*gpu_layers)).await;
+                    }
+                    TargetExecutionNode::LocalCpu { .. } => {
+                        self.request_model_load_with_gpu(state.model_path, Some(0)).await;
                     }
                     TargetExecutionNode::Remote { endpoint, name, .. } => {
                         let client = reqwest::Client::new();
@@ -257,15 +283,56 @@ impl HubApp {
 
     /// Request to launch a model. If a model is already active, prompts for hot-swap confirmation.
     pub async fn request_model_load(&mut self, model_path: PathBuf) {
+        self.request_model_load_with_gpu(model_path, None).await;
+    }
+
+    /// Request model load specifying optional explicit GPU layer offload.
+    pub async fn request_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
         if self.supervisor.is_some() {
             self.pending_hot_swap_path = Some(model_path);
         } else {
-            self.execute_model_load(model_path).await;
+            self.execute_model_load_with_gpu(model_path, custom_gpu_layers).await;
+        }
+    }
+
+    /// Unload the currently running model and terminate its supervisor process.
+    pub async fn unload_active_model(&mut self) {
+        let had_supervisor = self.supervisor.is_some();
+        if let Some(mut sup) = self.supervisor.take() {
+            info!("Unloading active model supervisor...");
+            let _ = sup.stop().await;
+        }
+
+        if had_supervisor || self.active_model_name != "None (Idle)" {
+            let unloaded_model = std::mem::replace(&mut self.active_model_name, "None (Idle)".to_string());
+            self.discovery.set_active_model("").await;
+            self.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
+
+            // Reset chat model to default
+            self.chat.model_name = "default".to_string();
+            self.chat.messages.push(ChatMessage::assistant(format!(
+                "Model '{}' unloaded. Local inference engine is idle.",
+                unloaded_model
+            )));
+            self.status_message = Some((
+                format!("Unloaded model '{}'", unloaded_model),
+                Color::Cyan,
+            ));
+        } else {
+            self.status_message = Some((
+                "No local model is currently active to unload".to_string(),
+                Color::Yellow,
+            ));
         }
     }
 
     /// Stop any active supervisor and load the new model process locally.
     pub async fn execute_model_load(&mut self, model_path: PathBuf) {
+        self.execute_model_load_with_gpu(model_path, None).await;
+    }
+
+    /// Load model process locally with optional GPU layer count override (0 forces CPU mode).
+    pub async fn execute_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
         if let Some(mut old_sup) = self.supervisor.take() {
             info!("Unloading active model supervisor...");
             let _ = old_sup.stop().await;
@@ -279,7 +346,9 @@ impl HubApp {
 
         let profile = SystemProfile::probe();
         let threads = self.config.hardware.acceleration.cpu_threads;
-        let gpu_layers = if self.config.hardware.acceleration.prefer_gpu {
+        let gpu_layers = if let Some(layers) = custom_gpu_layers {
+            layers
+        } else if self.config.hardware.acceleration.prefer_gpu {
             self.config.hardware.acceleration.gpu_layers
         } else {
             0
@@ -444,7 +513,7 @@ impl HubApp {
             self.active_model_name,
             self.chat.client.endpoint()
         );
-        let footer_line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 " [F1-F4] Tabs ",
                 Style::default()
@@ -454,12 +523,23 @@ impl HubApp {
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(active_str, Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [C] Connect Peer ", Style::default().fg(Color::Cyan)),
-            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(" [Ctrl+C] Quit", Style::default().fg(Color::Red)),
-        ]);
+        ];
 
-        let p = Paragraph::new(footer_line);
+        if self.supervisor.is_some() {
+            spans.push(Span::styled(
+                " [u] Unload Model ",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        }
+
+        spans.push(Span::styled(" [Alt+C] Connect Peer ", Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(" [Ctrl+C] Quit", Style::default().fg(Color::Red)));
+
+        let p = Paragraph::new(Line::from(spans));
         frame.render_widget(p, area);
     }
 
@@ -605,6 +685,34 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 if hub.active_tab == HubTab::Cluster {
                     hub.cluster_view.refresh().await;
                 }
+
+                // Supervise local model child process
+                if let Some(sup) = &mut hub.supervisor {
+                    match sup.check_status() {
+                        Ok(Some(exit_status)) => {
+                            let err_lines = sup.last_stderr_lines();
+                            let last_err = err_lines.last().map(|s| s.as_str()).unwrap_or("No stderr output captured");
+                            let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
+                            hub.supervisor = None;
+                            hub.discovery.set_active_model("").await;
+                            hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
+                            let msg = format!(
+                                "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
+                                exit_status.code(),
+                                last_err
+                            );
+                            hub.chat.messages.push(ChatMessage::assistant(msg));
+                            hub.status_message = Some((
+                                format!("Local server crashed for '{}' ({:?})", model, exit_status.code()),
+                                Color::Red,
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            debug!("Failed to check supervisor status: {}", e);
+                        }
+                    }
+                }
             }
             Some(event_res) = event_stream.next() => {
                 if let Ok(Event::Key(key)) = event_res {
@@ -661,7 +769,17 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         continue;
                     }
 
-                    // Global function keys F1..F4
+                    // Global tab navigation: Alt+1..4 or F1..F4
+                    if key.modifiers.contains(KeyModifiers::ALT) {
+                        match key.code {
+                            KeyCode::Char('1') => { hub.set_tab(HubTab::Chat); continue; }
+                            KeyCode::Char('2') => { hub.set_tab(HubTab::Models); continue; }
+                            KeyCode::Char('3') => { hub.set_tab(HubTab::Cluster); hub.cluster_view.refresh().await; continue; }
+                            KeyCode::Char('4') => { hub.set_tab(HubTab::Settings); continue; }
+                            _ => {}
+                        }
+                    }
+
                     match key.code {
                         KeyCode::F(1) => { hub.set_tab(HubTab::Chat); continue; }
                         KeyCode::F(2) => { hub.set_tab(HubTab::Models); continue; }
@@ -677,10 +795,16 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.next_tab();
                             } else if key.code == KeyCode::BackTab {
                                 hub.previous_tab();
-                            } else if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C') {
+                            } else if key.modifiers.contains(KeyModifiers::CONTROL) && (key.code == KeyCode::Char('u') || key.code == KeyCode::Char('U')) {
+                                hub.unload_active_model().await;
+                            } else if key.code == KeyCode::Enter && hub.chat.input_buffer.trim() == "/unload" {
+                                hub.chat.input_buffer.clear();
+                                hub.unload_active_model().await;
+                            } else if key.modifiers.contains(KeyModifiers::ALT) && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C')) {
                                 let peers = hub.discovery.get_active_peers().await;
                                 if let Some(active_peer) = peers.iter().find(|p| !p.active_model.is_empty() || p.status.is_ready()) {
                                     let ep = active_peer.api_endpoint();
+                                    hub.discovery.send_direct_probe_to_ip(active_peer.addr.ip()).await;
                                     let model = if !active_peer.active_model.is_empty() {
                                         active_peer.active_model.clone()
                                     } else {
@@ -689,7 +813,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     hub.chat.client = NexusClient::new(ep.clone());
                                     hub.chat.model_name = model.clone();
                                     hub.active_model_name = model.clone();
-                                    hub.status_message = Some((format!("Connected to cluster host at {}", ep), Color::Green));
+                                    hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green));
                                     hub.chat.messages.push(ChatMessage::assistant(format!(
                                         "Connected to active cluster host at {}. Ready for chat.", ep
                                     )));
@@ -702,9 +826,17 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         }
                         HubTab::Models => {
                             match key.code {
+                                KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
+                                KeyCode::Char('2') => hub.models_view.refresh(),
+                                KeyCode::Char('3') => {
+                                    hub.set_tab(HubTab::Cluster);
+                                    hub.cluster_view.refresh().await;
+                                }
+                                KeyCode::Char('4') => hub.set_tab(HubTab::Settings),
                                 KeyCode::Up | KeyCode::Char('k') => hub.models_view.previous(),
                                 KeyCode::Down | KeyCode::Char('j') => hub.models_view.next(),
                                 KeyCode::Char('r') | KeyCode::Char('R') => hub.models_view.refresh(),
+                                KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
                                 KeyCode::Enter => {
                                     if let Some(m) = hub.models_view.selected_model() {
                                         let path = m.path.clone();
@@ -758,11 +890,16 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             } else {
                                 match key.code {
+                                    KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
+                                    KeyCode::Char('2') => hub.set_tab(HubTab::Models),
+                                    KeyCode::Char('3') => hub.cluster_view.refresh().await,
+                                    KeyCode::Char('4') => hub.set_tab(HubTab::Settings),
                                     KeyCode::Up | KeyCode::Char('k') => hub.cluster_view.previous(),
                                     KeyCode::Down | KeyCode::Char('j') => hub.cluster_view.next(),
                                     KeyCode::Enter => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
                                             let ep = peer.api_endpoint();
+                                            hub.discovery.send_direct_probe_to_ip(peer.addr.ip()).await;
                                             let model = if !peer.active_model.is_empty() {
                                                 peer.active_model.clone()
                                             } else {
@@ -771,7 +908,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.chat.client = NexusClient::new(ep.clone());
                                             hub.chat.model_name = model.clone();
                                             hub.active_model_name = model.clone();
-                                            hub.status_message = Some((format!("Connected to peer at {}", ep), Color::Green));
+                                            hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
                                             hub.chat.messages.push(ChatMessage::assistant(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
                                                 peer.uuid, ep
@@ -815,7 +952,13 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                         hub.cluster_view.status_message = Some((format!("Load failed on {}: {}", peer_name, err), Color::Red));
                                                     }
                                                     Err(e) => {
-                                                        hub.cluster_view.status_message = Some((format!("Dispatch error to {}: {}", peer_name, e), Color::Red));
+                                                        let err_str = e.to_string();
+                                                        let hint = if err_str.contains("error sending request") {
+                                                            format!("Dispatch error to {}: node has no active server on port {}. Launch model locally on that device first.", peer_name, peer.api_port)
+                                                        } else {
+                                                            format!("Dispatch error to {}: {}", peer_name, e)
+                                                        };
+                                                        hub.cluster_view.status_message = Some((hint, Color::Red));
                                                     }
                                                 }
                                             } else {
@@ -841,6 +984,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
                                         hub.chat.messages.push(ChatMessage::assistant(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
                                     }
+                                    KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
                                     KeyCode::Char('r') | KeyCode::Char('R') => hub.cluster_view.refresh().await,
                                     KeyCode::Tab => hub.next_tab(),
                                     KeyCode::BackTab => hub.previous_tab(),
@@ -859,6 +1003,13 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             } else {
                                 match key.code {
+                                    KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
+                                    KeyCode::Char('2') => hub.set_tab(HubTab::Models),
+                                    KeyCode::Char('3') => {
+                                        hub.set_tab(HubTab::Cluster);
+                                        hub.cluster_view.refresh().await;
+                                    }
+                                    KeyCode::Char('4') => {}
                                     KeyCode::Up | KeyCode::Char('k') => hub.settings_view.previous(),
                                     KeyCode::Down | KeyCode::Char('j') => hub.settings_view.next(),
                                     KeyCode::Enter => {
@@ -879,6 +1030,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             if let Some(host) = &hub.config.network.default_host {
                                                 hub.chat.client = NexusClient::new(host.clone());
                                             }
+                                            hub.discovery.set_mdns_enabled(hub.config.network.discovery.mdns.enabled).await;
                                             hub.status_message = Some(("Settings saved & hot-reloaded".to_string(), Color::Green));
                                         }
                                     }
@@ -903,7 +1055,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                     }
                     StreamMsg::Error(err) => {
                         hub.chat.finalize_stream();
-                        hub.chat.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}", err)));
+                        let hint = if err.contains("Transport Error") || err.contains("error sending request") {
+                            "\n💡 Hint: If running on mobile GPU (Vulkan), try unloading ('u') and loading via 'Local (CPU Mode)' in [F2] Models to bypass mobile GPU driver freezes."
+                        } else {
+                            ""
+                        };
+                        hub.chat.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
                         hub.chat.status_message = Some(format!("Error: {}", err));
                         hub.chat.auto_scroll = true;
                     }

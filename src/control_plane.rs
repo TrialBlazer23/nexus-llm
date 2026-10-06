@@ -101,6 +101,7 @@ pub fn endpoint_from_state(
             0
         },
         control_port: endpoint.control_port,
+        display_name: endpoint.display_name.clone(),
     }
 }
 
@@ -251,6 +252,8 @@ pub async fn handle_load_model(
     api_host: &str,
     api_port: u16,
     binary_path: &std::path::Path,
+    use_mmap: bool,
+    memory_budget_percent: u8,
 ) -> ModelLoadResponse {
     if request.protocol_version != CONTROL_PLANE_VERSION {
         return ModelLoadResponse {
@@ -302,6 +305,8 @@ pub async fn handle_load_model(
         threads: request.threads,
         context_size: request.context_size,
         extra_args,
+        use_mmap,
+        memory_budget_percent,
     };
 
     match manager.spawn(config).await {

@@ -8,8 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "nexusd")]
@@ -50,16 +49,19 @@ struct Args {
     /// Disable automatic RPC discovery when model exceeds Node A's memory budget
     #[arg(long)]
     no_rpc_auto: bool,
+
+    /// Tracing filter level when RUST_LOG is unset
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-
     let args = Args::parse();
+    match nexus::logging::init_file_logging(&args.log_level) {
+        Ok(path) => eprintln!("nexusd log file: {}", path.display()),
+        Err(e) => eprintln!("Warning: file logging unavailable ({e})"),
+    }
 
     info!("=== Nexus-LLM Headless Daemon (nexusd) ===");
 
@@ -110,7 +112,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.binary.clone(),
         )
         .with_discovery(discovery.clone())
-        .with_capabilities(vec!["inference".to_string(), "daemon".to_string()]),
+        .with_capabilities(vec!["inference".to_string(), "daemon".to_string()])
+        .with_memory_policy(
+            config.hardware.safety.mmap,
+            config.hardware.safety.max_ram_usage_percent,
+        ),
     );
     let control_addr = SocketAddr::from(([0, 0, 0, 0], config.network.control_port));
     let control_handle = spawn_control_plane(control_addr, control_ctx);
@@ -140,7 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model_size_bytes = model_metadata.len();
         let kv_bytes = SystemProfile::estimate_kv_cache_bytes(args.ctx);
         let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
-        let host_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+        let host_cap_mb = profile
+            .max_allowed_memory_bytes_pct(config.hardware.safety.max_ram_usage_percent)
+            / (1024 * 1024);
 
         let mut extra_args = Vec::new();
 
@@ -152,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let rpc_endpoint = if let Some(ep) = args.rpc {
                 Some(ep)
-            } else if !args.no_rpc_auto && config.cluster.auto_offload {
+            } else if !args.no_rpc_auto && config.cluster.enable_rpc && config.cluster.auto_offload {
                 info!("Probing subnet for available RPC worker peer...");
                 discovery.send_probe().await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -214,6 +222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads,
             context_size: args.ctx,
             extra_args,
+            use_mmap: config.hardware.safety.mmap,
+            memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
         };
 
         info!(

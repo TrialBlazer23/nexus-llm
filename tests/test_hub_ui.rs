@@ -374,6 +374,7 @@ async fn test_cluster_view_interactions() {
         backend: AccelerationBackend::Vulkan,
         thermal_index: 45,
         active_model: "llama-3.2-3b.gguf".to_string(),
+        display_name: String::new(),
         last_seen: std::time::Instant::now(),
     };
     let peer2 = PeerNode {
@@ -389,6 +390,7 @@ async fn test_cluster_view_interactions() {
         backend: AccelerationBackend::ArmCpuDotProd,
         thermal_index: 30,
         active_model: String::new(),
+        display_name: String::new(),
         last_seen: std::time::Instant::now(),
     };
 

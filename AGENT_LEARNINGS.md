@@ -25,6 +25,17 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 7 remainder: names, zero-config resolve, doctor, settings honesty
+- Category: design-decision
+- Context: Finishing CAPABILITY_REVIEW §7 Phase 7 acceptance after PR #9 shipped the control-plane server.
+- Finding:
+  1. Beacon v1 still has no room for a display name; mDNS TXT `name=` + `PeerNode.display_name` / `label()` is enough. UDP-only peers keep `Node-<uuid8>` until mDNS arrives.
+  2. `resolve_from_discovery` only consulted the unset primary-compute anchor. Undeprecating `find_best_host` as fallback restores default-config auto-connect. The hub path never called discovery at all (localhost fallback) — that was the larger gap for two-device LAN acceptance.
+  3. TUI had no tracing subscriber; file logs under `~/.nexus/logs/nexus-<pid>.log` via `src/logging.rs` keep the alternate screen clean. `nexus doctor` treats missing `llama-server`/`rpc-server`/`adb` as WARN (exit 0) and bind/config failures as FAIL (exit 1).
+  4. Settings honesty: wire `max_ram_usage_percent`, `mmap`, `enable_rpc`, `prefer_adb_tunnel`, `rpc_server_binary`, `node.name`; hide inert `FallbackCpu`; add live `control_port`. Leave TOML-only `runtime_role` / `capabilities` / `cpu_threads_batch` / `mlock` unsuffixed.
+- Action: Implemented on `cursor/phase7-mesh-remainder-7787` stacked on the Phase 7 control-plane tip. Next phase should be **Phase 9 Trust** (pairing / signed control plane / registry verification) before Phase 8 TUI responsiveness — remote `model/load` is now unauthenticated on the LAN.
+- Verification: `cargo test --locked`; `nexus doctor` WARN-only exit 0 without llama binaries; log files created under `~/.nexus/logs/`; `scripts/verify_review_findings.sh` updated for wired Settings fields + file logging.
+
 ## 2026-10-06 — Phase 7: control plane HTTP server on dedicated port
 - Category: design-decision
 - Context: Implementing CAPABILITY_REVIEW.md §1.1 + §1.2 (Phase 7 MVP) so remote model load from the TUI can succeed.

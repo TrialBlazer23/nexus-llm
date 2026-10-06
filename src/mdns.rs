@@ -40,6 +40,7 @@ impl MdnsBackend {
         cluster_id: Option<Uuid>,
         role: NodeRole,
         capabilities: &[String],
+        display_name: &str,
         address: IpAddr,
     ) -> Result<(), MdnsError> {
         let capability_list = capabilities.join(",");
@@ -53,6 +54,7 @@ impl MdnsBackend {
             ("api".to_string(), api_port.to_string()),
             ("rpc".to_string(), rpc_port.to_string()),
             ("ctrl".to_string(), control_port.to_string()),
+            ("name".to_string(), display_name.to_string()),
         ]);
         let info = ServiceInfo::new(
             service_type,
@@ -157,6 +159,11 @@ fn endpoint_from_resolved(
         .get("caps")
         .map(|caps| caps.split(',').filter(|cap| !cap.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
+    let display_name = properties
+        .get("name")
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_default();
 
     Ok(ServiceEndpoint {
         node_id,
@@ -168,6 +175,7 @@ fn endpoint_from_resolved(
         api_port,
         rpc_port,
         control_port,
+        display_name,
     })
 }
 

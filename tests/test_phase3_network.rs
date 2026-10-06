@@ -18,6 +18,7 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         addresses: vec![SocketAddr::from((address, 8080))],
         api_port: 8080,
         control_port: 9998,
+        display_name: String::new(),
         rpc_port: 50052,
     }
 }
@@ -144,6 +145,7 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         backend: nexus::sysinfo::AccelerationBackend::X86Baseline,
         thermal_index: 20,
         active_model: String::new(),
+        display_name: String::new(),
         last_seen: now,
     };
     discovery
@@ -201,6 +203,7 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             backend: nexus::sysinfo::AccelerationBackend::Vulkan,
             thermal_index: 0,
             active_model: String::new(),
+            display_name: String::new(),
             last_seen: Instant::now(),
         },
     );
@@ -240,6 +243,8 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
         "127.0.0.1",
         8080,
         std::path::Path::new("llama-server"),
+        true,
+        75,
     )
     .await;
     assert_eq!(response.protocol_version, CONTROL_PLANE_VERSION);

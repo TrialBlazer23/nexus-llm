@@ -201,8 +201,7 @@ impl HubApp {
         let peers = self.discovery.get_active_peers().await;
         for p in peers {
             if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
-                let short_id = p.uuid.to_string();
-                let name = format!("Node-{}", &short_id[..8]);
+                let name = p.label();
                 candidates.push(TargetExecutionNode::Remote {
                     uuid: p.uuid,
                     name,
@@ -375,19 +374,24 @@ impl HubApp {
         let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
         let kv_bytes = SystemProfile::estimate_kv_cache_bytes(4096);
         let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
-        let host_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+        let host_cap_mb = profile
+            .max_allowed_memory_bytes_pct(self.config.hardware.safety.max_ram_usage_percent)
+            / (1024 * 1024);
 
         let mut extra_args = Vec::new();
 
-        if total_required_mb > host_cap_mb {
-            let rpc_peer = self
-                .discovery
-                .select_rpc_candidate(crate::discovery::RpcSelectionPolicy {
-                    max_thermal_index: 75,
-                    max_allocatable_mb: self.config.cluster.max_rpc_ram_mb,
-                    require_pairing: self.config.network.security.require_pairing,
-                })
-                .await;
+        if total_required_mb > host_cap_mb && self.config.cluster.enable_rpc {
+            let rpc_peer = if self.config.cluster.auto_offload {
+                self.discovery
+                    .select_rpc_candidate(crate::discovery::RpcSelectionPolicy {
+                        max_thermal_index: 75,
+                        max_allocatable_mb: self.config.cluster.max_rpc_ram_mb,
+                        require_pairing: self.config.network.security.require_pairing,
+                    })
+                    .await
+            } else {
+                None
+            };
             let rpc_endpoint = rpc_peer.map(|candidate| candidate.peer.rpc_endpoint());
             let remote_ram = if rpc_endpoint.is_some() {
                 Some(self.config.cluster.max_rpc_ram_mb)
@@ -431,6 +435,8 @@ impl HubApp {
             threads,
             context_size: 4096,
             extra_args,
+            use_mmap: self.config.hardware.safety.mmap,
+            memory_budget_percent: self.config.hardware.safety.max_ram_usage_percent,
         };
 
         info!("Spawning llama-server for model: {:?}", model_path);
@@ -703,7 +709,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             PathBuf::from(&hub.config.node.llama_server_binary),
         )
         .with_discovery(hub.discovery.clone())
-        .with_capabilities(vec!["inference".to_string(), "hub".to_string()]),
+        .with_capabilities(vec!["inference".to_string(), "hub".to_string()])
+        .with_memory_policy(
+            hub.config.hardware.safety.mmap,
+            hub.config.hardware.safety.max_ram_usage_percent,
+        ),
     );
     let control_handle = spawn_control_plane(control_addr, control_ctx);
     info!(
@@ -861,7 +871,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     hub.chat.client = NexusClient::new(ep.clone());
                                     hub.chat.model_name = model.clone();
                                     hub.active_model_name = model.clone();
-                                    let peer_label = format!("Node-{}", &active_peer.uuid.to_string()[..8]);
+                                    let peer_label = active_peer.label();
                                     hub.chat.set_target_hardware(&peer_label, active_peer.backend.to_string());
                                     hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green));
                                     hub.chat.messages.push(ChatMessage::assistant(format!(
@@ -959,12 +969,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.chat.client = NexusClient::new(ep.clone());
                                             hub.chat.model_name = model.clone();
                                             hub.active_model_name = model.clone();
-                                            let peer_name = format!("Node-{}", &peer.uuid.to_string()[..8]);
+                                            let peer_name = peer.label();
                                             hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
                                             hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
                                             hub.chat.messages.push(ChatMessage::assistant(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
-                                                peer.uuid, ep
+                                                peer_name, ep
                                             )));
                                             hub.chat.message_metrics.push(None);
                                             hub.set_tab(HubTab::Chat);
@@ -974,8 +984,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     }
                                     KeyCode::Char('l') | KeyCode::Char('L') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
-                                            let peer_uuid = peer.uuid;
-                                            let peer_name = format!("Node-{}", &peer_uuid.to_string()[..8]);
+                                            let peer_name = peer.label();
                                             let peer_ctrl = peer.control_endpoint();
                                             if let Some(m) = hub.models_view.selected_model() {
                                                 let client = reqwest::Client::new();
@@ -1034,9 +1043,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Char('w') | KeyCode::Char('W') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {
                                             let ep = peer.api_endpoint();
-                                            let short_id = &peer.uuid.to_string()[..8];
+                                            let peer_label = peer.label();
                                             hub.cluster_view.status_message = Some((
-                                                format!("Requested Node-{} at {} to stand by for RPC worker offload", short_id, ep),
+                                                format!("Requested {} at {} to stand by for RPC worker offload", peer_label, ep),
                                                 Color::Cyan,
                                             ));
                                         }

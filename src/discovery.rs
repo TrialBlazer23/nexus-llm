@@ -36,6 +36,8 @@ pub struct ServiceEndpoint {
     /// local `network.control_port` when a peer is learned only via UDP beacon
     /// (beacon v1 has no on-wire control port; see AGENT_LEARNINGS).
     pub control_port: u16,
+    /// Human-readable name from mDNS TXT `name=` (empty when unknown / UDP-only).
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +318,9 @@ pub struct PeerNode {
     pub backend: AccelerationBackend,
     pub thermal_index: u8,
     pub active_model: String,
+    /// From mDNS TXT `name=` when available; empty for UDP-only peers.
+    #[serde(default)]
+    pub display_name: String,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
 }
@@ -355,6 +360,17 @@ impl PeerNode {
         format!("{}:{}", self.addr.ip(), self.rpc_port)
     }
 
+    /// Operator-facing label: display name when known, else `Node-<uuid8>`.
+    pub fn label(&self) -> String {
+        let name = self.display_name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        let id = self.uuid.to_string();
+        let short = if id.len() >= 8 { &id[..8] } else { &id };
+        format!("Node-{}", short)
+    }
+
     pub fn service_endpoint(&self) -> ServiceEndpoint {
         ServiceEndpoint {
             node_id: self.uuid,
@@ -366,6 +382,7 @@ impl PeerNode {
             api_port: self.api_port,
             rpc_port: self.rpc_port,
             control_port: self.control_port,
+            display_name: self.display_name.clone(),
         }
     }
 }
@@ -798,12 +815,15 @@ impl DiscoveryService {
                                         peer_addr, beacon.uuid
                                     );
                                     let mut peers = self.peers.write().await;
-                                    // Beacon v1 has no control_port field; preserve an
-                                    // mDNS-learned value, otherwise assume the mesh default.
-                                    let control_port = peers
-                                        .get(&beacon.uuid)
+                                    // Beacon v1 has no control_port or display_name; preserve
+                                    // mDNS-learned values, otherwise assume mesh defaults.
+                                    let existing = peers.get(&beacon.uuid);
+                                    let control_port = existing
                                         .map(|p| p.control_port)
                                         .unwrap_or(self.config.network.control_port);
+                                    let display_name = existing
+                                        .map(|p| p.display_name.clone())
+                                        .unwrap_or_default();
                                     let peer = PeerNode {
                                         uuid: beacon.uuid,
                                         addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
@@ -817,6 +837,7 @@ impl DiscoveryService {
                                         backend: beacon.backend,
                                         thermal_index: beacon.thermal_index,
                                         active_model: beacon.active_model,
+                                        display_name,
                                         last_seen: Instant::now(),
                                     };
 
@@ -912,14 +933,13 @@ impl DiscoveryService {
     }
 
     /// Select the best compute host peer currently available on the subnet.
-    #[deprecated(note = "use resolve_primary_compute_anchor")]
+    /// Ranking: READY (+1000), Vulkan (+500), free RAM MB, minus thermal index.
     pub async fn find_best_host(&self) -> Option<PeerNode> {
         let active = self.get_active_peers().await;
         active
             .into_iter()
             .filter(|p| p.role.is_host())
             .max_by_key(|p| {
-                // Priority: Ready state (1000 pts) + Vulkan active (500 pts) + free RAM (MB) - thermal index
                 let mut score = p.free_ram_mb as i64;
                 if p.status.is_ready() {
                     score += 1000;
@@ -1020,6 +1040,9 @@ impl DiscoveryService {
             if endpoint.control_port > 0 {
                 existing.control_port = endpoint.control_port;
             }
+            if !endpoint.display_name.trim().is_empty() {
+                existing.display_name = endpoint.display_name.clone();
+            }
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
@@ -1054,6 +1077,7 @@ impl DiscoveryService {
                 backend: AccelerationBackend::GenericCpu,
                 thermal_index: 0,
                 active_model: String::new(),
+                display_name: endpoint.display_name.clone(),
                 last_seen: Instant::now(),
             };
             peers.insert(endpoint.node_id, peer.clone());
@@ -1129,6 +1153,7 @@ impl DiscoveryService {
                 None,
                 role,
                 &caps,
+                &this.config.resolved_display_name(),
                 local_ip,
             ) {
                 warn!("Failed to register mDNS service: {}", e);

@@ -183,6 +183,7 @@ async fn test_peer_cache_expiry_and_pruning() {
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 30,
                 active_model: "llama-3".to_string(),
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -230,6 +231,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::ArmCpuDotProd,
                 thermal_index: 50,
                 active_model: "qwen".to_string(),
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -250,6 +252,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 25,
                 active_model: "llama".to_string(),
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -270,6 +273,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::X86Baseline,
                 thermal_index: 10,
                 active_model: "".to_string(),
+                display_name: String::new(),
                 last_seen: Instant::now(),
             },
         );
@@ -388,6 +392,7 @@ async fn test_record_service_endpoint_merges_mdns() {
         addresses: vec!["192.168.1.200:8080".parse().unwrap()],
         api_port: 8080,
         control_port: 9998,
+        display_name: "galaxy-s23".to_string(),
         rpc_port: 50052,
     };
 
@@ -402,11 +407,81 @@ async fn test_record_service_endpoint_merges_mdns() {
     assert!(peers[0].is_rpc_ready());
     assert_eq!(peers[0].api_endpoint(), "http://192.168.1.200:8080");
     assert_eq!(peers[0].rpc_endpoint(), "192.168.1.200:50052");
+    assert_eq!(peers[0].display_name, "galaxy-s23");
+    assert_eq!(peers[0].label(), "galaxy-s23");
 
     // Also check registry
     let registry = discovery.peer_registry();
     let reg_read = registry.read().await;
     assert!(reg_read.get(node_id).is_some());
+}
+
+#[test]
+fn test_peer_label_prefers_display_name() {
+    let uuid = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+    let mut peer = PeerNode {
+        uuid,
+        addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+        role: NodeRole::HOST,
+        status: StatusFlags::READY,
+        api_port: 8080,
+        control_port: 9998,
+        rpc_port: 0,
+        total_ram_mb: 1000,
+        free_ram_mb: 500,
+        backend: AccelerationBackend::GenericCpu,
+        thermal_index: 0,
+        active_model: String::new(),
+        display_name: String::new(),
+        last_seen: Instant::now(),
+    };
+    assert_eq!(peer.label(), "Node-aaaaaaaa");
+    peer.display_name = "macrowave".to_string();
+    assert_eq!(peer.label(), "macrowave");
+}
+
+#[test]
+fn test_resolved_display_name_uses_configured_name() {
+    let mut config = NexusConfig::default();
+    config.node.name = "studio-box".to_string();
+    assert_eq!(config.resolved_display_name(), "studio-box");
+    config.node.name = "auto".to_string();
+    let resolved = config.resolved_display_name();
+    assert!(!resolved.is_empty());
+    assert_ne!(resolved, "auto");
+}
+
+#[tokio::test]
+async fn test_resolve_from_discovery_falls_back_to_best_host() {
+    use nexus::client::NexusClient;
+    let config = NexusConfig::default();
+    assert!(config.network.anchors.primary_compute_id.is_none());
+    let discovery = DiscoveryService::new(config, None);
+    let host_id = Uuid::new_v4();
+    discovery.peers().write().await.insert(
+        host_id,
+        PeerNode {
+            uuid: host_id,
+            addr: SocketAddr::from(([10, 0, 0, 42], 8080)),
+            role: NodeRole::HOST,
+            status: StatusFlags::READY,
+            api_port: 8080,
+            control_port: 9998,
+            rpc_port: 0,
+            total_ram_mb: 8000,
+            free_ram_mb: 4000,
+            backend: AccelerationBackend::Vulkan,
+            thermal_index: 10,
+            active_model: "demo".to_string(),
+            display_name: "lan-host".to_string(),
+            last_seen: Instant::now(),
+        },
+    );
+
+    let client = NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(1))
+        .await
+        .expect("default config must resolve a ready beacon host");
+    assert_eq!(client.endpoint(), "http://10.0.0.42:8080");
 }
 
 #[tokio::test]

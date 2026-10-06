@@ -73,6 +73,8 @@ fn test_memory_guard_enforcement() {
     };
 
     assert_eq!(profile.max_allowed_memory_bytes(), 3_000 * 1024 * 1024);
+    assert_eq!(profile.max_allowed_memory_bytes_pct(50), 2_000 * 1024 * 1024);
+    assert_eq!(profile.max_allowed_memory_bytes_pct(100), 4_000 * 1024 * 1024);
 
     // 1. Safe small model (500 MB) with 1024 context tokens (~200 MB KV):
     // Total ~ 700 MB <= 3000 MB -> should pass.
@@ -237,6 +239,8 @@ fn test_supervisor_command_args_builder() {
         threads: 6,
         context_size: 4096,
         extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
     };
 
     // Test Vulkan offload args (-ngl 99)
@@ -247,10 +251,16 @@ fn test_supervisor_command_args_builder() {
     assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--port").nth(1).unwrap(), "8080");
     assert!(vulkan_args.contains(&"--alias".to_string()));
     assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--alias").nth(1).unwrap(), "model");
+    assert!(!vulkan_args.iter().any(|a| a == "--no-mmap"));
 
     // Test CPU fallback args (-ngl 0)
     let cpu_args = cfg.build_args(0);
     assert_eq!(cpu_args.iter().skip_while(|&x| x != "-ngl").nth(1).unwrap(), "0");
+
+    let mut no_mmap = cfg.clone();
+    no_mmap.use_mmap = false;
+    let args = no_mmap.build_args(99);
+    assert!(args.iter().any(|a| a == "--no-mmap"));
 }
 
 #[tokio::test]
@@ -264,6 +274,8 @@ async fn test_supervisor_preflight_binary_not_found() {
         threads: 2,
         context_size: 512,
         extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -293,6 +305,8 @@ async fn test_supervisor_preflight_model_not_found() {
         threads: 2,
         context_size: 512,
         extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -333,6 +347,8 @@ async fn test_supervisor_memory_cap_rejection() {
         threads: 2,
         context_size: insane_context,
         extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;

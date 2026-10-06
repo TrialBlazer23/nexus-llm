@@ -189,28 +189,44 @@ impl SystemProfile {
         (context_size as u64).saturating_mul(BYTES_PER_CONTEXT_TOKEN)
     }
 
-    /// Maximum RAM bytes allowed under the Android LMK 75% memory ceiling.
+    /// Maximum RAM bytes allowed under the Android LMK memory ceiling (default 75%).
     pub fn max_allowed_memory_bytes(&self) -> u64 {
+        self.max_allowed_memory_bytes_pct(75)
+    }
+
+    /// Maximum RAM bytes allowed using an explicit usage percent (1–100).
+    pub fn max_allowed_memory_bytes_pct(&self, percent: u8) -> u64 {
+        let pct = u64::from(percent.clamp(1, 100));
         let available_bytes = self.available_ram_mb.saturating_mul(1024 * 1024);
-        (available_bytes.saturating_mul(75)) / 100
+        (available_bytes.saturating_mul(pct)) / 100
     }
 
     /// Android LMK Guard: verifies whether a model and its KV cache can safely load.
     ///
     /// Blocks model loads where:
-    ///   (model_file_size_bytes + kv_cache_bytes) > 0.75 * MemAvailable
+    ///   (model_file_size_bytes + kv_cache_bytes) > percent * MemAvailable
     pub fn can_safely_load(&self, model_file_size_bytes: u64, context_size: usize) -> bool {
+        self.can_safely_load_pct(model_file_size_bytes, context_size, 75)
+    }
+
+    pub fn can_safely_load_pct(
+        &self,
+        model_file_size_bytes: u64,
+        context_size: usize,
+        percent: u8,
+    ) -> bool {
         let kv_cache_bytes = Self::estimate_kv_cache_bytes(context_size);
         let total_required = model_file_size_bytes.saturating_add(kv_cache_bytes);
-        let max_allowed = self.max_allowed_memory_bytes();
+        let max_allowed = self.max_allowed_memory_bytes_pct(percent);
 
         let safe = total_required <= max_allowed;
         if !safe {
             warn!(
-                "Memory Safety Guard tripped! Required: {} MB (Model: {} MB + KV: {} MB), Max Allowed (75% of Avail {} MB): {} MB",
+                "Memory Safety Guard tripped! Required: {} MB (Model: {} MB + KV: {} MB), Max Allowed ({}% of Avail {} MB): {} MB",
                 total_required / (1024 * 1024),
                 model_file_size_bytes / (1024 * 1024),
                 kv_cache_bytes / (1024 * 1024),
+                percent.clamp(1, 100),
                 self.available_ram_mb,
                 max_allowed / (1024 * 1024)
             );
@@ -220,17 +236,27 @@ impl SystemProfile {
 
     /// Android LMK Guard with exact GGUF architectural dimensions.
     pub fn can_safely_load_gguf(&self, gguf: &crate::gguf::GgufMetadata, context_size: usize) -> bool {
+        self.can_safely_load_gguf_pct(gguf, context_size, 75)
+    }
+
+    pub fn can_safely_load_gguf_pct(
+        &self,
+        gguf: &crate::gguf::GgufMetadata,
+        context_size: usize,
+        percent: u8,
+    ) -> bool {
         let kv_cache_bytes = gguf.exact_kv_cache_bytes(context_size);
         let total_required = gguf.file_size_bytes.saturating_add(kv_cache_bytes);
-        let max_allowed = self.max_allowed_memory_bytes();
+        let max_allowed = self.max_allowed_memory_bytes_pct(percent);
 
         let safe = total_required <= max_allowed;
         if !safe {
             warn!(
-                "Memory Safety Guard tripped on GGUF! Required: {} MB (Model: {} MB + Exact KV: {} MB), Max Allowed (75% of Avail {} MB): {} MB",
+                "Memory Safety Guard tripped on GGUF! Required: {} MB (Model: {} MB + Exact KV: {} MB), Max Allowed ({}% of Avail {} MB): {} MB",
                 total_required / (1024 * 1024),
                 gguf.file_size_bytes / (1024 * 1024),
                 kv_cache_bytes / (1024 * 1024),
+                percent.clamp(1, 100),
                 self.available_ram_mb,
                 max_allowed / (1024 * 1024)
             );

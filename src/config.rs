@@ -104,6 +104,24 @@ impl NexusConfig {
             .map_err(|_| ConfigError::Invalid("node.id must be a UUID".to_string()))
     }
 
+    /// Human-readable mesh name for mDNS TXT `name=` and local identity.
+    /// Resolves `auto` / empty to the system hostname, then `nexus-<id8>`.
+    pub fn resolved_display_name(&self) -> String {
+        let name = self.node.name.trim();
+        if !name.is_empty() && name != "auto" {
+            return name.to_string();
+        }
+        if let Ok(hostname) = fs::read_to_string("/etc/hostname") {
+            let hostname = hostname.trim();
+            if !hostname.is_empty() {
+                return hostname.to_string();
+            }
+        }
+        let id = self.node.id.trim();
+        let short = if id.len() >= 8 { &id[..8] } else { id };
+        format!("nexus-{}", short)
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !matches!(self.node.role.as_str(), "host" | "client" | "worker" | "member" | "standalone") {
             return Err(ConfigError::Invalid(format!(

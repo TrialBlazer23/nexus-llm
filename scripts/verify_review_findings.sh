@@ -29,6 +29,7 @@ expect_no_callers() {
 
 echo "Nexus-LLM — CAPABILITY_REVIEW.md evidence"
 echo "commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+FAIL=0
 
 echo
 echo "########################################################################"
@@ -94,23 +95,42 @@ search 'ModelDownloader'
 
 echo
 echo "########################################################################"
-echo "# S0/S3.2 — config fields that are read only by the settings UI"
+echo "# S0/S3.2 — config fields: Settings-displayed fields must be consumed"
 echo "########################################################################"
-for field in 'node\.name' 'runtime_role' 'node\.capabilities' \
-             'fallback_to_cpu' 'cpu_threads_batch' 'safety\.mmap' \
-             'safety\.mlock' 'max_ram_usage_percent' 'enable_rpc' \
-             'prefer_adb_tunnel'; do
+# Still inert (TOML schema / not shown in Settings, or deferred):
+for field in 'runtime_role' 'node\.capabilities' \
+             'fallback_to_cpu' 'cpu_threads_batch' 'safety\.mlock'; do
     rule "$field (outside config.rs and settings_view.rs)"
     hits=$(search "$field" | grep -Ev '^src/config\.rs|^src/ui/settings_view\.rs')
     [ -z "$hits" ] && echo "INERT — no behavioral use (claim holds)" || echo "$hits"
 done
+# Phase 7 remainder wired these Settings fields into runtime consumers:
+for field in 'max_ram_usage_percent' 'safety\.mmap' 'enable_rpc' 'prefer_adb_tunnel' \
+             'resolved_display_name|display_name'; do
+    rule "$field must have behavioral callers outside settings/config"
+    hits=$(search "$field" | grep -Ev '^src/config\.rs|^src/ui/settings_view\.rs|^CAPABILITY_REVIEW|^AGENT_LEARNINGS|^scripts/')
+    if [ -z "$hits" ]; then
+        echo "MISSING — expected runtime consumers after Phase 7 remainder"
+        FAIL=1
+    else
+        echo "$hits" | head -20
+        echo "WIRED — behavioral use present"
+    fi
+done
 
 echo
 echo "########################################################################"
-echo "# S2.7 — no tracing subscriber in TUI mode"
+echo "# S2.7 — file logging installed for TUI via logging module"
 echo "########################################################################"
-expect_no_callers "subscriber installation outside the daemon" \
-    'tracing_subscriber|set_global_default' '^src/daemon\.rs'
+rule "init_file_logging / logging module used from main"
+hits=$(search 'init_file_logging|mod logging|nexus::logging' | grep -E '^src/(main|daemon|logging|lib)\.rs')
+if [ -z "$hits" ]; then
+    echo "MISSING — expected file logging wiring"
+    FAIL=1
+else
+    echo "$hits"
+    echo "WIRED — file logging present"
+fi
 
 echo
 echo "########################################################################"
@@ -137,3 +157,4 @@ search 'with_capacity\(kv_count|with_capacity\(array_len|vec!\[0u8; len\]'
 
 echo
 printf '\nDone.\n'
+exit "$FAIL"

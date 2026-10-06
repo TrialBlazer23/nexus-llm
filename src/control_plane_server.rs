@@ -38,6 +38,8 @@ pub struct ControlPlaneContext {
     pub binary_path: PathBuf,
     pub discovery: Option<Arc<DiscoveryService>>,
     pub rpc_ready: bool,
+    pub use_mmap: bool,
+    pub memory_budget_percent: u8,
 }
 
 impl ControlPlaneContext {
@@ -59,6 +61,8 @@ impl ControlPlaneContext {
             binary_path,
             discovery: None,
             rpc_ready: false,
+            use_mmap: true,
+            memory_budget_percent: 75,
         }
     }
 
@@ -74,6 +78,12 @@ impl ControlPlaneContext {
 
     pub fn with_capabilities(mut self, capabilities: Vec<String>) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_memory_policy(mut self, use_mmap: bool, memory_budget_percent: u8) -> Self {
+        self.use_mmap = use_mmap;
+        self.memory_budget_percent = memory_budget_percent;
         self
     }
 }
@@ -216,6 +226,8 @@ async fn handle_load(
         &ctx.api_host,
         ctx.api_port,
         &ctx.binary_path,
+        ctx.use_mmap,
+        ctx.memory_budget_percent,
     )
     .await;
 

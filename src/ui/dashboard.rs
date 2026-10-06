@@ -231,7 +231,7 @@ impl DashboardApp {
             };
 
             rows.push(Row::new(vec![
-                Cell::from(peer.uuid.to_string()),
+                Cell::from(peer.label()),
                 Cell::from(endpoint_str),
                 Cell::from(role_str),
                 Cell::from(format!("{} MB", peer.free_ram_mb)),
@@ -244,7 +244,7 @@ impl DashboardApp {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(37), // UUID
+                Constraint::Length(24), // Display name / label
                 Constraint::Length(23), // Endpoint
                 Constraint::Length(8),  // Role
                 Constraint::Length(12), // Free RAM

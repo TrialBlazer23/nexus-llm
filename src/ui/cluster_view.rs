@@ -350,8 +350,7 @@ impl ClusterView {
                 peer.active_model.clone()
             };
 
-            let short_id = peer.uuid.to_string();
-            let label = format!("{}{}", cursor, &short_id[..13]);
+            let label = format!("{}{}", cursor, peer.label());
 
             let row_style = if is_selected {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)

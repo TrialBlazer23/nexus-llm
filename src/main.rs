@@ -24,6 +24,10 @@ use std::time::Duration;
 #[command(name = "nexus")]
 #[command(about = "Nexus-LLM CLI Orchestrator & Client")]
 struct Cli {
+    /// Tracing filter level when RUST_LOG is unset (file logs under ~/.nexus/logs/)
+    #[arg(long, global = true, default_value = "info")]
+    log_level: String,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -127,9 +131,9 @@ enum Commands {
         #[arg(short, long, default_value_t = 1800)]
         mem: u64,
 
-        /// Path to llama.cpp rpc-server binary
-        #[arg(long, default_value = "rpc-server")]
-        binary: PathBuf,
+        /// Path to llama.cpp rpc-server binary (defaults to config `node.rpc_server_binary`)
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 
     /// Inspect or manage ADB USB port forwarding and reverse tunnels to phone
@@ -173,11 +177,24 @@ enum Commands {
         #[arg(long)]
         preset: Option<String>,
     },
+
+    /// Diagnose mesh / inference preconditions (binaries, ports, config, profile)
+    Doctor,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let log_path = match nexus::logging::init_file_logging(&cli.log_level) {
+        Ok(path) => {
+            eprintln!("Nexus log file: {}", path.display());
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!("Warning: file logging unavailable ({e}); continuing without subscriber");
+            None
+        }
+    };
 
     let command = match cli.command {
         Some(cmd) => cmd,
@@ -187,23 +204,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _broadcaster = discovery.clone().start_broadcaster();
             let _listener = discovery.clone().start_listener();
             let _mdns = discovery.clone().start_mdns();
+            discovery.send_probe().await;
 
-            // Determine default client endpoint
+            // Order: default_host → PreferAdbTunnel USB → discovery → localhost
             let host = if let Some(dh) = &config.network.default_host {
                 dh.clone()
-            } else if let (Some(usb_ep), _) = AdbTunnelSupervisor::resolve_transport_endpoint(
-                TransportMode::Auto,
-                config.network.api_port,
-                config.cluster.rpc_port,
-            ) {
-                usb_ep
             } else {
-                format!("http://127.0.0.1:{}", config.network.api_port)
+                let usb_ep = if config.cluster.prefer_adb_tunnel {
+                    AdbTunnelSupervisor::resolve_transport_endpoint(
+                        TransportMode::Auto,
+                        config.network.api_port,
+                        config.cluster.rpc_port,
+                    )
+                    .0
+                } else {
+                    None
+                };
+                if let Some(usb) = usb_ep {
+                    usb
+                } else {
+                    match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3)).await
+                    {
+                        Ok(client) => client.endpoint().to_string(),
+                        Err(_) => format!("http://127.0.0.1:{}", config.network.api_port),
+                    }
+                }
             };
 
             let client = NexusClient::new(host);
             let hub = HubApp::new(config, client, discovery);
-            return run_hub_tui(hub).await;
+            let result = run_hub_tui(hub).await;
+            if let Some(path) = &log_path {
+                eprintln!("Nexus log file: {}", path.display());
+            }
+            return result;
         }
     };
 
@@ -228,8 +262,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     api_port,
                     binary.clone(),
                 )
-                .with_discovery(discovery.clone())
-                .with_capabilities(vec!["inference".to_string(), "host".to_string()]),
+        .with_discovery(discovery.clone())
+        .with_capabilities(vec!["inference".to_string(), "host".to_string()])
+        .with_memory_policy(
+            config.hardware.safety.mmap,
+            config.hardware.safety.max_ram_usage_percent,
+        ),
             );
             let control_handle = spawn_control_plane(
                 SocketAddr::from(([0, 0, 0, 0], config.network.control_port)),
@@ -253,6 +291,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 threads: profile.recommended_threads,
                 context_size: ctx,
                 extra_args: Vec::new(),
+                use_mmap: config.hardware.safety.mmap,
+                memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
             };
             supervisor.spawn(server_cfg).await?;
             let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -453,6 +493,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let api_host = config.network.api_host.clone();
             let api_port = config.network.api_port;
             let llama_binary = PathBuf::from(&config.node.llama_server_binary);
+            let rpc_binary = binary.unwrap_or_else(|| PathBuf::from(&config.node.rpc_server_binary));
+            let use_mmap = config.hardware.safety.mmap;
+            let memory_budget_percent = config.hardware.safety.max_ram_usage_percent;
 
             // Start discovery service advertising RPC worker readiness
             let discovery = Arc::new(DiscoveryService::new(config, None));
@@ -475,7 +518,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .with_discovery(discovery.clone())
                 .with_rpc_ready(true)
-                .with_capabilities(vec!["rpc".to_string(), "worker".to_string()]),
+                .with_capabilities(vec!["rpc".to_string(), "worker".to_string()])
+                .with_memory_policy(use_mmap, memory_budget_percent),
             );
             let control_handle = spawn_control_plane(
                 SocketAddr::from(([0, 0, 0, 0], control_port)),
@@ -487,7 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Control-plane listening on port {}", control_port);
 
-            let child = tokio::process::Command::new(&binary)
+            let child = tokio::process::Command::new(&rpc_binary)
                 .args(["-H", "0.0.0.0", "-p", &port.to_string(), "-m", &mem.to_string()])
                 .spawn();
 
@@ -510,7 +554,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     control_handle.abort();
-                    eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", binary, e);
+                    eprintln!("Failed to spawn {:?}: {}. Please check that rpc-server is built and in PATH.", rpc_binary, e);
                     std::process::exit(1);
                 }
             }
@@ -559,8 +603,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = NexusConfig::load()?;
             let trans_mode = transport.parse::<TransportMode>().unwrap_or(TransportMode::Auto);
 
-            let (usb_endpoint, is_usb) = if host.is_none() {
-                AdbTunnelSupervisor::resolve_transport_endpoint(trans_mode, 8080, 50052)
+            let (usb_endpoint, is_usb) = if host.is_none() && config.cluster.prefer_adb_tunnel {
+                AdbTunnelSupervisor::resolve_transport_endpoint(
+                    trans_mode,
+                    config.network.api_port,
+                    config.cluster.rpc_port,
+                )
             } else {
                 (None, false)
             };
@@ -653,6 +701,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let app = ChatApp::new(client, model, sys_prompt);
                 run_chat_tui(app).await?;
             }
+        }
+
+        Commands::Doctor => {
+            let config = NexusConfig::load().unwrap_or_default();
+            let report = nexus::doctor::run_doctor(&config);
+            report.print();
+            if let Some(path) = &log_path {
+                println!("Log file: {}", path.display());
+            }
+            std::process::exit(report.exit_code());
         }
     }
 

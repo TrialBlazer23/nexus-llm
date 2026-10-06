@@ -57,6 +57,10 @@ pub struct LlamaServerConfig {
     pub threads: usize,
     pub context_size: usize,
     pub extra_args: Vec<String>,
+    /// When false, pass `--no-mmap` to llama-server.
+    pub use_mmap: bool,
+    /// LMK / memory ceiling percent (from `hardware.safety.max_ram_usage_percent`).
+    pub memory_budget_percent: u8,
 }
 
 impl LlamaServerConfig {
@@ -75,6 +79,8 @@ impl LlamaServerConfig {
             threads: 6,
             context_size: 4096,
             extra_args: Vec::new(),
+            use_mmap: true,
+            memory_budget_percent: 75,
         }
     }
 
@@ -108,6 +114,9 @@ impl LlamaServerConfig {
             "-ngl".to_string(),
             effective_gpu_layers.to_string(),
         ];
+        if !self.use_mmap {
+            args.push("--no-mmap".to_string());
+        }
         args.extend(self.extra_args.clone());
         args
     }
@@ -186,13 +195,19 @@ impl ProcessSupervisor {
             let model_size_bytes = model_metadata.len();
             let sys_profile = SystemProfile::probe();
 
-            if !sys_profile.can_safely_load(model_size_bytes, config.context_size) {
+            if !sys_profile.can_safely_load_pct(
+                model_size_bytes,
+                config.context_size,
+                config.memory_budget_percent,
+            ) {
                 let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
                 let total_required = model_size_bytes + kv_bytes;
                 return Err(SupervisorError::MemoryCapExceeded {
                     required_mb: total_required / (1024 * 1024),
                     available_mb: sys_profile.available_ram_mb,
-                    max_allowed_mb: sys_profile.max_allowed_memory_bytes() / (1024 * 1024),
+                    max_allowed_mb: sys_profile
+                        .max_allowed_memory_bytes_pct(config.memory_budget_percent)
+                        / (1024 * 1024),
                 });
             }
         }

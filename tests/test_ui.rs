@@ -124,3 +124,29 @@ fn test_models_scanner() {
     let scanned = scan_models_dir(temp_dir.path());
     assert_eq!(scanned.len(), 0);
 }
+
+#[test]
+fn test_clean_conversation_messages() {
+    let raw_messages = vec![
+        ChatMessage::assistant("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
+        ChatMessage::assistant("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
+        ChatMessage::assistant("⚠️ [Connection / Generation Error]: Transport Error"),
+        ChatMessage::assistant("Model unloaded. Local inference engine is idle."),
+        ChatMessage::user("What is the capital of France?"),
+        ChatMessage::assistant("The capital of France is Paris."),
+        ChatMessage::user("And its population?"),
+    ];
+
+    let cleaned = ChatApp::clean_conversation_messages(&raw_messages, Some("You are a helpful assistant."));
+
+    assert_eq!(cleaned.len(), 4); // System instruction + 3 genuine dialogue turns
+    assert_eq!(cleaned[0].role, "system");
+    assert_eq!(cleaned[0].content, "You are a helpful assistant.");
+    assert_eq!(cleaned[1].role, "user");
+    assert_eq!(cleaned[1].content, "What is the capital of France?");
+    assert_eq!(cleaned[2].role, "assistant");
+    assert_eq!(cleaned[2].content, "The capital of France is Paris.");
+    assert_eq!(cleaned[3].role, "user");
+    assert_eq!(cleaned[3].content, "And its population?");
+}
+

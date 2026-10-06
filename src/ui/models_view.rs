@@ -223,9 +223,9 @@ impl ModelsView {
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
             } else if m.lmk_compatible {
-                " [Enter] Select Execution Device & Chat  |  [P] Persona  |  [R] Rescan ".to_string()
+                " [Enter] Select Execution Device  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
             } else {
-                " [Enter] Select Cluster Node (Offload)  |  [P] Persona  |  [R] Rescan ".to_string()
+                " [Enter] Select Cluster Node  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
             };
 
             let action_widget = Paragraph::new(Line::from(vec![Span::styled(

@@ -367,6 +367,8 @@ pub struct DiscoveryService {
     udp_health: Arc<RwLock<BackendHealth>>,
     mdns_health: Arc<RwLock<BackendHealth>>,
     extra_targets: Arc<RwLock<Vec<SocketAddr>>>,
+    last_unicast_replies: Arc<RwLock<HashMap<std::net::IpAddr, Instant>>>,
+    mdns_enabled: Arc<RwLock<bool>>,
 }
 
 impl DiscoveryService {
@@ -382,8 +384,9 @@ impl DiscoveryService {
         } else {
             BackendHealth::Stopped
         }));
+        let mdns_enabled_val = config.network.discovery.enabled && config.network.discovery.mdns.enabled;
         let mdns_health = Arc::new(RwLock::new(
-            if config.network.discovery.enabled && config.network.discovery.mdns.enabled {
+            if mdns_enabled_val {
                 BackendHealth::Started
             } else {
                 BackendHealth::Stopped
@@ -404,6 +407,8 @@ impl DiscoveryService {
             udp_health,
             mdns_health,
             extra_targets: Arc::new(RwLock::new(Vec::new())),
+            last_unicast_replies: Arc::new(RwLock::new(HashMap::new())),
+            mdns_enabled: Arc::new(RwLock::new(mdns_enabled_val)),
         }
     }
 
@@ -433,6 +438,39 @@ impl DiscoveryService {
 
     pub async fn set_mdns_health(&self, health: BackendHealth) {
         *self.mdns_health.write().await = health;
+    }
+
+    pub async fn is_mdns_enabled(&self) -> bool {
+        *self.mdns_enabled.read().await
+    }
+
+    pub async fn set_mdns_enabled(self: &Arc<Self>, enabled: bool) {
+        let mut mdns_en = self.mdns_enabled.write().await;
+        if *mdns_en == enabled {
+            return;
+        }
+        *mdns_en = enabled;
+        drop(mdns_en);
+
+        if enabled {
+            info!("Hot-reloading discovery: enabling and starting mDNS-SD service");
+            self.clone().start_mdns();
+        } else {
+            info!("Hot-reloading discovery: disabling mDNS-SD service");
+            *self.mdns_health.write().await = BackendHealth::Stopped;
+        }
+    }
+
+    /// Register a peer IP and transmit an immediate targeted discovery probe to its discovery port.
+    pub async fn send_direct_probe_to_ip(&self, ip: std::net::IpAddr) {
+        let target = SocketAddr::new(ip, self.config.network.discovery_port);
+        {
+            let mut extra = self.extra_targets.write().await;
+            if !extra.contains(&target) {
+                extra.push(target);
+            }
+        }
+        self.send_probe_to(target).await;
     }
 
     pub async fn set_active_model(&self, model_name: impl Into<String>) {
@@ -778,19 +816,38 @@ impl DiscoveryService {
                                         let _ = sender.send(event).await;
                                     }
 
-                                    // If this node is a host and received a client beacon/probe, reply unicast immediately
-                                    let is_host_node =
-                                        NodeRole::from_str_role(&self.config.node.role).is_host();
-                                    if is_host_node && beacon.role.is_client() {
-                                        let reply_addr = SocketAddr::new(
-                                            peer_addr.ip(),
-                                            self.config.network.discovery_port,
-                                        );
+                                    // Auto-register peer endpoint into extra_targets so ongoing periodic unicast beacons reach it
+                                    let peer_discovery_addr = SocketAddr::new(
+                                        peer_addr.ip(),
+                                        self.config.network.discovery_port,
+                                    );
+                                    {
+                                        let mut extra = self.extra_targets.write().await;
+                                        if !extra.contains(&peer_discovery_addr) {
+                                            extra.push(peer_discovery_addr);
+                                        }
+                                    }
+
+                                    // Symmetric Mesh Discovery:
+                                    // Respond directly to the sender via unicast UDP with rate-limiting (at most once every 5 seconds per peer IP)
+                                    // to prevent recursive ping-pong storms while ensuring reliable discovery across Wi-Fi routers that drop broadcast.
+                                    let should_reply = {
+                                        let mut replies = self.last_unicast_replies.write().await;
+                                        match replies.get(&peer_addr.ip()) {
+                                            Some(last) if last.elapsed() < Duration::from_secs(5) => false,
+                                            _ => {
+                                                replies.insert(peer_addr.ip(), Instant::now());
+                                                true
+                                            }
+                                        }
+                                    };
+
+                                    if should_reply {
                                         let profile = SystemProfile::probe();
                                         let reply_beacon = BeaconPacket {
                                             magic: BEACON_MAGIC,
                                             version: BEACON_VERSION,
-                                            role: NodeRole::HOST,
+                                            role: NodeRole::from_str_role(&self.config.node.role),
                                             status: *self.status_flags.read().await,
                                             uuid: self.node_uuid,
                                             api_port: self.config.network.api_port,
@@ -802,7 +859,7 @@ impl DiscoveryService {
                                             active_model: self.active_model.read().await.clone(),
                                         };
                                         let reply_bytes = reply_beacon.encode();
-                                        let _ = socket.send_to(&reply_bytes, reply_addr).await;
+                                        let _ = socket.send_to(&reply_bytes, peer_discovery_addr).await;
                                     }
                                 }
                                 Err(e) => {
@@ -1003,7 +1060,13 @@ impl DiscoveryService {
 
     /// Spawn asynchronous mDNS advertising and browsing service if enabled.
     pub fn start_mdns(self: Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
-        if !self.config.network.discovery.enabled || !self.config.network.discovery.mdns.enabled {
+        let enabled = if let Ok(guard) = self.mdns_enabled.try_read() {
+            *guard
+        } else {
+            self.config.network.discovery.mdns.enabled
+        };
+
+        if !self.config.network.discovery.enabled || !enabled {
             info!("mDNS discovery disabled by configuration");
             return None;
         }

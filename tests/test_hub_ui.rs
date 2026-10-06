@@ -314,8 +314,9 @@ async fn test_hub_app_target_node_selection_modal() {
     assert!(hub.pending_target_selection.is_some());
     let state = hub.pending_target_selection.as_mut().unwrap();
     assert_eq!(state.model_name, "qwen2.5-coder-7b");
-    assert_eq!(state.candidates.len(), 1); // At least Local machine
+    assert_eq!(state.candidates.len(), 2); // Local GPU and Local CPU options
     assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
+    assert!(matches!(state.candidates[1], TargetExecutionNode::LocalCpu { .. }));
 
     // Add a simulated remote peer candidate
     let peer_id = Uuid::new_v4();
@@ -326,7 +327,7 @@ async fn test_hub_app_target_node_selection_modal() {
         free_ram_mb: 8500,
         backend: "Vulkan".to_string(),
     });
-    assert_eq!(state.candidates.len(), 2);
+    assert_eq!(state.candidates.len(), 3);
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -337,7 +338,7 @@ async fn test_hub_app_target_node_selection_modal() {
 
     assert!(content.contains("Target Node Selection"), "Must render modal title");
     assert!(content.contains("qwen2.5-coder-7b"), "Must render target model name");
-    assert!(content.contains("Local Machine"), "Must list Local Machine option");
+    assert!(content.contains("Local GPU") || content.contains("Local CPU"), "Must list Local execution options");
     assert!(content.contains("Galaxy-S23"), "Must list remote peer candidate");
 }
 
@@ -436,5 +437,36 @@ async fn test_cluster_view_header_status_badges() {
     assert!(content.contains("UDP:"));
     assert!(content.contains("mDNS:"));
     assert!(content.contains("Broadcasting"));
+}
+
+#[tokio::test]
+async fn test_hub_app_unload_model() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery.clone());
+
+    // Initially no model loaded
+    assert_eq!(hub.active_model_name, "None (Idle)");
+    hub.unload_active_model().await;
+    assert_eq!(hub.active_model_name, "None (Idle)");
+
+    // Simulate an active model name and discovery advertisement
+    hub.active_model_name = "test-model-3b".to_string();
+    discovery.set_active_model("test-model-3b").await;
+    discovery.set_status_flags(nexus::discovery::StatusFlags::READY).await;
+
+    // Call unload
+    hub.unload_active_model().await;
+    assert_eq!(hub.active_model_name, "None (Idle)");
+    assert_eq!(hub.chat.model_name, "default");
+    assert!(hub.status_message.is_some());
+    let (msg, color) = hub.status_message.as_ref().unwrap();
+    assert!(msg.contains("Unloaded model 'test-model-3b'"));
+    assert_eq!(*color, ratatui::style::Color::Cyan);
+
+    // Verify chat received unload notice
+    let last_msg = hub.chat.messages.last().expect("Must have unload notice message");
+    assert!(last_msg.content.contains("Model 'test-model-3b' unloaded"));
 }
 

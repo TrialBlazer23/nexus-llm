@@ -94,7 +94,8 @@ impl ClusterView {
                 BackendHealth::Stopped => BackendStatus::Disabled,
             };
 
-            if !self.discovery.config().network.discovery.mdns.enabled {
+            let mdns_enabled = self.discovery.is_mdns_enabled().await;
+            if !mdns_enabled {
                 self.mdns_status = BackendStatus::Disabled;
             } else {
                 let mdns_health = *self.discovery.mdns_health().read().await;

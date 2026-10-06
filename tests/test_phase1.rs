@@ -244,6 +244,8 @@ fn test_supervisor_command_args_builder() {
     assert_eq!(vulkan_args.iter().skip_while(|&x| x != "-ngl").nth(1).unwrap(), "99");
     assert!(vulkan_args.contains(&"--port".to_string()));
     assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--port").nth(1).unwrap(), "8080");
+    assert!(vulkan_args.contains(&"--alias".to_string()));
+    assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--alias").nth(1).unwrap(), "model");
 
     // Test CPU fallback args (-ngl 0)
     let cpu_args = cfg.build_args(0);

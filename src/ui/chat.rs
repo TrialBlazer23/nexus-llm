@@ -59,6 +59,34 @@ impl ChatApp {
         }
     }
 
+    /// Returns true if a message is a genuine dialogue turn rather than a system/UI banner.
+    pub fn is_conversation_message(m: &ChatMessage) -> bool {
+        let trimmed = m.content.trim();
+        !trimmed.starts_with("Model '")
+            && !trimmed.starts_with("Connected to")
+            && !trimmed.starts_with("⚠️")
+            && !trimmed.starts_with("Model unloaded")
+            && !trimmed.starts_with("Disconnected from")
+            && !trimmed.starts_with("Loaded '")
+    }
+
+    /// Build a cleaned list of messages for sending to OpenAI /v1/chat/completions.
+    pub fn clean_conversation_messages(
+        messages: &[ChatMessage],
+        system_prompt: Option<&str>,
+    ) -> Vec<ChatMessage> {
+        let mut req_messages = Vec::new();
+        if let Some(sys) = system_prompt {
+            req_messages.push(ChatMessage::system(sys));
+        }
+        for m in messages {
+            if Self::is_conversation_message(m) {
+                req_messages.push(m.clone());
+            }
+        }
+        req_messages
+    }
+
     /// Calculate approximate total line count across current conversation.
     pub fn total_lines(&self) -> usize {
         let mut count = 0;
@@ -168,11 +196,7 @@ impl ChatApp {
                     self.tokens_per_sec = 0.0;
                     self.stream_start_time = Some(Instant::now());
 
-                    let mut req_messages = Vec::new();
-                    if let Some(sys) = &self.system_prompt {
-                        req_messages.push(ChatMessage::system(sys));
-                    }
-                    req_messages.extend(self.messages.clone());
+                    let req_messages = Self::clean_conversation_messages(&self.messages, self.system_prompt.as_deref());
 
                     let req = ChatCompletionRequest {
                         model: self.model_name.clone(),
@@ -441,11 +465,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                     app.stream_start_time = Some(Instant::now());
 
                                     // Build full request messages
-                                    let mut req_messages = Vec::new();
-                                    if let Some(sys) = &app.system_prompt {
-                                        req_messages.push(ChatMessage::system(sys));
-                                    }
-                                    req_messages.extend(app.messages.clone());
+                                    let req_messages = ChatApp::clean_conversation_messages(&app.messages, app.system_prompt.as_deref());
 
                                     let req = ChatCompletionRequest {
                                         model: app.model_name.clone(),
@@ -502,7 +522,12 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     }
                     StreamMsg::Error(err) => {
                         app.finalize_stream();
-                        app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}", err)));
+                        let hint = if err.contains("Transport Error") || err.contains("error sending request") {
+                            "\n💡 Hint: If running on mobile GPU (Vulkan), try unloading ('u') and loading via 'Local (CPU Mode)' in [F2] Models to bypass mobile GPU driver freezes."
+                        } else {
+                            ""
+                        };
+                        app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
                         app.status_message = Some(format!("Error: {}", err));
                         app.auto_scroll = true;
                     }

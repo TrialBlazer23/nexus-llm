@@ -1,6 +1,8 @@
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -83,6 +85,13 @@ impl LlamaServerConfig {
 
     /// Construct command-line argument list for llama-server.
     pub fn build_args(&self, effective_gpu_layers: u32) -> Vec<String> {
+        let model_alias = self
+            .model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model")
+            .to_string();
+
         let mut args = vec![
             "--host".to_string(),
             self.host.clone(),
@@ -90,6 +99,8 @@ impl LlamaServerConfig {
             self.port.to_string(),
             "-m".to_string(),
             self.model_path.to_string_lossy().to_string(),
+            "--alias".to_string(),
+            model_alias,
             "-c".to_string(),
             self.context_size.to_string(),
             "-t".to_string(),
@@ -110,6 +121,7 @@ pub struct ProcessSupervisor {
     active_backend: AccelerationBackend,
     client: reqwest::Client,
     state_tx: watch::Sender<SupervisorState>,
+    stderr_history: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl ProcessSupervisor {
@@ -129,6 +141,27 @@ impl ProcessSupervisor {
 
     pub fn state(&self) -> SupervisorState {
         *self.state_tx.borrow()
+    }
+
+    /// Return a copy of recently captured stderr lines from llama-server (up to 50 lines).
+    pub fn last_stderr_lines(&self) -> Vec<String> {
+        self.stderr_history
+            .lock()
+            .map(|hist| hist.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Non-blocking check of whether the underlying child process has exited.
+    pub fn check_status(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
+        if let Some(child) = &mut self.child {
+            let res = child.try_wait()?;
+            if res.is_some() {
+                let _ = self.state_tx.send(SupervisorState::Failed);
+            }
+            Ok(res)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Spawn llama-server with Vulkan GPU offload if requested, automatically
@@ -169,6 +202,8 @@ impl ProcessSupervisor {
             .build()
             .map_err(|e| SupervisorError::SpawnFailed(e.to_string()))?;
 
+        let stderr_history = Arc::new(Mutex::new(VecDeque::with_capacity(50)));
+
         // Attempt 1: Vulkan offload if requested
         if config.gpu_layers > 0 {
             info!(
@@ -182,6 +217,7 @@ impl ProcessSupervisor {
                         &mut child,
                         &mut stdout_reader,
                         &mut stderr_reader,
+                        stderr_history.clone(),
                         Duration::from_secs(4),
                     )
                     .await;
@@ -189,7 +225,7 @@ impl ProcessSupervisor {
                     match vulkan_result {
                         Ok(()) => {
                             info!("Vulkan acceleration successfully initialized.");
-                            Self::spawn_drain_tasks(stdout_reader, stderr_reader);
+                            Self::spawn_drain_tasks(stdout_reader, stderr_reader, stderr_history.clone());
                             let (state_tx, _) = watch::channel(SupervisorState::Starting);
                             let mut supervisor = Self {
                                 child: Some(child),
@@ -197,6 +233,7 @@ impl ProcessSupervisor {
                                 active_backend: AccelerationBackend::Vulkan,
                                 client: http_client.clone(),
                                 state_tx,
+                                stderr_history: stderr_history.clone(),
                             };
 
                             // Wait for /health endpoint readiness
@@ -234,7 +271,7 @@ impl ProcessSupervisor {
             config.threads
         );
         let (child, stdout_reader, stderr_reader) = Self::try_spawn(&config, 0).await?;
-        Self::spawn_drain_tasks(stdout_reader, stderr_reader);
+        Self::spawn_drain_tasks(stdout_reader, stderr_reader, stderr_history.clone());
 
         let (state_tx, _) = watch::channel(SupervisorState::Starting);
         let mut supervisor = Self {
@@ -247,6 +284,7 @@ impl ProcessSupervisor {
             },
             client: http_client,
             state_tx,
+            stderr_history,
         };
 
         if !supervisor.wait_until_ready(Duration::from_secs(20)).await {
@@ -264,6 +302,7 @@ impl ProcessSupervisor {
     fn spawn_drain_tasks(
         mut stdout_reader: BufReader<tokio::process::ChildStdout>,
         mut stderr_reader: BufReader<tokio::process::ChildStderr>,
+        stderr_history: Arc<Mutex<VecDeque<String>>>,
     ) {
         tokio::spawn(async move {
             let mut line = String::new();
@@ -282,7 +321,16 @@ impl ProcessSupervisor {
                 if n == 0 {
                     break;
                 }
-                debug!("[llama-server stderr] {}", line.trim_end());
+                let trimmed = line.trim_end().to_string();
+                if !trimmed.is_empty() {
+                    debug!("[llama-server stderr] {}", trimmed);
+                    if let Ok(mut hist) = stderr_history.lock() {
+                        if hist.len() >= 50 {
+                            hist.pop_front();
+                        }
+                        hist.push_back(trimmed);
+                    }
+                }
                 line.clear();
             }
         });
@@ -331,6 +379,7 @@ impl ProcessSupervisor {
         child: &mut Child,
         _stdout_reader: &mut BufReader<tokio::process::ChildStdout>,
         stderr_reader: &mut BufReader<tokio::process::ChildStderr>,
+        stderr_history: Arc<Mutex<VecDeque<String>>>,
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -353,6 +402,15 @@ impl ProcessSupervisor {
                             break;
                         }
                         (Ok(_), line) => {
+                            let trimmed = line.trim_end().to_string();
+                            if !trimmed.is_empty() {
+                                if let Ok(mut hist) = stderr_history.lock() {
+                                    if hist.len() >= 50 {
+                                        hist.pop_front();
+                                    }
+                                    hist.push_back(trimmed.clone());
+                                }
+                            }
                             let lower = line.to_lowercase();
                             debug!("[llama-server] {}", line.trim_end());
 

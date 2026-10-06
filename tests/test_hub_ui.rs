@@ -296,8 +296,12 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut hub = test_hub(config, client, discovery);
 
-    // Simulate pending hot swap
-    hub.pending_hot_swap_path = Some(PathBuf::from("/models/llama-3.2-3b.gguf"));
+    // Simulate pending hot swap with full intent (preserves -ngl)
+    hub.pending_hot_swap = Some(nexus::ui::hub::HotSwapIntent {
+        path: PathBuf::from("/models/llama-3.2-3b.gguf"),
+        gpu_layers: Some(0),
+        context_size: 4096,
+    });
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -326,7 +330,7 @@ async fn test_hub_app_target_node_selection_modal() {
 
     assert!(hub.pending_target_selection.is_some());
     let state = hub.pending_target_selection.as_mut().unwrap();
-    assert_eq!(state.model_name, "qwen2.5-coder-7b");
+    assert_eq!(state.model_name, "qwen2.5-coder-7b.gguf");
     assert_eq!(state.candidates.len(), 2); // Local GPU and Local CPU options
     assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
     assert!(matches!(state.candidates[1], TargetExecutionNode::LocalCpu { .. }));
@@ -485,6 +489,6 @@ async fn test_hub_app_unload_model() {
 
     // Verify chat received unload notice
     let last_msg = hub.chat.messages.last().expect("Must have unload notice message");
-    assert!(last_msg.content.contains("Model 'test-model-3b' unloaded"));
+    assert!(last_msg.message.content.contains("Model 'test-model-3b' unloaded"));
 }
 

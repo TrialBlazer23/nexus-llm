@@ -1,4 +1,3 @@
-use crate::gguf::GgufMetadata;
 use crate::sysinfo::SystemProfile;
 use crate::ui::models::{scan_models_dir, ModelEntry};
 use ratatui::{
@@ -17,6 +16,10 @@ pub struct ModelsView {
     pub models: Vec<ModelEntry>,
     pub selected_index: usize,
     pub status_message: Option<String>,
+    /// Refreshed on tick / rescan — never inside `render`.
+    pub cached_profile: SystemProfile,
+    /// Context size used for local loads (Models +/-).
+    pub selected_context: usize,
 }
 
 impl ModelsView {
@@ -27,14 +30,28 @@ impl ModelsView {
             models,
             selected_index: 0,
             status_message: None,
+            cached_profile: SystemProfile::probe(),
+            selected_context: 4096,
         }
+    }
+
+    pub fn refresh_profile(&mut self) {
+        self.cached_profile = SystemProfile::probe();
     }
 
     pub fn refresh(&mut self) {
         self.models = scan_models_dir(&self.models_dir);
+        self.refresh_profile();
         if self.selected_index >= self.models.len() && !self.models.is_empty() {
             self.selected_index = self.models.len() - 1;
         }
+    }
+
+    pub fn adjust_context(&mut self, delta: i32) {
+        let step = 512i32;
+        let next = (self.selected_context as i32 + delta * step).clamp(512, 131_072);
+        self.selected_context = next as usize;
+        self.status_message = Some(format!("Context size: {} tokens", self.selected_context));
     }
 
     pub fn next(&mut self) {
@@ -89,16 +106,29 @@ impl ModelsView {
 
                     let prefix = if is_selected { " > " } else { "   " };
                     let style = if is_selected {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
 
                     let line = Line::from(vec![
                         Span::styled(prefix, style),
-                        Span::styled(format!("{:<32}", truncate_string(&m.filename, 30)), style),
-                        Span::styled(format!("{:>6} MB ", m.size_mb), Style::default().fg(Color::Gray)),
-                        Span::styled(badge_text, Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!("{:<32}", truncate_string(&m.filename, 30)),
+                            style,
+                        ),
+                        Span::styled(
+                            format!("{:>6} MB ", m.size_mb),
+                            Style::default().fg(Color::Gray),
+                        ),
+                        Span::styled(
+                            badge_text,
+                            Style::default()
+                                .fg(badge_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     ]);
 
                     ListItem::new(line)
@@ -106,7 +136,11 @@ impl ModelsView {
                 .collect()
         };
 
-        let list_title = format!(" Local Models ({}) | Path: {:?} ", self.models.len(), self.models_dir);
+        let list_title = format!(
+            " Local Models ({}) | Path: {:?} ",
+            self.models.len(),
+            self.models_dir
+        );
         let list_widget = List::new(items).block(
             Block::default()
                 .title(list_title)
@@ -121,20 +155,14 @@ impl ModelsView {
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(12),   // Metadata attributes
-                Constraint::Length(5),  // RAM Health & LMK Gauge
-                Constraint::Length(4),  // Action bar
+                Constraint::Min(12),
+                Constraint::Length(5),
+                Constraint::Length(4),
             ])
             .split(area);
 
         if let Some(m) = self.selected_model() {
-            let meta = GgufMetadata::open(&m.path).ok();
-            let block_count = meta.as_ref().and_then(|g| g.block_count).unwrap_or(0);
-            let head_count = meta.as_ref().and_then(|g| g.head_count).unwrap_or(0);
-            let embed_len = meta.as_ref().and_then(|g| g.embedding_length).unwrap_or(0);
-            let version = meta.as_ref().map(|g| g.version).unwrap_or(3);
-
-            let profile = SystemProfile::probe();
+            let profile = &self.cached_profile;
             let total_ram_mb = profile.total_ram_mb;
             let avail_ram_mb = profile.available_ram_mb;
             let lmk_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
@@ -157,39 +185,79 @@ impl ModelsView {
             let info_lines = vec![
                 Line::from(vec![
                     Span::styled(" Model File:        ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(&m.filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        &m.filename,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Format Version:    ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("GGUF v{}", version), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("GGUF v{}", m.gguf_version),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Architecture:      ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(&m.architecture, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        &m.architecture,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Weight Size:       ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{} MB", m.size_mb), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{} MB", m.size_mb),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Transformer Layers:", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{}", block_count), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{}", m.block_count),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Attention Heads:   ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{}", head_count), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{}", m.head_count),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Embedding Length:  ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{}", embed_len), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{}", m.embedding_length),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Context Limit:     ", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{} tokens", m.context_length), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{} tokens", m.context_length),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Selected Context:  ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        format!("{} tokens (+/-)", self.selected_context),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled(" Exact KV Cache (4k):", Style::default().fg(Color::LightBlue)),
-                    Span::styled(format!("{} MB", m.exact_kv_mb), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{} MB", m.exact_kv_mb),
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
             ];
 
@@ -201,7 +269,6 @@ impl ModelsView {
             );
             frame.render_widget(meta_widget, right_chunks[0]);
 
-            // RAM Health Block
             let gauge_label = format!(
                 "{} MB / {} MB Cap (Available: {} MB of {} MB)",
                 required_mb, lmk_cap_mb, avail_ram_mb, total_ram_mb
@@ -219,18 +286,20 @@ impl ModelsView {
                 .label(gauge_label);
             frame.render_widget(gauge_widget, right_chunks[1]);
 
-            // Action / Status bar
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
             } else if m.lmk_compatible {
-                " [Enter] Select Execution Device  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
+                " [Enter] Select Device  |  [+/-] Context  |  [u] Unload  |  [R] Rescan ".to_string()
             } else {
-                " [Enter] Select Cluster Node  |  [u] Unload  |  [P] Persona  |  [R] Rescan ".to_string()
+                " [Enter] Select Cluster Node  |  [+/-] Context  |  [u] Unload  |  [R] Rescan "
+                    .to_string()
             };
 
             let action_widget = Paragraph::new(Line::from(vec![Span::styled(
                 status_text,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )]))
             .block(
                 Block::default()

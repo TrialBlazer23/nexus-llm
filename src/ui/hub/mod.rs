@@ -1,26 +1,32 @@
-use crate::client::{ChatMessage, NexusClient};
+//! Unified Nexus Hub TUI (Phase 8 — responsive command/event architecture).
+
+pub mod commands;
+pub mod keymap;
+
+use crate::client::NexusClient;
 use crate::config::NexusConfig;
 use crate::control_plane::{
-    dispatch_load_model, dispatch_load_model_signed, dispatch_pair, ModelLoadRequest,
-    ModelLoadResponse, PairRequest, CONTROL_PLANE_VERSION,
+    dispatch_pair, PairRequest, CONTROL_PLANE_VERSION,
 };
-use crate::control_plane::ControlPlaneError;
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
 use crate::node_identity::NodeIdentity;
 use crate::registry_runtime::spawn_registry_runtime;
-use crate::supervisor::{LlamaServerConfig, SupervisorManager};
-use crate::sysinfo::SystemProfile;
-use crate::ui::chat::{ChatApp, StreamMsg};
+use crate::supervisor::SupervisorManager;
+use crate::ui::chat::{ChatApp, ChatEntry, StreamMsg};
 use crate::ui::cluster_view::ClusterView;
 use crate::ui::models_view::ModelsView;
 use crate::ui::settings_view::SettingsView;
+use commands::{
+    request_load_or_hot_swap, spawn_hub_worker, HubCommand, HubEvent, HubWorkerCtx,
+};
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures_util::StreamExt;
+use keymap::{resolve, HubAction, KeyScope};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -35,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +79,7 @@ pub enum TargetExecutionNode {
     Remote {
         uuid: Uuid,
         name: String,
-        /// Control-plane base URL used for `dispatch_load_model`.
         endpoint: String,
-        /// OpenAI-compatible inference URL used after a successful remote load.
         api_endpoint: String,
         free_ram_mb: u32,
         backend: String,
@@ -85,14 +89,37 @@ pub enum TargetExecutionNode {
 impl TargetExecutionNode {
     pub fn display_label(&self) -> String {
         match self {
-            Self::Local { allocatable_mb, backend, gpu_layers } => {
-                format!("⚡ Local GPU (Accelerated - {} layers) - {} MB allocatable | {}", gpu_layers, allocatable_mb, backend)
+            Self::Local {
+                allocatable_mb,
+                backend,
+                gpu_layers,
+            } => {
+                format!(
+                    "⚡ Local GPU (Accelerated - {} layers) - {} MB allocatable | {}",
+                    gpu_layers, allocatable_mb, backend
+                )
             }
-            Self::LocalCpu { allocatable_mb, backend, threads } => {
-                format!("🛡️  Local CPU (Safe Mode - 0 GPU layers, {} threads) - {} MB allocatable | {}", threads, allocatable_mb, backend)
+            Self::LocalCpu {
+                allocatable_mb,
+                backend,
+                threads,
+            } => {
+                format!(
+                    "🛡️  Local CPU (Safe Mode - 0 GPU layers, {} threads) - {} MB allocatable | {}",
+                    threads, allocatable_mb, backend
+                )
             }
-            Self::Remote { name, endpoint, free_ram_mb, backend, .. } => {
-                format!("📱 {} ({}) - {} MB free | {}", name, endpoint, free_ram_mb, backend)
+            Self::Remote {
+                name,
+                endpoint,
+                free_ram_mb,
+                backend,
+                ..
+            } => {
+                format!(
+                    "📱 {} ({}) - {} MB free | {}",
+                    name, endpoint, free_ram_mb, backend
+                )
             }
         }
     }
@@ -107,6 +134,14 @@ pub struct TargetSelectionState {
     pub selected_idx: usize,
 }
 
+/// Full hot-swap intent — path + GPU layers + context (CAPABILITY_REVIEW §2.6).
+#[derive(Debug, Clone)]
+pub struct HotSwapIntent {
+    pub path: PathBuf,
+    pub gpu_layers: Option<u32>,
+    pub context_size: usize,
+}
+
 pub struct HubApp {
     pub config: NexusConfig,
     pub discovery: Arc<DiscoveryService>,
@@ -117,12 +152,14 @@ pub struct HubApp {
     pub settings_view: SettingsView,
     pub supervisor: SupervisorManager,
     pub active_model_name: String,
-    pub pending_hot_swap_path: Option<PathBuf>,
+    pub pending_hot_swap: Option<HotSwapIntent>,
     pub pending_target_selection: Option<TargetSelectionState>,
     pub status_message: Option<(String, Color)>,
     pub identity: Arc<NodeIdentity>,
     pub shared_config: Arc<std::sync::RwLock<NexusConfig>>,
     pub config_path: std::path::PathBuf,
+    pub load_phase: Option<String>,
+    pub show_help: bool,
 }
 
 impl HubApp {
@@ -149,31 +186,20 @@ impl HubApp {
             settings_view,
             supervisor: SupervisorManager::new(),
             active_model_name: "None (Idle)".to_string(),
-            pending_hot_swap_path: None,
+            pending_hot_swap: None,
             pending_target_selection: None,
             status_message: None,
             identity,
             shared_config,
             config_path,
+            load_phase: None,
+            show_help: false,
         }
     }
 
     pub fn sync_shared_config(&mut self) {
         if let Ok(mut shared) = self.shared_config.write() {
             *shared = self.config.clone();
-        }
-    }
-
-    async fn dispatch_remote_load_request(
-        &self,
-        endpoint: &str,
-        req: ModelLoadRequest,
-    ) -> Result<ModelLoadResponse, ControlPlaneError> {
-        let client = reqwest::Client::new();
-        if self.config.network.security.pairing_enforced() {
-            dispatch_load_model_signed(&client, endpoint, &req, &self.identity).await
-        } else {
-            dispatch_load_model(&client, endpoint, &req).await
         }
     }
 
@@ -184,10 +210,7 @@ impl HubApp {
             .ok_or_else(|| "No peer selected".to_string())?
             .clone();
         let control_ep = peer.control_endpoint();
-        let requester_id = self
-            .config
-            .node_uuid()
-            .map_err(|e| e.to_string())?;
+        let requester_id = self.config.node_uuid().map_err(|e| e.to_string())?;
         let pair_req = PairRequest {
             protocol_version: CONTROL_PLANE_VERSION,
             requester_id,
@@ -205,7 +228,9 @@ impl HubApp {
             .network
             .security
             .record_pair(resp.node_id, resp.public_key);
-        self.config.save_to_path(&self.config_path).map_err(|e| e.to_string())?;
+        self.config
+            .save_to_path(&self.config_path)
+            .map_err(|e| e.to_string())?;
         self.sync_shared_config();
         Ok(())
     }
@@ -241,322 +266,140 @@ impl HubApp {
         });
     }
 
-    /// Open target execution device selector modal for a model.
+    /// Build target-selection candidates (used by tests and as a sync fallback).
     pub async fn open_target_selection(&mut self, model_path: PathBuf) {
-        let model_name = model_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let profile = SystemProfile::probe();
-        let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
-        let gpu_layers = if self.config.hardware.acceleration.prefer_gpu {
-            self.config.hardware.acceleration.gpu_layers
-        } else {
-            99
+        let ctx = HubWorkerCtx {
+            config: self.config.clone(),
+            discovery: self.discovery.clone(),
+            supervisor: self.supervisor.clone(),
+            identity: self.identity.clone(),
         };
-
-        let mut candidates = vec![
-            TargetExecutionNode::Local {
-                allocatable_mb: local_cap_mb,
-                backend: profile.detected_backend.to_string(),
-                gpu_layers,
-            },
-            TargetExecutionNode::LocalCpu {
-                allocatable_mb: local_cap_mb,
-                backend: "CPU Fallback (DotProd / Multi-thread)".to_string(),
-                threads: profile.recommended_threads,
-            },
-        ];
-
-        let peers = self.discovery.get_active_peers().await;
-        for p in peers {
-            if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
-                let name = p.label();
-                candidates.push(TargetExecutionNode::Remote {
-                    uuid: p.uuid,
-                    name,
-                    endpoint: p.control_endpoint(),
-                    api_endpoint: p.api_endpoint(),
-                    free_ram_mb: p.free_ram_mb,
-                    backend: p.backend.to_string(),
-                });
-            }
-        }
-
-        self.pending_target_selection = Some(TargetSelectionState {
-            model_path,
-            model_name,
-            candidates,
-            selected_idx: 0,
-        });
+        self.pending_target_selection =
+            Some(commands::build_target_selection(&ctx, model_path).await);
     }
 
-    /// Confirm and execute the selected target node.
-    pub async fn execute_target_selection(&mut self) {
-        if let Some(state) = self.pending_target_selection.take() {
-            if let Some(target) = state.candidates.get(state.selected_idx) {
-                match target {
-                    TargetExecutionNode::Local { gpu_layers, .. } => {
-                        self.chat.set_target_hardware("Local Host", format!("Local GPU ({} layers)", gpu_layers));
-                        self.request_model_load_with_gpu(state.model_path, Some(*gpu_layers)).await;
-                    }
-                    TargetExecutionNode::LocalCpu { .. } => {
-                        self.chat.set_target_hardware("Local Host", "Local CPU (DotProd / Multi-thread)");
-                        self.request_model_load_with_gpu(state.model_path, Some(0)).await;
-                    }
-                    TargetExecutionNode::Remote { endpoint, api_endpoint, name, backend, .. } => {
-                        let req = crate::control_plane::ModelLoadRequest {
-                            protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
-                            requester_id: self.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
-                            model_path: state.model_name.clone(),
-                            context_size: 4096,
-                            gpu_layers: if self.config.hardware.acceleration.prefer_gpu { 99 } else { 0 },
-                            threads: self.config.hardware.acceleration.cpu_threads,
-                            rpc_workers: Vec::new(),
-                        };
-
-                        info!("Dispatching remote model load to {}: {:?}", endpoint, req);
-                        match self.dispatch_remote_load_request(endpoint, req).await {
-                            Ok(resp) if resp.success => {
-                                self.active_model_name = state.model_name.clone();
-                                let target_api = if !resp.api_endpoint.is_empty()
-                                    && !resp.api_endpoint.contains("0.0.0.0")
-                                {
-                                    resp.api_endpoint
-                                } else {
-                                    api_endpoint.clone()
-                                };
-                                self.chat.client = NexusClient::new(target_api.clone());
-                                self.chat.model_name = state.model_name.clone();
-                                self.chat.set_target_hardware(name, backend);
-                                self.chat.messages.clear();
-                                self.chat.messages.push(ChatMessage::assistant(format!(
-                                    "Connected to remote model '{}' running on {}. Ready for inference.",
-                                    state.model_name, name
-                                )));
-                                self.status_message = Some((
-                                    format!("Active on {}: {}", name, state.model_name),
-                                    Color::Green,
-                                ));
-                                self.set_tab(HubTab::Chat);
-                            }
-                            Ok(resp) => {
-                                let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
-                                self.status_message = Some((
-                                    format!("Remote load failed on {}: {}", name, err),
-                                    Color::Red,
-                                ));
-                            }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                let hint = if err_str.contains("error sending request") {
-                                    format!(
-                                        "Remote dispatch failed to {}: no control-plane listener on {}. Is nexus/nexusd running on that device?",
-                                        name, endpoint
-                                    )
-                                } else {
-                                    format!("Remote dispatch failed to {}: {}", name, e)
-                                };
-                                self.status_message = Some((hint, Color::Red));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Request to launch a model. If a model is already active, prompts for hot-swap confirmation.
-    pub async fn request_model_load(&mut self, model_path: PathBuf) {
-        self.request_model_load_with_gpu(model_path, None).await;
-    }
-
-    /// Request model load specifying optional explicit GPU layer offload.
-    pub async fn request_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
-        if self.supervisor.is_running().await {
-            self.pending_hot_swap_path = Some(model_path);
-        } else {
-            self.execute_model_load_with_gpu(model_path, custom_gpu_layers).await;
-        }
-    }
-
-    /// Unload the currently running model and terminate its supervisor process.
+    /// Unload the active model (tests + direct callers). Event-loop path uses HubCommand::Unload.
     pub async fn unload_active_model(&mut self) {
+        let name = self.active_model_name.clone();
         let had_supervisor = self.supervisor.is_running().await;
+        let had_named = name != "None (Idle)";
         if had_supervisor {
-            info!("Unloading active model supervisor...");
             let _ = self.supervisor.stop().await;
         }
-
-        if had_supervisor || self.active_model_name != "None (Idle)" {
-            let unloaded_model = std::mem::replace(&mut self.active_model_name, "None (Idle)".to_string());
+        if had_supervisor || had_named {
             self.discovery.set_active_model("").await;
-            self.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
-
-            // Reset chat model to default
-            self.chat.model_name = "default".to_string();
-            self.chat.messages.push(ChatMessage::assistant(format!(
-                "Model '{}' unloaded. Local inference engine is idle.",
-                unloaded_model
-            )));
-            self.status_message = Some((
-                format!("Unloaded model '{}'", unloaded_model),
-                Color::Cyan,
-            ));
+            self.discovery
+                .set_status_flags(crate::discovery::StatusFlags(0))
+                .await;
+            self.apply_event(HubEvent::ModelUnloaded {
+                unloaded_model: name,
+            });
         } else {
-            self.status_message = Some((
-                "No local model is currently active to unload".to_string(),
-                Color::Yellow,
-            ));
+            self.apply_event(HubEvent::UnloadNoop);
         }
     }
 
-    /// Stop any active supervisor and load the new model process locally.
-    pub async fn execute_model_load(&mut self, model_path: PathBuf) {
-        self.execute_model_load_with_gpu(model_path, None).await;
-    }
-
-    /// Load model process locally with optional GPU layer count override (0 forces CPU mode).
-    pub async fn execute_model_load_with_gpu(&mut self, model_path: PathBuf, custom_gpu_layers: Option<u32>) {
-        if self.supervisor.is_running().await {
-            info!("Unloading active model supervisor...");
-            let _ = self.supervisor.stop().await;
-        }
-
-        let model_name = model_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let profile = SystemProfile::probe();
-        let threads = self.config.hardware.acceleration.cpu_threads;
-        let gpu_layers = if let Some(layers) = custom_gpu_layers {
-            layers
-        } else if self.config.hardware.acceleration.prefer_gpu {
-            self.config.hardware.acceleration.gpu_layers
-        } else {
-            0
-        };
-
-        // Check if model overflows local host memory budget
-        let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
-        let kv_bytes = SystemProfile::estimate_kv_cache_bytes(4096);
-        let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
-        let host_cap_mb = profile
-            .max_allowed_memory_bytes_pct(self.config.hardware.safety.max_ram_usage_percent)
-            / (1024 * 1024);
-
-        let mut extra_args = Vec::new();
-
-        if total_required_mb > host_cap_mb && self.config.cluster.enable_rpc {
-            let rpc_peer = if self.config.cluster.auto_offload {
-                self.discovery
-                    .select_rpc_candidate(crate::discovery::RpcSelectionPolicy {
-                        max_thermal_index: 75,
-                        max_allocatable_mb: self.config.cluster.max_rpc_ram_mb,
-                        require_pairing: self.config.network.security.require_pairing,
-                        protocol_version: CONTROL_PLANE_VERSION,
-                    })
-                    .await
-            } else {
-                None
-            };
-            let rpc_endpoint = rpc_peer.map(|candidate| candidate.peer.rpc_endpoint());
-            let remote_ram = if rpc_endpoint.is_some() {
-                Some(self.config.cluster.max_rpc_ram_mb)
-            } else {
-                None
-            };
-            let budget = crate::cluster::ClusterCoordinator::calculate_budget(
-                profile.available_ram_mb,
-                remote_ram,
-            );
-
-            let total_layers = if let Ok(gguf) = crate::gguf::GgufMetadata::open(&model_path) {
-                gguf.block_count.unwrap_or(32) as u32
-            } else {
-                32
-            };
-
-            match crate::cluster::ClusterCoordinator::plan_layer_split(
-                model_size_bytes,
-                kv_bytes,
-                total_layers,
-                &budget,
-                rpc_endpoint.as_deref(),
-            ) {
-                Ok(split) => {
-                    extra_args = split.build_llama_args();
-                }
-                Err(e) => {
-                    self.status_message = Some((format!("Memory budget error: {}", e), Color::Red));
-                    return;
-                }
+    /// Apply a worker event on the UI thread (no awaits).
+    pub fn apply_event(&mut self, event: HubEvent) {
+        match event {
+            HubEvent::Status { message, color } => {
+                self.status_message = Some((message, color));
             }
-        }
-
-        let server_cfg = LlamaServerConfig {
-            binary_path: PathBuf::from(&self.config.node.llama_server_binary),
-            model_path: model_path.clone(),
-            host: self.config.network.api_host.clone(),
-            port: self.config.network.api_port,
-            gpu_layers,
-            threads,
-            context_size: 4096,
-            extra_args,
-            use_mmap: self.config.hardware.safety.mmap,
-            memory_budget_percent: self.config.hardware.safety.max_ram_usage_percent,
-        };
-
-        info!("Spawning llama-server for model: {:?}", model_path);
-        match self.supervisor.spawn(server_cfg).await {
-            Ok(()) => {
+            HubEvent::ModelLoadProgress { phase } => {
+                self.load_phase = Some(phase.clone());
+                self.status_message = Some((phase, Color::Yellow));
+            }
+            HubEvent::ModelLoaded {
+                model_name,
+                endpoint,
+                backend_label,
+                notice,
+            } => {
+                self.load_phase = None;
                 self.active_model_name = model_name.clone();
-                self.discovery.set_active_model(&model_name).await;
-                self.discovery
-                    .set_status_flags(crate::discovery::StatusFlags::READY)
-                    .await;
-
-                // Reconfigure chat client to local host
-                let endpoint = format!("http://127.0.0.1:{}", self.config.network.api_port);
                 self.chat.client = NexusClient::new(endpoint);
                 self.chat.model_name = model_name;
-                let local_backend = if gpu_layers > 0 {
-                    format!("Local GPU ({} layers)", gpu_layers)
-                } else {
-                    "Local CPU (DotProd / Multi-thread)".to_string()
-                };
-                self.chat.set_target_hardware("Local Host", local_backend);
+                self.chat.set_target_hardware("Local Host", backend_label);
                 self.chat.messages.clear();
-                self.chat.messages.push(ChatMessage::assistant(format!(
-                    "Model '{}' loaded successfully and ready for inference.",
-                    self.active_model_name
-                )));
-
+                self.chat.messages.push(ChatEntry::notice(notice));
                 self.status_message =
                     Some((format!("Active: {}", self.active_model_name), Color::Green));
-                // Automatically switch to Chat tab!
                 self.set_tab(HubTab::Chat);
             }
-            Err(e) => {
-                error!("Failed to launch model supervisor: {}", e);
-                self.status_message = Some((format!("Launch failed: {}", e), Color::Red));
+            HubEvent::ModelFailed { message } => {
+                self.load_phase = None;
+                self.status_message = Some((message, Color::Red));
+            }
+            HubEvent::ModelUnloaded { unloaded_model } => {
+                self.active_model_name = "None (Idle)".to_string();
+                self.chat.model_name = "default".to_string();
+                self.chat.messages.push(ChatEntry::notice(format!(
+                    "Model '{}' unloaded. Local inference engine is idle.",
+                    unloaded_model
+                )));
+                self.status_message = Some((
+                    format!("Unloaded model '{}'", unloaded_model),
+                    Color::Cyan,
+                ));
+            }
+            HubEvent::UnloadNoop => {
+                self.status_message = Some((
+                    "No local model is currently active to unload".to_string(),
+                    Color::Yellow,
+                ));
+            }
+            HubEvent::TargetSelectionReady(state) => {
+                self.pending_target_selection = Some(state);
+            }
+            HubEvent::RemoteLoadSucceeded {
+                model_name,
+                name,
+                backend,
+                api_endpoint,
+                notice,
+            } => {
+                self.load_phase = None;
+                self.active_model_name = model_name.clone();
+                self.chat.client = NexusClient::new(api_endpoint);
+                self.chat.model_name = model_name;
+                self.chat.set_target_hardware(&name, backend);
+                self.chat.messages.clear();
+                self.chat.messages.push(ChatEntry::notice(notice));
+                self.status_message =
+                    Some((format!("Active on {}: {}", name, self.active_model_name), Color::Green));
+                self.set_tab(HubTab::Chat);
+            }
+            HubEvent::RemoteLoadFailed { message } => {
+                self.load_phase = None;
+                self.status_message = Some((message, Color::Red));
+            }
+            HubEvent::ClusterRefreshed => {
+                // Actual peer snapshot refresh happens via async helper outside apply;
+                // status only — see run_hub_tui which awaits refresh when this arrives.
+            }
+            HubEvent::SupervisorCrashed { model, code, stderr } => {
+                self.active_model_name = "None (Idle)".to_string();
+                self.chat.messages.push(ChatEntry::error(format!(
+                    "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
+                    code, stderr
+                )));
+                self.status_message = Some((
+                    format!("Local server crashed for '{}' ({:?})", model, code),
+                    Color::Red,
+                ));
             }
         }
     }
 
-    pub fn render(&self, frame: &mut Frame) {
+    pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Top navigation tab bar
-                Constraint::Min(10),   // Active tab contents
-                Constraint::Length(1), // Global hotkeys footer
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(1),
             ])
             .split(area);
 
@@ -571,14 +414,42 @@ impl HubApp {
 
         self.render_footer(frame, chunks[2]);
 
-        // Render hot-swap confirmation modal if triggered
-        if let Some(target_path) = &self.pending_hot_swap_path {
-            self.render_hot_swap_modal(frame, area, target_path);
+        if let Some(intent) = &self.pending_hot_swap {
+            self.render_hot_swap_modal(frame, area, intent);
         }
 
-        // Render target node selection modal if triggered
         if let Some(target_state) = &self.pending_target_selection {
             self.render_target_selection_modal(frame, area, target_state);
+        }
+
+        if self.show_help {
+            self.render_help_modal(frame, area);
+        }
+
+        if let Some(phase) = &self.load_phase {
+            let modal = centered_rect(50, 15, area);
+            frame.render_widget(Clear, modal);
+            let p = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Model Load In Progress ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(phase.clone(), Style::default().fg(Color::White))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "(UI remains responsive — chat/stream still drain)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(" Loading ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+            frame.render_widget(p, modal);
         }
     }
 
@@ -589,7 +460,6 @@ impl HubApp {
             HubTab::Cluster.title(),
             HubTab::Settings.title(),
         ];
-
         let selected = self.active_tab as usize;
         let tabs = Tabs::new(titles)
             .select(selected)
@@ -606,88 +476,78 @@ impl HubApp {
                     .add_modifier(Modifier::BOLD)
                     .bg(Color::Rgb(20, 30, 40)),
             );
-
         frame.render_widget(tabs, area);
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let active_str = format!(
-            "Model: {} | Host: {}",
+            "Model: {} | Host: {} | temp={:.2} max={} ctx={}",
             self.active_model_name,
-            self.chat.client.endpoint()
+            self.chat.client.endpoint(),
+            self.chat.temperature,
+            self.chat.max_tokens,
+            self.models_view.selected_context,
         );
         let mut spans = vec![
             Span::styled(
                 " [F1-F4] Tabs ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(active_str, Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[?] Help", Style::default().fg(Color::Cyan)),
         ];
-
         if self.supervisor.is_running_blocking() {
-            spans.push(Span::styled(
-                " [u] Unload Model ",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ));
             spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                " [u] Unload ",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ));
         }
-
-        spans.push(Span::styled(" [Alt+C] Connect Peer ", Style::default().fg(Color::Cyan)));
-        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(" [Ctrl+C] Quit", Style::default().fg(Color::Red)));
-
-        let p = Paragraph::new(Line::from(spans));
-        frame.render_widget(p, area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_hot_swap_modal(&self, frame: &mut Frame, area: Rect, target_path: &PathBuf) {
-        let modal_area = centered_rect(60, 25, area);
+    fn render_hot_swap_modal(&self, frame: &mut Frame, area: Rect, intent: &HotSwapIntent) {
+        let modal_area = centered_rect(60, 30, area);
         frame.render_widget(Clear, modal_area);
-
-        let target_name = target_path
+        let target_name = intent
+            .path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "new model".to_string());
-
+        let ngl = intent.gpu_layers.map(|n| n.to_string()).unwrap_or_else(|| "default".into());
         let lines = vec![
-            Line::from(vec![Span::styled(
+            Line::from(Span::styled(
                 " Model Hot-Swap Confirmation",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::styled(
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
                 format!("\nActive Model:   {}", self.active_model_name),
                 Style::default().fg(Color::White),
-            )]),
-            Line::from(vec![Span::styled(
+            )),
+            Line::from(Span::styled(
                 format!("Target Model:   {}", target_name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::styled(
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("GPU layers (-ngl): {} | Context: {}", ngl, intent.context_size),
+                Style::default().fg(Color::Green),
+            )),
+            Line::from(Span::styled(
                 "\nUnload active model and launch new model? [Y / N]",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )]),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            )),
         ];
-
-        let block = Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .title(" Hot-Swap ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+        frame.render_widget(
+            Paragraph::new(lines).alignment(Alignment::Center).block(
+                Block::default()
+                    .title(" Hot-Swap ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            ),
+            modal_area,
         );
-
-        frame.render_widget(block, modal_area);
     }
 
     fn render_target_selection_modal(
@@ -698,27 +558,24 @@ impl HubApp {
     ) {
         let modal_area = centered_rect(75, 45, area);
         frame.render_widget(Clear, modal_area);
-
         let mut lines = vec![
-            Line::from(vec![Span::styled(
+            Line::from(Span::styled(
                 " Select Target Execution Device ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::styled(
-                format!("Model: {} | Choose device to run weights:\n", state.model_name),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "Model: {} | ctx={} | Choose device:\n",
+                    state.model_name, self.models_view.selected_context
+                ),
                 Style::default().fg(Color::White),
-            )]),
+            )),
         ];
-
         for (i, candidate) in state.candidates.iter().enumerate() {
             let is_sel = i == state.selected_idx;
             let prefix = if is_sel { " > " } else { "   " };
             let style = if is_sel {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -727,27 +584,41 @@ impl HubApp {
                 Span::styled(format!("[{}] {}", i, candidate.display_label()), style),
             ]));
         }
-
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
+        lines.push(Line::from(Span::styled(
             " [↑ / ↓] Navigate  |  [Enter] Confirm & Launch  |  [Esc] Cancel ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )]));
-
-        let block = Paragraph::new(lines).block(
-            Block::default()
-                .title(" Target Node Selection ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Target Node Selection ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            modal_area,
         );
+    }
 
-        frame.render_widget(block, modal_area);
+    fn render_help_modal(&self, frame: &mut Frame, area: Rect) {
+        let modal = centered_rect(60, 70, area);
+        frame.render_widget(Clear, modal);
+        let lines: Vec<Line> = keymap::help_lines()
+            .into_iter()
+            .map(|s| Line::from(s))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Help (?) ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            modal,
+        );
     }
 }
 
-/// Helper function to create a centered Rect for modals.
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -757,7 +628,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_y) / 2),
         ])
         .split(r);
-
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -803,6 +673,16 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         hub.config.network.control_port
     );
 
+    let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(32);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<HubEvent>(64);
+    let worker_ctx = HubWorkerCtx {
+        config: hub.config.clone(),
+        discovery: hub.discovery.clone(),
+        supervisor: hub.supervisor.clone(),
+        identity: hub.identity.clone(),
+    };
+    let worker = spawn_hub_worker(cmd_rx, evt_tx, worker_ctx);
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -818,45 +698,54 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
         tokio::select! {
             _ = refresh_interval.tick() => {
-                if hub.active_tab == HubTab::Cluster {
-                    hub.cluster_view.refresh().await;
+                if hub.active_tab == HubTab::Models {
+                    hub.models_view.refresh_profile();
                 }
-
-                // Supervise local model child process
+                if hub.active_tab == HubTab::Cluster {
+                    let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
+                }
                 match hub.supervisor.check_status().await {
                     Ok(Some((exit_status, err_lines))) => {
                         let last_err = err_lines
                             .last()
                             .map(|s| s.as_str())
-                            .unwrap_or("No stderr output captured");
+                            .unwrap_or("No stderr output captured")
+                            .to_string();
                         let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
                         hub.discovery.set_active_model("").await;
                         hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
-                        let msg = format!(
-                            "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
-                            exit_status.code(),
-                            last_err
-                        );
-                        hub.chat.messages.push(ChatMessage::assistant(msg));
-                        hub.status_message = Some((
-                            format!("Local server crashed for '{}' ({:?})", model, exit_status.code()),
-                            Color::Red,
-                        ));
+                        hub.apply_event(HubEvent::SupervisorCrashed {
+                            model,
+                            code: exit_status.code(),
+                            stderr: last_err,
+                        });
                     }
                     Ok(None) => {}
-                    Err(e) => {
-                        debug!("Failed to check supervisor status: {}", e);
-                    }
+                    Err(e) => debug!("Failed to check supervisor status: {}", e),
+                }
+            }
+            Some(event) = evt_rx.recv() => {
+                let needs_cluster = matches!(event, HubEvent::ClusterRefreshed);
+                hub.apply_event(event);
+                if needs_cluster {
+                    // Short discovery snapshot — not a 30s load.
+                    hub.cluster_view.refresh().await;
                 }
             }
             Some(event_res) = event_stream.next() => {
                 if let Ok(Event::Key(key)) = event_res {
-                    // Global quit: Ctrl+C
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                         break;
                     }
 
-                    // Target Selection modal handling
+                    if hub.show_help {
+                        if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(12)) {
+                            hub.show_help = false;
+                        }
+                        continue;
+                    }
+
+                    // Target Selection modal
                     if let Some(target_state) = &mut hub.pending_target_selection {
                         match key.code {
                             KeyCode::Up | KeyCode::Char('k') => {
@@ -869,61 +758,195 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if !target_state.candidates.is_empty() {
-                                    target_state.selected_idx = (target_state.selected_idx + 1) % target_state.candidates.len();
+                                    target_state.selected_idx =
+                                        (target_state.selected_idx + 1) % target_state.candidates.len();
                                 }
                                 continue;
                             }
                             KeyCode::Enter => {
-                                hub.execute_target_selection().await;
+                                if let Some(state) = hub.pending_target_selection.take() {
+                                    if let Some(target) = state.candidates.get(state.selected_idx) {
+                                        let ctx_size = hub.models_view.selected_context;
+                                        match target {
+                                            TargetExecutionNode::Local { gpu_layers, .. } => {
+                                                hub.chat.set_target_hardware(
+                                                    "Local Host",
+                                                    format!("Local GPU ({} layers)", gpu_layers),
+                                                );
+                                                match request_load_or_hot_swap(
+                                                    &hub.supervisor,
+                                                    state.model_path.clone(),
+                                                    Some(*gpu_layers),
+                                                    ctx_size,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(cmd) => {
+                                                        hub.load_phase = Some("Queued local load…".into());
+                                                        let _ = cmd_tx.try_send(cmd);
+                                                    }
+                                                    Err(intent) => {
+                                                        hub.pending_hot_swap = Some(intent);
+                                                    }
+                                                }
+                                            }
+                                            TargetExecutionNode::LocalCpu { .. } => {
+                                                hub.chat.set_target_hardware(
+                                                    "Local Host",
+                                                    "Local CPU (DotProd / Multi-thread)",
+                                                );
+                                                match request_load_or_hot_swap(
+                                                    &hub.supervisor,
+                                                    state.model_path.clone(),
+                                                    Some(0),
+                                                    ctx_size,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(cmd) => {
+                                                        hub.load_phase = Some("Queued CPU-safe load…".into());
+                                                        let _ = cmd_tx.try_send(cmd);
+                                                    }
+                                                    Err(intent) => {
+                                                        hub.pending_hot_swap = Some(intent);
+                                                    }
+                                                }
+                                            }
+                                            TargetExecutionNode::Remote {
+                                                endpoint,
+                                                api_endpoint,
+                                                name,
+                                                backend,
+                                                ..
+                                            } => {
+                                                let gpu_layers = if hub.config.hardware.acceleration.prefer_gpu {
+                                                    99
+                                                } else {
+                                                    0
+                                                };
+                                                hub.load_phase = Some(format!("Queued remote load on {name}…"));
+                                                let _ = cmd_tx.try_send(HubCommand::LoadModelRemote {
+                                                    endpoint: endpoint.clone(),
+                                                    api_endpoint: api_endpoint.clone(),
+                                                    name: name.clone(),
+                                                    backend: backend.clone(),
+                                                    model_name: state.model_name.clone(),
+                                                    context_size: ctx_size,
+                                                    gpu_layers,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
                                 continue;
                             }
                             KeyCode::Esc => {
                                 hub.pending_target_selection = None;
-                                hub.status_message = Some(("Target selection cancelled".to_string(), Color::DarkGray));
+                                hub.status_message = Some(("Target selection cancelled".into(), Color::DarkGray));
                                 continue;
                             }
-                            _ => {
-                                continue;
-                            }
+                            _ => continue,
                         }
                     }
 
-                    // Hot-Swap modal handling
-                    if let Some(target_path) = hub.pending_hot_swap_path.take() {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                hub.execute_model_load(target_path).await;
+                    // Hot-Swap modal — preserves -ngl via HotSwapIntent
+                    if hub.pending_hot_swap.is_some() {
+                        if let Some(action) = resolve(KeyScope::HotSwap, key.code, key.modifiers) {
+                            match action {
+                                HubAction::ConfirmHotSwap => {
+                                    if let Some(intent) = hub.pending_hot_swap.take() {
+                                        hub.load_phase = Some(format!(
+                                            "Hot-swap → -ngl {} …",
+                                            intent.gpu_layers.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+                                        ));
+                                        let _ = cmd_tx.try_send(HubCommand::LoadModelLocal {
+                                            path: intent.path,
+                                            gpu_layers: intent.gpu_layers,
+                                            context_size: intent.context_size,
+                                        });
+                                    }
+                                }
+                                HubAction::CancelHotSwap => {
+                                    hub.pending_hot_swap = None;
+                                    hub.status_message = Some(("Hot-swap cancelled".into(), Color::DarkGray));
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                hub.status_message = Some(("Hot-swap cancelled".to_string(), Color::DarkGray));
+                        } else if matches!(key.code, KeyCode::Char('Y')) {
+                            if let Some(intent) = hub.pending_hot_swap.take() {
+                                let _ = cmd_tx.try_send(HubCommand::LoadModelLocal {
+                                    path: intent.path,
+                                    gpu_layers: intent.gpu_layers,
+                                    context_size: intent.context_size,
+                                });
                             }
-                            _ => {
-                                hub.pending_hot_swap_path = Some(target_path);
-                            }
+                        } else if matches!(key.code, KeyCode::Char('N')) {
+                            hub.pending_hot_swap = None;
                         }
                         continue;
                     }
 
-                    // Global tab navigation: Alt+1..4 or F1..F4
-                    if key.modifiers.contains(KeyModifiers::ALT) {
-                        match key.code {
-                            KeyCode::Char('1') => { hub.set_tab(HubTab::Chat); continue; }
-                            KeyCode::Char('2') => { hub.set_tab(HubTab::Models); continue; }
-                            KeyCode::Char('3') => { hub.set_tab(HubTab::Cluster); hub.cluster_view.refresh().await; continue; }
-                            KeyCode::Char('4') => { hub.set_tab(HubTab::Settings); continue; }
+                    // Global / Models declarative actions
+                    if let Some(action) = resolve(KeyScope::Global, key.code, key.modifiers)
+                        .or_else(|| {
+                            if hub.active_tab == HubTab::Models {
+                                resolve(KeyScope::Models, key.code, key.modifiers)
+                            } else {
+                                None
+                            }
+                        })
+                    {
+                        match action {
+                            HubAction::Quit => break,
+                            HubAction::TabChat => hub.set_tab(HubTab::Chat),
+                            HubAction::TabModels => hub.set_tab(HubTab::Models),
+                            HubAction::TabCluster => {
+                                hub.set_tab(HubTab::Cluster);
+                                let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
+                            }
+                            HubAction::TabSettings => hub.set_tab(HubTab::Settings),
+                            HubAction::NextTab => hub.next_tab(),
+                            HubAction::PrevTab => hub.previous_tab(),
+                            HubAction::Help => hub.show_help = true,
+                            HubAction::UnloadModel => {
+                                let _ = cmd_tx.try_send(HubCommand::Unload {
+                                    active_model_name: hub.active_model_name.clone(),
+                                });
+                            }
+                            HubAction::ModelsNext => hub.models_view.next(),
+                            HubAction::ModelsPrev => hub.models_view.previous(),
+                            HubAction::ModelsRefresh => hub.models_view.refresh(),
+                            HubAction::ModelsEnter => {
+                                if let Some(m) = hub.models_view.selected_model() {
+                                    let path = m.path.clone();
+                                    let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection { model_path: path });
+                                }
+                            }
+                            HubAction::ModelsContextInc => hub.models_view.adjust_context(1),
+                            HubAction::ModelsContextDec => hub.models_view.adjust_context(-1),
+                            HubAction::ClusterRefresh => {
+                                let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
+                            }
                             _ => {}
+                        }
+                        // Models/global actions handled — still allow Chat/Cluster/Settings specifics below
+                        if hub.active_tab == HubTab::Models
+                            || matches!(
+                                action,
+                                HubAction::TabChat
+                                    | HubAction::TabModels
+                                    | HubAction::TabCluster
+                                    | HubAction::TabSettings
+                                    | HubAction::NextTab
+                                    | HubAction::PrevTab
+                                    | HubAction::Help
+                                    | HubAction::Quit
+                            )
+                        {
+                            continue;
                         }
                     }
 
-                    match key.code {
-                        KeyCode::F(1) => { hub.set_tab(HubTab::Chat); continue; }
-                        KeyCode::F(2) => { hub.set_tab(HubTab::Models); continue; }
-                        KeyCode::F(3) => { hub.set_tab(HubTab::Cluster); hub.cluster_view.refresh().await; continue; }
-                        KeyCode::F(4) => { hub.set_tab(HubTab::Settings); continue; }
-                        _ => {}
-                    }
-
-                    // Tab-specific key routing
                     match hub.active_tab {
                         HubTab::Chat => {
                             if hub.chat.show_preset_modal {
@@ -934,15 +957,26 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.next_tab();
                             } else if key.code == KeyCode::BackTab {
                                 hub.previous_tab();
-                            } else if key.modifiers.contains(KeyModifiers::CONTROL) && (key.code == KeyCode::Char('u') || key.code == KeyCode::Char('U')) {
-                                hub.unload_active_model().await;
+                            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U'))
+                            {
+                                let _ = cmd_tx.try_send(HubCommand::Unload {
+                                    active_model_name: hub.active_model_name.clone(),
+                                });
                             } else if key.code == KeyCode::Enter && hub.chat.input_buffer.trim() == "/unload" {
                                 hub.chat.input_buffer.clear();
                                 hub.chat.cursor_idx = 0;
-                                hub.unload_active_model().await;
-                            } else if key.modifiers.contains(KeyModifiers::ALT) && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C')) {
+                                let _ = cmd_tx.try_send(HubCommand::Unload {
+                                    active_model_name: hub.active_model_name.clone(),
+                                });
+                            } else if key.modifiers.contains(KeyModifiers::ALT)
+                                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                            {
                                 let peers = hub.discovery.get_active_peers().await;
-                                if let Some(active_peer) = peers.iter().find(|p| !p.active_model.is_empty() || p.status.is_ready()) {
+                                if let Some(active_peer) = peers
+                                    .iter()
+                                    .find(|p| !p.active_model.is_empty() || p.status.is_ready())
+                                {
                                     let ep = active_peer.api_endpoint();
                                     hub.discovery.send_direct_probe_to_ip(active_peer.addr.ip()).await;
                                     let model = if !active_peer.active_model.is_empty() {
@@ -952,44 +986,27 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     };
                                     hub.chat.client = NexusClient::new(ep.clone());
                                     hub.chat.model_name = model.clone();
-                                    hub.active_model_name = model.clone();
+                                    hub.active_model_name = model;
                                     let peer_label = active_peer.label();
                                     hub.chat.set_target_hardware(&peer_label, active_peer.backend.to_string());
-                                    hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green));
-                                    hub.chat.messages.push(ChatMessage::assistant(format!(
-                                        "Connected to active cluster host at {}. Ready for chat.", ep
+                                    hub.status_message = Some((
+                                        format!("Connected to cluster host at {} (probe sent)", ep),
+                                        Color::Green,
+                                    ));
+                                    hub.chat.messages.push(ChatEntry::notice(format!(
+                                        "Connected to active cluster host at {}. Ready for chat.",
+                                        ep
                                     )));
-                                    hub.chat.message_metrics.push(None);
                                 } else {
-                                    hub.status_message = Some(("No active cluster host found".to_string(), Color::Yellow));
+                                    hub.status_message =
+                                        Some(("No active cluster host found".into(), Color::Yellow));
                                 }
                             } else {
                                 hub.chat.handle_key_input(key, &tx);
                             }
                         }
                         HubTab::Models => {
-                            match key.code {
-                                KeyCode::Char('1') => hub.set_tab(HubTab::Chat),
-                                KeyCode::Char('2') => hub.models_view.refresh(),
-                                KeyCode::Char('3') => {
-                                    hub.set_tab(HubTab::Cluster);
-                                    hub.cluster_view.refresh().await;
-                                }
-                                KeyCode::Char('4') => hub.set_tab(HubTab::Settings),
-                                KeyCode::Up | KeyCode::Char('k') => hub.models_view.previous(),
-                                KeyCode::Down | KeyCode::Char('j') => hub.models_view.next(),
-                                KeyCode::Char('r') | KeyCode::Char('R') => hub.models_view.refresh(),
-                                KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
-                                KeyCode::Enter => {
-                                    if let Some(m) = hub.models_view.selected_model() {
-                                        let path = m.path.clone();
-                                        hub.open_target_selection(path).await;
-                                    }
-                                }
-                                KeyCode::Tab => hub.next_tab(),
-                                KeyCode::BackTab => hub.previous_tab(),
-                                _ => {}
-                            }
+                            // Models keys handled via declarative keymap above.
                         }
                         HubTab::Cluster => {
                             if hub.cluster_view.enter_pair_code {
@@ -1040,7 +1057,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                 format!("Static peer '{}' added & probed", input),
                                                 Color::Green,
                                             ));
-                                            hub.cluster_view.refresh().await;
+                                            let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                                         } else {
                                             hub.cluster_view.cancel_add_peer();
                                         }
@@ -1105,11 +1122,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             let peer_name = peer.label();
                                             hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
                                             hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
-                                            hub.chat.messages.push(ChatMessage::assistant(format!(
+                                            hub.chat.messages.push(crate::ui::chat::ChatEntry::notice(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
                                                 peer_name, ep
                                             )));
-                                            hub.chat.message_metrics.push(None);
+                                            
                                             hub.set_tab(HubTab::Chat);
                                         } else {
                                             hub.cluster_view.status_message = Some(("No peer selected to connect".to_string(), Color::Yellow));
@@ -1142,54 +1159,21 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             }
                                             let peer_name = peer.label();
                                             let peer_ctrl = peer.control_endpoint();
+                                            let peer_api = peer.api_endpoint();
+                                            let peer_backend = peer.backend.to_string();
                                             if let Some(m) = hub.models_view.selected_model() {
                                                 let model_name = m.filename.clone();
-                                                let req = crate::control_plane::ModelLoadRequest {
-                                                    protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
-                                                    requester_id: hub.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
-                                                    model_path: model_name.clone(),
-                                                    context_size: 4096,
-                                                    gpu_layers: if hub.config.hardware.acceleration.prefer_gpu { 99 } else { 0 },
-                                                    threads: hub.config.hardware.acceleration.cpu_threads,
-                                                    rpc_workers: Vec::new(),
-                                                };
-                                                match hub.dispatch_remote_load_request(&peer_ctrl, req).await {
-                                                    Ok(resp) if resp.success => {
-                                                        hub.active_model_name = model_name.clone();
-                                                        let target_api = if !resp.api_endpoint.is_empty()
-                                                            && !resp.api_endpoint.contains("0.0.0.0")
-                                                        {
-                                                            resp.api_endpoint
-                                                        } else {
-                                                            peer.api_endpoint()
-                                                        };
-                                                        hub.chat.client = NexusClient::new(target_api);
-                                                        hub.chat.model_name = model_name.clone();
-                                                        hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
-                                                        hub.chat.messages.push(ChatMessage::assistant(format!(
-                                                            "Loaded '{}' on remote node {}.", model_name, peer_name
-                                                        )));
-                                                        hub.chat.message_metrics.push(None);
-                                                        hub.status_message = Some((format!("Active on {}: {}", peer_name, model_name), Color::Green));
-                                                        hub.set_tab(HubTab::Chat);
-                                                    }
-                                                    Ok(resp) => {
-                                                        let err = resp.error_message.unwrap_or_else(|| "Unknown error".to_string());
-                                                        hub.cluster_view.status_message = Some((format!("Load failed on {}: {}", peer_name, err), Color::Red));
-                                                    }
-                                                    Err(e) => {
-                                                        let err_str = e.to_string();
-                                                        let hint = if err_str.contains("error sending request") {
-                                                            format!(
-                                                                "Dispatch error to {}: no control-plane listener on {} (port {}). Is nexus/nexusd running on that device?",
-                                                                peer_name, peer_ctrl, peer.control_port
-                                                            )
-                                                        } else {
-                                                            format!("Dispatch error to {}: {}", peer_name, e)
-                                                        };
-                                                        hub.cluster_view.status_message = Some((hint, Color::Red));
-                                                    }
-                                                }
+                                                let gpu_layers = if hub.config.hardware.acceleration.prefer_gpu { 99 } else { 0 };
+                                                hub.load_phase = Some(format!("Queued remote load on {peer_name}…"));
+                                                let _ = cmd_tx.try_send(HubCommand::LoadModelRemote {
+                                                    endpoint: peer_ctrl,
+                                                    api_endpoint: peer_api,
+                                                    name: peer_name,
+                                                    backend: peer_backend,
+                                                    model_name,
+                                                    context_size: hub.models_view.selected_context,
+                                                    gpu_layers,
+                                                });
                                             } else {
                                                 hub.cluster_view.status_message = Some(("Select a model in [F2] Models first".to_string(), Color::Yellow));
                                             }
@@ -1212,10 +1196,14 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         hub.chat.client = NexusClient::new(local_ep.clone());
                                         hub.chat.set_target_hardware("Local Host", "Local CPU/GPU");
                                         hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
-                                        hub.chat.messages.push(ChatMessage::assistant(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
-                                        hub.chat.message_metrics.push(None);
+                                        hub.chat.messages.push(crate::ui::chat::ChatEntry::notice(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
+                                        
                                     }
-                                    KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
+                                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                                        let _ = cmd_tx.try_send(HubCommand::Unload {
+                                            active_model_name: hub.active_model_name.clone(),
+                                        });
+                                    }
                                     KeyCode::Char('r') | KeyCode::Char('R') => hub.cluster_view.refresh().await,
                                     KeyCode::Tab => hub.next_tab(),
                                     KeyCode::BackTab => hub.previous_tab(),
@@ -1238,7 +1226,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Char('2') => hub.set_tab(HubTab::Models),
                                     KeyCode::Char('3') => {
                                         hub.set_tab(HubTab::Cluster);
-                                        hub.cluster_view.refresh().await;
+                                        let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                                     }
                                     KeyCode::Char('4') => {}
                                     KeyCode::Up | KeyCode::Char('k') => hub.settings_view.previous(),
@@ -1271,6 +1259,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             }
                         }
+
                     }
                 }
             }
@@ -1296,8 +1285,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         } else {
                             ""
                         };
-                        hub.chat.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
-                        hub.chat.message_metrics.push(None);
+                        hub.chat.messages.push(ChatEntry::error(format!(
+                            "⚠️ [Connection / Generation Error]: {}{}",
+                            err, hint
+                        )));
                         hub.chat.status_message = Some(format!("Error: {}", err));
                         hub.chat.auto_scroll = true;
                     }
@@ -1306,12 +1297,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    // Cleanup terminal on exit
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     control_handle.abort();
+    worker.abort();
     if hub.supervisor.is_running().await {
         info!("Stopping active supervisor process on hub exit...");
         let _ = hub.supervisor.stop().await;

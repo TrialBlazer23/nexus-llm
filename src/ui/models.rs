@@ -3,6 +3,7 @@ use crate::sysinfo::SystemProfile;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Local GGUF catalog row with metadata cached at scan time (no reopen in render).
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub path: PathBuf,
@@ -12,6 +13,11 @@ pub struct ModelEntry {
     pub context_length: usize,
     pub exact_kv_mb: u64,
     pub lmk_compatible: bool,
+    /// Cached GGUF header fields — filled once in [`scan_models_dir`].
+    pub gguf_version: u32,
+    pub block_count: usize,
+    pub head_count: usize,
+    pub embedding_length: usize,
 }
 
 /// Scan a directory for GGUF model files and inspect their metadata.
@@ -40,16 +46,23 @@ pub fn scan_models_dir<P: AsRef<Path>>(dir: P) -> Vec<ModelEntry> {
                         let context_length = meta.context_length.unwrap_or(4096);
                         let exact_kv_bytes = meta.exact_kv_cache_bytes(context_length.min(4096));
                         let exact_kv_mb = exact_kv_bytes / (1024 * 1024);
-                        let lmk_compatible = profile.can_safely_load_gguf(&meta, context_length.min(4096));
+                        let lmk_compatible =
+                            profile.can_safely_load_gguf(&meta, context_length.min(4096));
 
                         entries.push(ModelEntry {
                             path,
                             filename,
                             size_mb,
-                            architecture: meta.architecture.unwrap_or_else(|| "unknown".to_string()),
+                            architecture: meta
+                                .architecture
+                                .unwrap_or_else(|| "unknown".to_string()),
                             context_length,
                             exact_kv_mb,
                             lmk_compatible,
+                            gguf_version: meta.version,
+                            block_count: meta.block_count.unwrap_or(0),
+                            head_count: meta.head_count.unwrap_or(0),
+                            embedding_length: meta.embedding_length.unwrap_or(0),
                         });
                     }
                 }

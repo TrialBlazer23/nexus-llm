@@ -648,6 +648,18 @@ impl SupervisorManager {
         }
         Ok(())
     }
+
+    /// Subscribe to supervisor state transitions for UI phase labels.
+    pub async fn subscribe(&self) -> Option<watch::Receiver<SupervisorState>> {
+        let lock = self.inner.lock().await;
+        lock.as_ref().map(|sup| sup.subscribe())
+    }
+
+    /// Current supervisor state, if a child is slotted.
+    pub async fn state(&self) -> Option<SupervisorState> {
+        let lock = self.inner.lock().await;
+        lock.as_ref().map(|sup| sup.state())
+    }
 }
 
 /// Helper to check if binary is in PATH

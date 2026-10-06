@@ -10,7 +10,7 @@
 (PR #10). Phase 9 trust is **shipped** on `cursor/phase9-trust-4865` (Ed25519
 identity, signed control plane, TOFU pairing, registry verification at runtime).
 Historical findings below are preserved; status markers call out what is done vs
-still open. **Recommended next phase: Phase 8 (TUI)** or Phase 10 (model store).
+still open. **Recommended next phase: Phase 10 (model store / LAN transfer).** Phase 8 TUI is Done.
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -39,7 +39,7 @@ inert — are mechanically reproducible:
 | `GET /models`, SSE `/events` | **Deferred** | Phase 10 / later |
 | `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
 | Peer registry as runtime SoT | **Done** | `src/registry_runtime.rs`, `src/discovery.rs`, Cluster UI |
-| TUI responsiveness / hub split | **Open — Phase 8** | §2.1–§2.6, §2.8 |
+| TUI responsiveness / hub split | **Done — Phase 8** | `src/ui/hub/` command/event + ChatEntry |
 | Model store / LAN transfer | **Open — Phase 10** | §4 |
 
 ---
@@ -1161,23 +1161,26 @@ deliberately broken node; no config field is displayed that has no effect.
 
 ### Phase 8 — TUI responsiveness and correctness
 
-> **Sequencing note:** Prefer **Phase 9 before Phase 8**. Trust risk from an
-> open control plane outweighs UX freezes.
+> **Status (2026-10-06): Done** — branch `cursor/phase8-tui-responsiveness-4865`.
+> HubCommand/HubEvent bus; ChatEntry; wrap scroll; hot-swap preserves `-ngl`;
+> GGUF/profile/Vulkan caches; hub split + declarative keymap.
 
-- Command/event architecture; no blocking awaits in the event loop (§2.1)
-- Pure render: cache GGUF metadata, system profile, rendered markdown (§2.2)
-- `ChatEntry` replaces the parallel metrics vector and prefix-based filtering
-  (§2.4, §2.5)
-- Wrapping-aware scroll with a scrollbar (§2.3)
-- Context size and generation parameters exposed; hot-swap preserves target
-  (§2.6, §2.8)
-- Split `hub.rs`; declarative keymap (§6)
+- ~~Command/event architecture; no blocking awaits in the event loop (§2.1)~~ **Done**
+- ~~Pure render: cache GGUF metadata, system profile, rendered markdown (§2.2)~~ **Done**
+- ~~`ChatEntry` replaces the parallel metrics vector and prefix-based filtering
+  (§2.4, §2.5)~~ **Done**
+- ~~Wrapping-aware scroll with a scrollbar (§2.3)~~ **Done**
+- ~~Context size and generation parameters exposed; hot-swap preserves target
+  (§2.6, §2.8)~~ **Done**
+- ~~Split `hub.rs`; declarative keymap (§6)~~ **Done** (`src/ui/hub/`)
 
 *Invasiveness:* substantial refactor of `hub.rs` and `chat.rs`; no protocol
 changes.
 *Acceptance:* the UI stays responsive and keeps streaming during a 30-second
 model load; scrolling reaches the top of a conversation with wrapped code blocks;
-choosing CPU-safe mode during a hot-swap launches with `-ngl 0`.
+choosing CPU-safe mode during a hot-swap launches with `-ngl 0`. Covered by unit
+tests for ChatEntry/wrap/`effective_ngl(Some(0))`; live 30s load needs
+`llama-server` + GGUF outside Cloud VMs.
 
 ### Phase 9 — Trust
 

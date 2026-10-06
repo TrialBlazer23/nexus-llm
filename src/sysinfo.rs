@@ -93,8 +93,16 @@ impl SystemProfile {
     }
 
     /// Probe whether Vulkan runtime libraries or tools are available on the system.
+    ///
+    /// Result is cached for the process lifetime — render paths must not re-probe
+    /// every frame (Phase 8 / CAPABILITY_REVIEW §2.2).
     pub fn probe_vulkan() -> bool {
-        // 1. Android / Termux dynamic library paths
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(Self::probe_vulkan_uncached)
+    }
+
+    /// Uncached Vulkan probe (tests / forced refresh).
+    pub fn probe_vulkan_uncached() -> bool {
         let standard_vulkan_paths = [
             "/system/lib64/libvulkan.so",
             "/data/data/com.termux/files/usr/lib/libvulkan.so",
@@ -109,7 +117,6 @@ impl SystemProfile {
             }
         }
 
-        // 2. Check if `vulkaninfo` is available in PATH
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 if dir.join("vulkaninfo").is_file() {

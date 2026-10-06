@@ -25,6 +25,17 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 8 TUI: command/event bus, ChatEntry, hot-swap -ngl
+- Category: design-decision
+- Context: CAPABILITY_REVIEW §2 Phase 8 on `cursor/phase8-tui-responsiveness-4865` stacked on Phase 9 trust.
+- Finding:
+  1. Long loads must not `.await` on the hub key path — `HubCommand`/`HubEvent` + `spawn_hub_worker` keep `run_hub_tui` draining crossterm/stream while `SupervisorManager::spawn` runs; `subscribe`/`state` feed phase labels.
+  2. `ChatEntry { kind, metrics, rendered }` replaces parallel `message_metrics` and English prefix banner filters; notices that say "Connected to…" stay out of the OpenAI prompt.
+  3. Hot-swap must carry full intent (`path`, `gpu_layers`, `context_size`) so CPU Safe Mode confirms with `-ngl 0` (`effective_ngl(Some(0), …) == 0`).
+  4. Render must be pure: GGUF fields cached on `ModelEntry` at scan; `ModelsView.cached_profile` on tick; `SystemProfile::probe_vulkan` process-cached via `OnceLock`; wrap scroll uses one `wrapped_line_count` shared by keys and Paragraph.
+- Action: Split `src/ui/hub/{mod,commands,keymap}.rs`; reserve `StartDownload`/`TransferModel` commands for Phase 10.
+- Verification: `cargo test --locked` (ChatEntry/wrap/hot-swap/keymap + existing suites). Live ~30s load soak needs `llama-server` + GGUF.
+
 ## 2026-10-06 — Phase 9 trust: signing canonical, node.key, pairing migration
 - Category: design-decision
 - Context: CAPABILITY_REVIEW §1.4 + §1.5 — authenticated control plane and registry as runtime source of truth on `cursor/phase9-trust-4865`.

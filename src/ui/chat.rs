@@ -37,18 +37,113 @@ pub struct GenerationMetrics {
     pub ttft_ms: Option<u64>,
 }
 
+/// Classification for history entries — set at construction, never by string prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Dialogue,
+    Notice,
+    Error,
+}
+
+/// Single chat history row: message + kind + optional metrics + cached markdown lines.
+#[derive(Debug, Clone)]
+pub struct ChatEntry {
+    pub message: ChatMessage,
+    pub kind: EntryKind,
+    pub metrics: Option<GenerationMetrics>,
+    pub rendered: Option<Vec<Line<'static>>>,
+}
+
+impl ChatEntry {
+    pub fn dialogue(message: ChatMessage) -> Self {
+        Self {
+            message,
+            kind: EntryKind::Dialogue,
+            metrics: None,
+            rendered: None,
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::dialogue(ChatMessage::user(content))
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::dialogue(ChatMessage::assistant(content))
+    }
+
+    pub fn notice(content: impl Into<String>) -> Self {
+        Self {
+            message: ChatMessage::assistant(content),
+            kind: EntryKind::Notice,
+            metrics: None,
+            rendered: None,
+        }
+    }
+
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            message: ChatMessage::assistant(content),
+            kind: EntryKind::Error,
+            metrics: None,
+            rendered: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: GenerationMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn is_dialogue(&self) -> bool {
+        self.kind == EntryKind::Dialogue
+    }
+
+    /// Lazily cache markdown render; safe because message content is immutable after push.
+    pub fn ensure_rendered(&mut self) -> &[Line<'static>] {
+        if self.rendered.is_none() {
+            self.rendered = Some(render_markdown(&self.message.content));
+        }
+        self.rendered.as_ref().unwrap()
+    }
+
+    pub fn rendered_lines(&self) -> Vec<Line<'static>> {
+        if let Some(lines) = &self.rendered {
+            lines.clone()
+        } else {
+            render_markdown(&self.message.content)
+        }
+    }
+}
+
+/// Count visual lines after wrapping `lines` to `width` columns.
+pub fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let w = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let lw = line.width().max(1);
+            (lw + w - 1) / w
+        })
+        .sum()
+}
+
 /// State container for the interactive TUI chat session.
 pub struct ChatApp {
     pub client: NexusClient,
     pub model_name: String,
     pub system_prompt: Option<String>,
-    pub messages: Vec<ChatMessage>,
-    pub message_metrics: Vec<Option<GenerationMetrics>>,
+    pub messages: Vec<ChatEntry>,
     pub streaming_response: String,
+    pub streaming_rendered: Option<Vec<Line<'static>>>,
     pub is_streaming: bool,
     pub input_buffer: String,
     pub cursor_idx: usize,
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
+    /// Last computed wrapped history length (shared by keys + render).
+    pub last_wrapped_lines: usize,
+    /// Viewport inner width used for wrap math.
+    pub last_viewport_width: u16,
     pub auto_scroll: bool,
     pub tokens_streamed: usize,
     pub tokens_per_sec: f64,
@@ -89,12 +184,14 @@ impl ChatApp {
             model_name: model_str,
             system_prompt,
             messages: Vec::new(),
-            message_metrics: Vec::new(),
             streaming_response: String::new(),
+            streaming_rendered: None,
             is_streaming: false,
             input_buffer: String::new(),
             cursor_idx: 0,
             scroll_offset: 0,
+            last_wrapped_lines: 0,
+            last_viewport_width: 80,
             auto_scroll: true,
             tokens_streamed: 0,
             tokens_per_sec: 0.0,
@@ -205,13 +302,11 @@ impl ChatApp {
                                  • /stop or /cancel     Halt active token generation\n\
                                  • /unload              Unload active model\n\
                                  Hotkeys: [Alt+P / F5] Preset Picker | [Esc] Abort Stream | [Shift+Enter] Newline";
-                self.messages.push(ChatMessage::assistant(help_text));
-                self.message_metrics.push(None);
+                self.messages.push(ChatEntry::notice(help_text));
             }
 
             "/clear" => {
                 self.messages.clear();
-                self.message_metrics.clear();
                 self.status_message = Some("Conversation history cleared".to_string());
             }
 
@@ -292,8 +387,13 @@ impl ChatApp {
             "/export" => {
                 let default_name = format!("chats/export-{}.md", chrono_placeholder());
                 let path = parts.get(1).copied().unwrap_or(&default_name);
+                let export_msgs: Vec<ChatMessage> = self
+                    .messages
+                    .iter()
+                    .map(|e| e.message.clone())
+                    .collect();
                 match SessionLogger::export_to_markdown(
-                    &self.messages,
+                    &export_msgs,
                     &self.model_name,
                     self.client.endpoint(),
                     &self.target_backend,
@@ -316,47 +416,135 @@ impl ChatApp {
         true
     }
 
-    /// Returns true if a message is a genuine dialogue turn rather than a system/UI banner.
-    pub fn is_conversation_message(m: &ChatMessage) -> bool {
-        let trimmed = m.content.trim();
-        !trimmed.starts_with("Model '")
-            && !trimmed.starts_with("Connected to")
-            && !trimmed.starts_with("⚠️")
-            && !trimmed.starts_with("Model unloaded")
-            && !trimmed.starts_with("Disconnected from")
-            && !trimmed.starts_with("Loaded '")
-    }
-
-    /// Build a cleaned list of messages for sending to OpenAI /v1/chat/completions.
+    /// Build a cleaned list of dialogue messages for OpenAI /v1/chat/completions.
     pub fn clean_conversation_messages(
-        messages: &[ChatMessage],
+        messages: &[ChatEntry],
         system_prompt: Option<&str>,
     ) -> Vec<ChatMessage> {
         let mut req_messages = Vec::new();
         if let Some(sys) = system_prompt {
             req_messages.push(ChatMessage::system(sys));
         }
-        for m in messages {
-            if Self::is_conversation_message(m) {
-                req_messages.push(m.clone());
+        for entry in messages {
+            if entry.is_dialogue() {
+                req_messages.push(entry.message.clone());
             }
         }
         req_messages
     }
 
-    /// Calculate approximate total line count across current conversation.
-    pub fn total_lines(&self) -> usize {
-        let mut count = 0;
-        if self.system_prompt.is_some() {
-            count += 2;
+    /// Build laid-out history lines (for render + wrap math). Mutates render caches.
+    pub fn build_history_lines(&mut self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        if let Some(sys) = &self.system_prompt {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " [System] ",
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(sys.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
         }
-        for msg in &self.messages {
-            count += 1 + msg.content.lines().count() + 2;
+
+        for entry in &mut self.messages {
+            let (label, color) = match entry.kind {
+                EntryKind::Dialogue if entry.message.role == "user" => (" [You] ", Color::Blue),
+                EntryKind::Dialogue => (" [Nexus] ", Color::Green),
+                EntryKind::Notice => (" [Status] ", Color::Cyan),
+                EntryKind::Error => (" [Error] ", Color::LightRed),
+            };
+
+            lines.push(Line::from(vec![Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )]));
+
+            let rendered = entry.ensure_rendered().to_vec();
+            for m_line in rendered {
+                let mut indented_spans = vec![Span::raw("   ")];
+                indented_spans.extend(m_line.spans);
+                lines.push(Line::from(indented_spans));
+            }
+
+            if entry.message.role == "assistant" {
+                if let Some(metrics) = &entry.metrics {
+                    let ttft_label = if let Some(ttft) = metrics.ttft_ms {
+                        format!(" · TTFT: {}ms", ttft)
+                    } else {
+                        String::new()
+                    };
+                    let badge_text = format!(
+                        "   ⚡ {:.1} t/s · {} tokens · {:.2}s{}",
+                        metrics.tokens_per_sec, metrics.tokens, metrics.duration_secs, ttft_label
+                    );
+                    lines.push(Line::from(Span::styled(
+                        badge_text,
+                        Style::default()
+                            .fg(Color::Rgb(140, 160, 180))
+                            .add_modifier(Modifier::DIM),
+                    )));
+                }
+            }
+
+            lines.push(Line::from(""));
         }
+
         if self.is_streaming || !self.streaming_response.is_empty() {
-            count += 1 + self.streaming_response.lines().count() + 1;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " [Nexus] ",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("(generating...)", Style::default().fg(Color::Yellow)),
+            ]));
+
+            if self.streaming_rendered.is_none() {
+                self.streaming_rendered = Some(render_markdown(&self.streaming_response));
+            }
+            // Re-render streaming text each token (content changes)
+            let rendered_markdown = render_markdown(&self.streaming_response);
+            self.streaming_rendered = Some(rendered_markdown.clone());
+            for m_line in rendered_markdown {
+                let mut indented_spans = vec![Span::raw("   ")];
+                indented_spans.extend(m_line.spans);
+                lines.push(Line::from(indented_spans));
+            }
         }
-        count
+
+        lines
+    }
+
+    /// Wrapped visual line count for the last laid-out history (call after build/update).
+    pub fn total_lines(&self) -> usize {
+        if self.last_wrapped_lines > 0 {
+            self.last_wrapped_lines
+        } else {
+            // Fallback before first render
+            let mut count = 0;
+            if self.system_prompt.is_some() {
+                count += 2;
+            }
+            for entry in &self.messages {
+                count += 1 + entry.message.content.lines().count() + 2;
+            }
+            if self.is_streaming || !self.streaming_response.is_empty() {
+                count += 1 + self.streaming_response.lines().count() + 1;
+            }
+            count
+        }
+    }
+
+    /// Sync wrap metrics from a viewport width (used by keys after render updates).
+    pub fn update_wrap_metrics(&mut self, lines: &[Line<'static>], width: u16) {
+        self.last_viewport_width = width.max(1);
+        self.last_wrapped_lines = wrapped_line_count(lines, self.last_viewport_width);
+        if self.auto_scroll {
+            self.scroll_offset = self.last_wrapped_lines;
+        } else {
+            self.scroll_offset = self.scroll_offset.min(self.last_wrapped_lines);
+        }
     }
 
     /// Process a stream chunk received from background worker.
@@ -369,6 +557,7 @@ impl ChatApp {
         }
 
         self.streaming_response.push_str(&token);
+        self.streaming_rendered = None;
         self.tokens_streamed += 1;
 
         if let Some(start) = self.stream_start_time {
@@ -405,24 +594,25 @@ impl ChatApp {
                 Some(self.tokens_streamed),
             );
 
-            self.messages.push(ChatMessage::assistant(content));
-            self.message_metrics.push(Some(metrics));
+            self.messages
+                .push(ChatEntry::assistant(content).with_metrics(metrics));
         }
 
         self.is_streaming = false;
+        self.streaming_rendered = None;
         self.stream_start_time = None;
         self.first_token_time = None;
         self.abort_tx = None;
     }
 
     /// Prepare and render the UI frame for full window.
-    pub fn render(&self, frame: &mut Frame) {
+    pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.render_in_area(frame, area);
     }
 
     /// Prepare and render the UI frame within a specified sub-area.
-    pub fn render_in_area(&self, frame: &mut Frame, area: Rect) {
+    pub fn render_in_area(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -533,19 +723,19 @@ impl ChatApp {
                 self.cursor_idx += 1;
             }
             KeyCode::Up => {
-                let max = self.total_lines() as u16;
+                let max = self.total_lines();
                 let current = if self.auto_scroll { max } else { self.scroll_offset };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(1);
             }
             KeyCode::Down => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
-                if self.scroll_offset >= self.total_lines() as u16 {
+                if self.scroll_offset >= self.total_lines() {
                     self.auto_scroll = true;
                 }
             }
             KeyCode::PageUp => {
-                let max = self.total_lines() as u16;
+                let max = self.total_lines();
                 let current = if self.auto_scroll { max } else { self.scroll_offset };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(10);
@@ -582,8 +772,7 @@ impl ChatApp {
                         None,
                     );
 
-                    self.messages.push(ChatMessage::user(&input));
-                    self.message_metrics.push(None);
+                    self.messages.push(ChatEntry::user(&input));
 
                     self.is_streaming = true;
                     self.auto_scroll = true;
@@ -700,96 +889,54 @@ impl ChatApp {
         frame.render_widget(header, area);
     }
 
-    fn render_chat_history(&self, frame: &mut Frame, area: Rect) {
-        let mut lines = Vec::new();
+    fn render_chat_history(&mut self, frame: &mut Frame, area: Rect) {
+        let lines = self.build_history_lines();
+        // Inner width accounts for borders + indent margin used by Paragraph
+        let inner_width = area.width.saturating_sub(4).max(1);
+        self.update_wrap_metrics(&lines, inner_width);
 
-        if let Some(sys) = &self.system_prompt {
-            lines.push(Line::from(vec![
-                Span::styled(" [System] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                Span::styled(sys, Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::from(""));
-        }
-
-        for (i, msg) in self.messages.iter().enumerate() {
-            let (label, color) = if msg.role == "user" {
-                (" [You] ", Color::Blue)
-            } else {
-                (" [Nexus] ", Color::Green)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            ]));
-
-            // Markdown parsing and syntax highlighting for messages
-            let rendered_markdown = render_markdown(&msg.content);
-            for m_line in rendered_markdown {
-                let mut indented_spans = vec![Span::raw("   ")];
-                indented_spans.extend(m_line.spans);
-                lines.push(Line::from(indented_spans));
-            }
-
-            // Render generation telemetry badge for assistant responses
-            if msg.role == "assistant" {
-                if let Some(Some(metrics)) = self.message_metrics.get(i) {
-                    let ttft_label = if let Some(ttft) = metrics.ttft_ms {
-                        format!(" · TTFT: {}ms", ttft)
-                    } else {
-                        String::new()
-                    };
-                    let badge_text = format!(
-                        "   ⚡ {:.1} t/s · {} tokens · {:.2}s{}",
-                        metrics.tokens_per_sec, metrics.tokens, metrics.duration_secs, ttft_label
-                    );
-                    lines.push(Line::from(Span::styled(
-                        badge_text,
-                        Style::default().fg(Color::Rgb(140, 160, 180)).add_modifier(Modifier::DIM),
-                    )));
-                }
-            }
-
-            lines.push(Line::from(""));
-        }
-
-        // Display current active streaming generation
-        if self.is_streaming || !self.streaming_response.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(" [Nexus] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled("(generating...)", Style::default().fg(Color::Yellow)),
-            ]));
-
-            let rendered_markdown = render_markdown(&self.streaming_response);
-            for m_line in rendered_markdown {
-                let mut indented_spans = vec![Span::raw("   ")];
-                indented_spans.extend(m_line.spans);
-                lines.push(Line::from(indented_spans));
-            }
-        }
-
-        let total_lines = lines.len() as u16;
-        let viewport_height = area.height.saturating_sub(2);
-        let max_scroll = total_lines.saturating_sub(viewport_height);
+        let viewport_height = area.height.saturating_sub(2) as usize;
+        let visual_total = self.last_wrapped_lines;
+        let max_scroll = visual_total.saturating_sub(viewport_height);
 
         let scroll_y = if self.auto_scroll {
             max_scroll
         } else {
             self.scroll_offset.min(max_scroll)
         };
+        self.scroll_offset = scroll_y;
 
-        let history = Paragraph::new(lines)
+        let history = Paragraph::new(lines.clone())
             .block(
                 Block::default()
                     .title(" Conversation History ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue)),
             )
-            .scroll((scroll_y, 0))
+            .scroll((scroll_y.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(history, area);
-    }
 
+        // Scrollbar grounded on the same wrapped count as key handling
+        if visual_total > viewport_height && area.width > 2 {
+            let scrollbar_area = Rect {
+                x: area.x + area.width.saturating_sub(1),
+                y: area.y.saturating_add(1),
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            let mut state = ratatui::widgets::ScrollbarState::new(max_scroll.max(1))
+                .position(scroll_y);
+            frame.render_stateful_widget(
+                ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(Some("↑"))
+                    .end_symbol(Some("↓")),
+                scrollbar_area,
+                &mut state,
+            );
+        }
+    }
     fn render_input_box(&self, frame: &mut Frame, area: Rect) {
         let border_color = if self.is_streaming {
             Color::Yellow
@@ -837,7 +984,10 @@ impl ChatApp {
             (status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD))
         } else {
             (
-                "[Enter] Submit | [Shift+Enter] Newline | [Esc] Abort | [Alt+P/F5] Presets | [/help] Commands".to_string(),
+                format!(
+                    "[Enter] Send | Esc Abort | Alt+P Preset | temp={:.2} top_p={:.2} max={} | /help",
+                    self.temperature, self.top_p, self.max_tokens
+                ),
                 Style::default().fg(Color::DarkGray),
             )
         };
@@ -994,8 +1144,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         } else {
                             ""
                         };
-                        app.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
-                        app.message_metrics.push(None);
+                        app.messages.push(ChatEntry::error(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
                         app.status_message = Some(format!("Error: {}", err));
                         app.auto_scroll = true;
                     }

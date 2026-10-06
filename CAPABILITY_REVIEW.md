@@ -5,6 +5,12 @@
 **Baseline reviewed:** commit `213ee12` ("feat: Enhance chat functionality and markdown support")
 **Verification baseline at time of review:** `cargo test` — 73 tests passing across 7 suites; `cargo clippy --all-targets` — 19 lib warnings, 0 errors; no CI workflows present (`.github/` contains only `agents/*.md`).
 
+**Implementation status (2026-10-06):** Phase 7 mesh work is **shipped** on
+`cursor/phase7-control-plane-server-e680` (PR #9) + `cursor/phase7-mesh-remainder-7787`
+(PR #10). Historical findings below are preserved; status markers call out what
+is done vs still open. **Recommended next phase: Phase 9 (Trust)** before
+Phase 8 (TUI) — remote `model/load` is live and unauthenticated on the LAN.
+
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
 proposals, and proposals are ordered by how much capability they unlock per unit
@@ -19,6 +25,24 @@ inert — are mechanically reproducible:
 
 ---
 
+## Status snapshot (post–Phase 7)
+
+| Area | Status | Where |
+|---|---|---|
+| Control-plane HTTP server on `control_port` 9998 | **Done** | `src/control_plane_server.rs`; hub / nexusd / host / worker |
+| mDNS TXT `ctrl` + UDP fallback to local `control_port` | **Done** | `src/mdns.rs`, `src/discovery.rs` (beacon v2 for on-wire ctrl deferred) |
+| Human-readable node name (`name=` TXT + `PeerNode.display_name`) | **Done** | mDNS + UI `label()`; beacon still has no name field |
+| Zero-config host resolution (`find_best_host` fallback + hub discovery) | **Done** | `src/client.rs`, hub bootstrap in `src/main.rs` |
+| File logging + `nexus doctor` | **Done** | `src/logging.rs`, `src/doctor.rs` |
+| Settings displayed ⇒ consumed | **Done** for Settings UI | wired ram%/mmap/enable_rpc/prefer_adb/rpc binary/name; hid FallbackCpu; added control_port |
+| `GET /models`, SSE `/events` | **Deferred** | Phase 10 / later |
+| `POST /pair`, Ed25519, signed control plane | **Open — Phase 9** | §1.5; now urgent |
+| Peer registry as runtime SoT | **Open — Phase 9** | §1.4 |
+| TUI responsiveness / hub split | **Open — Phase 8** | §2.1–§2.6, §2.8 |
+| Model store / LAN transfer | **Open — Phase 10** | §4 |
+
+---
+
 ## Executive summary
 
 The codebase is well-factored for its size, the binary beacon protocol and GGUF
@@ -28,40 +52,39 @@ They are integration problems: several subsystems are fully implemented but neve
 connected to anything, so the headline user-facing promises do not hold at
 runtime.
 
-The five findings that matter most, in order:
+The five findings that mattered most at review time (with current status):
 
-1. **There is no HTTP server for the control plane.** `handle_load_model` and
-   `handle_unload_model` exist in `src/control_plane.rs` but have no callers
-   outside `tests/test_phase3_network.rs`. Nothing in `src/daemon.rs` or
-   `src/main.rs` binds a listener. Every "launch a model on another device from
-   the TUI" path in `src/ui/hub.rs` therefore dispatches an HTTP POST that cannot
-   be answered. The single most prominent feature in `README.md` and
-   `DESIGN_SPEC.md` section 5 is non-functional.
+1. ~~**There is no HTTP server for the control plane.**~~ **Resolved (Phase 7 /
+   PR #9).** `src/control_plane_server.rs` (hyper) serves
+   `POST /nexus/control/v1/{state,model/load,model/unload}` on
+   `network.control_port` (default 9998) from hub, nexusd, host, and worker.
+   `SupervisorManager` is the shared inference owner. Still deferred:
+   `GET /models`, SSE `/events`, `POST /pair`.
 
-2. **Auto-discovery of a chat host cannot succeed with a default config.**
-   `NexusClient::resolve_from_discovery` only consults
-   `resolve_primary_compute_anchor`, which returns `None` unless
-   `network.anchors.primary_compute_id` is explicitly set. A fresh install with
-   no static peers will always hit `DiscoveryTimeout`.
+2. ~~**Auto-discovery of a chat host cannot succeed with a default config.**~~
+   **Resolved (Phase 7 remainder / PR #10).** `resolve_from_discovery` prefers a
+   pinned ready anchor, then `find_best_host`, then static peers. Hub bootstrap
+   order: `default_host` → PreferAdbTunnel USB → discovery → localhost.
 
-3. **Ten configuration options are inert.** `node.name`, `node.runtime_role`,
-   `node.capabilities`, `hardware.acceleration.fallback_to_cpu`,
-   `hardware.acceleration.cpu_threads_batch`, `hardware.safety.mmap`,
-   `hardware.safety.mlock`, `hardware.safety.max_ram_usage_percent`,
-   `cluster.enable_rpc`, and `cluster.prefer_adb_tunnel` are read and written by
-   `src/ui/settings_view.rs` and never consulted anywhere else. Operators can
-   toggle them, save them, see them persist, and observe no behavior change.
+3. ~~**Ten configuration options are inert.**~~ **Mostly resolved for Settings
+   (PR #10).** Settings now wires `node.name`, `max_ram_usage_percent`, `mmap`,
+   `enable_rpc`, `prefer_adb_tunnel`, `rpc_server_binary`, and exposes
+   `control_port`. FallbackCpu was removed from the Settings UI. Still unused
+   in TOML-only schema (not shown): `runtime_role`, `capabilities`,
+   `cpu_threads_batch`, `mlock`, `fallback_to_cpu`.
 
-4. **There is no device-to-device model transfer.** The user-facing concept of a
-   "personal local AI network" implies that a model downloaded once is available
-   everywhere. Today each node must independently fetch from the internet, and
-   `ModelDownloader` is reachable only from `nexus download` on the CLI — it is
-   not wired into the TUI at all.
+4. **There is no device-to-device model transfer.** *(Still open — Phase 10.)*
+   The user-facing concept of a "personal local AI network" implies that a model
+   downloaded once is available everywhere. Today each node must independently
+   fetch from the internet, and `ModelDownloader` is reachable only from
+   `nexus download` on the CLI — it is not wired into the TUI at all.
 
-5. **Nothing on the wire is authenticated.** The beacon's CRC-16-CCITT is error
-   detection, not integrity. Any host on the LAN can forge a beacon carrying
-   another node's UUID and redirect every TUI client's chat traffic to itself.
-   Once a control-plane server exists, the same applies to remote model loads.
+5. **Nothing on the wire is authenticated.** *(Still open — Phase 9; now more
+   urgent.)* The beacon's CRC-16-CCITT is error detection, not integrity. Any
+   host on the LAN can forge a beacon carrying another node's UUID and redirect
+   every TUI client's chat traffic to itself. **With the control-plane server
+   live, the same applies to remote model loads** — this is the recommended
+   next phase.
 
 ---
 
@@ -72,21 +95,24 @@ accounts for most of the gap between the documented system and the running one.
 
 | Subsystem | Where it lives | Status at runtime |
 |---|---|---|
-| Control-plane request handlers | `src/control_plane.rs` (`handle_load_model`, `handle_unload_model`) | No server binds them; tests only |
-| Control-plane state fetch | `src/control_plane.rs` (`fetch_state`) | No callers in `src/` |
-| Remote unload dispatch | `src/control_plane.rs` (`dispatch_unload_model`) | No callers in `src/` |
-| Peer lifecycle registry | `src/peer_registry.rs` (`expire`, `remove_terminal`, `mark_verified`, `eligible_rpc_peers`) | No callers in `src/`; `ClusterView` reads the raw `HashMap` instead |
+| Control-plane request handlers | `src/control_plane.rs` + `src/control_plane_server.rs` | **Done** — hyper server binds them on `control_port` |
+| Control-plane state fetch | `src/control_plane.rs` (`fetch_state`) | Used by doctor / tests; peer-registry verification still Phase 9 |
+| Remote unload dispatch | `src/control_plane.rs` (`dispatch_unload_model`) | Library ready; TUI remote unload still limited |
+| Peer lifecycle registry | `src/peer_registry.rs` | Still parallel to `DiscoveryService` HashMap — Phase 9 |
 | Chat template engine | `src/preset.rs` (`format_prompt`, `ChatTemplate`) | No callers; llama-server applies its own template |
 | Non-streaming completion | `src/client.rs` (`complete_chat`) | No callers |
 | ADB tunnel view | `src/ui/tunnel_view.rs` | Not wired into any hub tab; tested but unreachable |
 | Model downloader | `src/downloader.rs` | CLI `nexus download` only; absent from the TUI |
-| Structured logging | `tracing` macros throughout `src/ui/`, `src/discovery.rs` | No subscriber is installed in `src/main.rs`, so every log line in TUI mode is discarded |
+| Structured logging | `src/logging.rs` | **Done** — file subscriber in `nexus` / `nexusd` (`~/.nexus/logs/`) |
+| `nexus doctor` | `src/doctor.rs` | **Done** — CLI probes binaries, ports, profile, config |
 
-Two consequences are worth stating explicitly. First, the test suite passes while
-the application does not work as documented, because the tests exercise the
-handlers directly rather than through a server. Second, `src/ui/settings_view.rs`
-is actively misleading: it is the most polished surface in the app and most of
-what it offers has no effect.
+Two consequences were worth stating at review time. First, the test suite could
+pass while the application did not work as documented, because tests exercised
+handlers directly rather than through a server — **the control-plane server and
+`tests/test_control_plane_server.rs` close that gap for load/unload/state**.
+Second, `src/ui/settings_view.rs` was actively misleading — **Phase 7 remainder
+enforces displayed ⇒ consumed for Settings fields**; remaining inert keys are
+TOML-only and not shown.
 
 **Recommendation.** Treat "is it reachable from a user action?" as an acceptance
 criterion for every subsystem, and add an integration test layer that drives
@@ -101,17 +127,24 @@ client, and hub be tested end to end without a GGUF file or a GPU.
 
 ### 1.1 The control plane is a client without a server (blocker)
 
+> **Status (2026-10-06): Resolved for MVP.** See PR #9 /
+> `src/control_plane_server.rs`. Routes served:
+> `POST /nexus/control/v1/{state,model/load,model/unload}` on dedicated
+> `control_port` (9998). Still deferred: `GET /models`, SSE `/events`,
+> `POST /pair`.
+
 `src/control_plane.rs` defines a complete, well-validated protocol: versioned
 requests, identity checks, response size caps, and policy validation in
 `validate_state`. The client half is wired up — `src/ui/hub.rs` calls
 `dispatch_load_model` from both `execute_target_selection` and the Cluster tab's
-`[L] Load Model` key. The server half does not exist.
+`[L] Load Model` key. ~~The server half does not exist.~~
 
 The failure is also mis-reported to the operator. `src/ui/hub.rs` maps the
 resulting transport error to the hint "node has no active server on port 8080.
 Launch model locally on that device first," which sends the operator chasing a
 configuration problem that cannot be fixed, because the endpoint is unimplemented
-rather than unstarted.
+rather than unstarted. *(Hint text updated in PR #9 to reference the control
+plane / control_port.)*
 
 **Proposal.** Add a `src/server.rs` that binds a typed HTTP control plane and run
 it from every entry point — `nexus` (hub), `nexusd`, and `nexus worker` — not
@@ -138,9 +171,14 @@ pulls a large tree. `hyper` is already in the dependency graph transitively via
 the footprint small. If a framework is preferred, `axum` is the conventional
 choice and is pure Rust with no C bindings, so it does not conflict with
 Directive 4's intent — but that is a decision worth recording explicitly in
-`AGENT_LEARNINGS.md` rather than made implicitly.
+`AGENT_LEARNINGS.md` rather than made implicitly. *(Decision recorded: hand-rolled
+hyper in PR #9.)*
 
 ### 1.2 The control plane would collide with llama-server on port 8080
+
+> **Status (2026-10-06): Resolved.** Dedicated `network.control_port` (default
+> 9998). mDNS TXT `ctrl`; UDP peers fall back to local config (beacon v1 has no
+> spare field; beacon v2 deferred).
 
 `PeerNode::api_endpoint()` returns `http://{ip}:{api_port}`, and `api_port`
 defaults to 8080 — the same port `llama-server` binds. `dispatch_load_model`
@@ -162,6 +200,10 @@ design avoids.
 
 ### 1.3 Auto-discovery is gated behind an anchor that defaults to unset
 
+> **Status (2026-10-06): Resolved (PR #10).** Anchor preferred when set and
+> healthy; otherwise `find_best_host`. Hub no longer skips discovery for a
+> silent localhost fallback.
+
 `NexusClient::resolve_from_discovery` loops on `resolve_primary_compute_anchor`,
 which short-circuits on `self.config.network.anchors.primary_compute_id?`. With
 the default `AnchorConfig::default()` that is `None`, so the loop never resolves
@@ -182,6 +224,8 @@ and add a test asserting that a default-configured client resolves a host that i
 only advertising via beacon.
 
 ### 1.4 The peer registry does not participate at runtime
+
+> **Status (2026-10-06): Open — Phase 9.** Composes with pairing/verification.
 
 `src/peer_registry.rs` implements the lifecycle the design spec describes —
 `Discovered`, `Verifying`, `Healthy`, `Stale`, `Removed`, `Rejected` — with
@@ -214,6 +258,10 @@ particular, `verified` is never set to `true` anywhere, which means
    which makes field debugging guesswork.
 
 ### 1.5 Nothing on the wire is authenticated or integrity-protected
+
+> **Status (2026-10-06): Open — Phase 9 (now highest priority).** Control-plane
+> remote load works without pairing; forgeable beacons remain. Do this before
+> Phase 8 TUI polish.
 
 The beacon carries a 16-byte UUID and a CRC-16-CCITT over the first 62 bytes.
 CRC detects accidental corruption; it provides no defense against a crafted
@@ -492,6 +540,10 @@ hot-swap modals should compose rather than overwrite each other.
 
 ### 2.7 TUI mode produces no logs at all
 
+> **Status (2026-10-06): Resolved (PR #10).** `src/logging.rs` installs a file
+> subscriber writing `~/.nexus/logs/nexus-<pid>.log` from `nexus` and `nexusd`
+> (`--log-level` / `RUST_LOG`). In-TUI log viewer still deferred.
+
 `src/main.rs` never installs a `tracing` subscriber. Only `src/daemon.rs` does.
 Every `info!`, `warn!`, and `error!` in the discovery service, supervisor, and hub
 is therefore discarded when running `nexus`. When a cross-device load fails, the
@@ -539,6 +591,9 @@ the single highest-leverage debuggability change available, and it is small.
   beacon nor the mDNS TXT record carries a name. `node.name` exists in config and
   is inert (§0). Human-readable names are a small change with an outsized effect
   on whether a multi-device mesh feels manageable.
+  *(**Resolved for mDNS/UI in PR #10:** TXT `name=` + `PeerNode.display_name` /
+  `label()`. Beacon still has no name field; UDP-only peers keep UUID labels
+  until mDNS arrives.)*
 - `&peer.uuid.to_string()[..8]` and `[..13]` slice a `String` by byte index in
   several places. Safe for a hyphenated UUID, but it is a pattern that panics the
   moment it is pointed at a display name.
@@ -1020,13 +1075,11 @@ after §5.1, which gives it a stable endpoint to build against.
 
 ### 5.7 Operational conveniences
 
-- **`nexus doctor`** — one command that checks every precondition and prints what
-  is wrong: `llama-server` and `rpc-server` on `PATH` and their versions, Vulkan
-  present and functional, models directory readable, discovery ports bindable,
-  beacons observed from peers, control plane reachable on each peer, ADB state,
-  free disk, thermal headroom. Given how many cross-device failure modes are
-  silent today (§1.1, §1.3, §2.7), this is the highest-value diagnostic available
-  and most of the probes already exist as library functions.
+- **`nexus doctor`** — ~~one command that checks every precondition~~ **Done
+  (PR #10, `src/doctor.rs`).** Probes config, `llama-server`/`rpc-server` on
+  PATH (WARN if missing), models dir, `SystemProfile`, bindability of
+  discovery/control/api ports, adb (WARN), log dir, display name. Shell
+  completions / systemd units / config schema versioning remain open.
 - **Shell completions and a man page** from the existing `clap` definitions.
 - **Systemd and Termux boot units** so `nexusd` survives reboots.
 - **Config schema versioning** so future config changes migrate rather than fail
@@ -1079,15 +1132,23 @@ driven by dependencies, and the invasiveness note says what each one touches.
 
 ### Phase 7 — Make the mesh actually work
 
+> **Status (2026-10-06): Done** — PR #9 (control plane) + PR #10 (remainder).
+> Acceptance: remote load path exists; zero-config resolve + hub discovery;
+> `nexus doctor`; Settings displayed ⇒ consumed. Remaining Phase 7 nits:
+> beacon v2 for on-wire `ctrl`/name; two-device LAN soak still worth a live check
+> outside Cloud VMs.
+
 The minimum set that makes the documented features true.
 
-- Control-plane HTTP server on its own port, served from all three entry points
-  (§1.1, §1.2)
-- Beacon and mDNS carry the control port and a human-readable node name (§1.2,
-  §2.9)
-- Restore zero-config host resolution (§1.3)
-- File-based logging in TUI mode and `nexus doctor` (§2.7, §5.7)
-- Remove or wire up every inert config field; delete dead modules (§0)
+- ~~Control-plane HTTP server on its own port, served from all three entry points
+  (§1.1, §1.2)~~ **Done**
+- ~~Beacon and mDNS carry the control port and a human-readable node name (§1.2,
+  §2.9)~~ **Done for mDNS** (`ctrl`, `name=`); beacon v2 deferred
+- ~~Restore zero-config host resolution (§1.3)~~ **Done**
+- ~~File-based logging in TUI mode and `nexus doctor` (§2.7, §5.7)~~ **Done**
+- ~~Remove or wire up every inert config field; delete dead modules (§0)~~
+  **Done for Settings UI**; dead modules (`tunnel_view`, `format_prompt`, etc.)
+  intentionally kept for later phases
 
 *Invasiveness:* one new module, small edits across `discovery.rs`, `main.rs`,
 `daemon.rs`, `settings_view.rs`. Adds an HTTP server dependency — decision to
@@ -1097,6 +1158,9 @@ two-device LAN with default config on both; `nexus doctor` diagnoses a
 deliberately broken node; no config field is displayed that has no effect.
 
 ### Phase 8 — TUI responsiveness and correctness
+
+> **Sequencing note:** Prefer **Phase 9 before Phase 8**. Trust risk from an
+> open control plane outweighs UX freezes.
 
 - Command/event architecture; no blocking awaits in the event loop (§2.1)
 - Pure render: cache GGUF metadata, system profile, rendered markdown (§2.2)
@@ -1114,6 +1178,8 @@ model load; scrolling reaches the top of a conversation with wrapped code blocks
 choosing CPU-safe mode during a hot-swap launches with `-ngl 0`.
 
 ### Phase 9 — Trust
+
+> **Recommended next shippable slice** after Phase 7.
 
 - Ed25519 node identity; pairing with a short code (§1.5)
 - Signed control-plane requests with replay protection (§1.5)

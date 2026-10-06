@@ -22,6 +22,9 @@ pub enum HubAction {
     ModelsEnter,
     ModelsContextInc,
     ModelsContextDec,
+    ModelsDownload,
+    ModelsTransfer,
+    ModelsPush,
     ClusterRefresh,
     Help,
 }
@@ -156,6 +159,27 @@ pub fn models_bindings() -> &'static [KeyBinding] {
             label: "- Context",
             scope: KeyScope::Models,
         },
+        KeyBinding {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsDownload,
+            label: "D Download URL",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsTransfer,
+            label: "T Pull from peer",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsPush,
+            label: "S Send to peer",
+            scope: KeyScope::Models,
+        },
     ]
 }
 
@@ -226,6 +250,9 @@ pub fn resolve(scope: KeyScope, code: KeyCode, modifiers: KeyModifiers) -> Optio
             KeyCode::Char('R') => return Some(HubAction::ModelsRefresh),
             KeyCode::Char('U') => return Some(HubAction::UnloadModel),
             KeyCode::Char('=') => return Some(HubAction::ModelsContextInc),
+            KeyCode::Char('D') => return Some(HubAction::ModelsDownload),
+            KeyCode::Char('T') => return Some(HubAction::ModelsTransfer),
+            KeyCode::Char('S') => return Some(HubAction::ModelsPush),
             _ => {}
         }
     }
@@ -289,14 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn models_context_keys() {
+    fn test_models_d_t_s_keys() {
         assert_eq!(
-            resolve(KeyScope::Models, KeyCode::Char('+'), KeyModifiers::NONE),
-            Some(HubAction::ModelsContextInc)
+            resolve(KeyScope::Models, KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(HubAction::ModelsDownload)
         );
         assert_eq!(
-            resolve(KeyScope::Models, KeyCode::Char('-'), KeyModifiers::NONE),
-            Some(HubAction::ModelsContextDec)
+            resolve(KeyScope::Models, KeyCode::Char('t'), KeyModifiers::NONE),
+            Some(HubAction::ModelsTransfer)
+        );
+        assert_eq!(
+            resolve(KeyScope::Models, KeyCode::Char('s'), KeyModifiers::NONE),
+            Some(HubAction::ModelsPush)
         );
     }
 }

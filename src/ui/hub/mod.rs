@@ -32,7 +32,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Tabs},
     Frame, Terminal,
 };
 use std::io::stdout;
@@ -160,6 +160,12 @@ pub struct HubApp {
     pub config_path: std::path::PathBuf,
     pub load_phase: Option<String>,
     pub show_help: bool,
+    /// URL input modal for Models [D].
+    pub pending_download_url: Option<String>,
+    /// Peer picker for [S] push (list of (label, endpoint)).
+    pub pending_push_peers: Option<Vec<(String, String)>>,
+    pub push_peer_idx: usize,
+    pub download_progress: Option<(String, Option<f32>, u64, Option<u64>, f64)>,
 }
 
 impl HubApp {
@@ -194,6 +200,10 @@ impl HubApp {
             config_path,
             load_phase: None,
             show_help: false,
+            pending_download_url: None,
+            pending_push_peers: None,
+            push_peer_idx: 0,
+            download_progress: None,
         }
     }
 
@@ -388,6 +398,33 @@ impl HubApp {
                     Color::Red,
                 ));
             }
+            HubEvent::DownloadProgress {
+                downloaded_bytes,
+                total_bytes,
+                percent,
+                speed_bytes_per_sec,
+                label,
+            } => {
+                self.download_progress = Some((
+                    label,
+                    percent,
+                    downloaded_bytes,
+                    total_bytes,
+                    speed_bytes_per_sec,
+                ));
+            }
+            HubEvent::DownloadFinished { message } => {
+                self.download_progress = None;
+                self.models_view.refresh();
+                self.status_message = Some((message, Color::Green));
+            }
+            HubEvent::DownloadFailed { message } => {
+                self.download_progress = None;
+                self.status_message = Some((message, Color::Red));
+            }
+            HubEvent::ModelCatalogUpdated { remotes } => {
+                self.models_view.apply_remote_catalogs(&remotes);
+            }
         }
     }
 
@@ -424,6 +461,89 @@ impl HubApp {
 
         if self.show_help {
             self.render_help_modal(frame, area);
+        }
+
+        if let Some((label, percent, downloaded, total, speed)) = &self.download_progress {
+            let modal = centered_rect(60, 20, area);
+            frame.render_widget(Clear, modal);
+            let ratio = percent.map(|p| (p as f64 / 100.0).clamp(0.0, 1.0)).unwrap_or(0.0);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                ])
+                .margin(1)
+                .split(modal);
+            let title = Paragraph::new(Line::from(Span::styled(
+                format!(" {label} "),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(" Transfer ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+            frame.render_widget(title, modal);
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+                .ratio(ratio)
+                .label(format!(
+                    "{:.1}%  {} / {}  ({:.1} MB/s)",
+                    percent.unwrap_or(0.0),
+                    downloaded,
+                    total.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    speed / (1024.0 * 1024.0)
+                ));
+            frame.render_widget(gauge, chunks[1]);
+        }
+
+        if let Some(url) = &self.pending_download_url {
+            let modal = centered_rect(70, 20, area);
+            frame.render_widget(Clear, modal);
+            let p = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Enter GGUF URL (Enter=start, Esc=cancel) ",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(url.clone(), Style::default().fg(Color::White))),
+            ])
+            .block(
+                Block::default()
+                    .title(" Download ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+            frame.render_widget(p, modal);
+        }
+
+        if let Some(peers) = &self.pending_push_peers {
+            let modal = centered_rect(50, 40, area);
+            frame.render_widget(Clear, modal);
+            let mut lines = vec![Line::from(Span::styled(
+                " Select peer to receive model (Enter/Esc) ",
+                Style::default().fg(Color::Yellow),
+            ))];
+            for (i, (label, _)) in peers.iter().enumerate() {
+                let style = if i == self.push_peer_idx {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let prefix = if i == self.push_peer_idx { "> " } else { "  " };
+                lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
+            }
+            let p = Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Push to Peer ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+            frame.render_widget(p, modal);
         }
 
         if let Some(phase) = &self.load_phase {
@@ -700,6 +820,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             _ = refresh_interval.tick() => {
                 if hub.active_tab == HubTab::Models {
                     hub.models_view.refresh_profile();
+                    let _ = cmd_tx.try_send(HubCommand::RefreshModelCatalog);
                 }
                 if hub.active_tab == HubTab::Cluster {
                     let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
@@ -741,6 +862,84 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                     if hub.show_help {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(12)) {
                             hub.show_help = false;
+                        }
+                        continue;
+                    }
+
+                    // Download URL modal
+                    if hub.pending_download_url.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.pending_download_url = None;
+                            }
+                            KeyCode::Enter => {
+                                if let Some(url) = hub.pending_download_url.take() {
+                                    let url = url.trim().to_string();
+                                    if !url.is_empty() {
+                                        let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(buf) = &mut hub.pending_download_url {
+                                    buf.pop();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(buf) = &mut hub.pending_download_url {
+                                    buf.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Push peer picker
+                    if let Some(peers) = &hub.pending_push_peers {
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.pending_push_peers = None;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if hub.push_peer_idx > 0 {
+                                    hub.push_peer_idx -= 1;
+                                } else if !peers.is_empty() {
+                                    hub.push_peer_idx = peers.len() - 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !peers.is_empty() {
+                                    hub.push_peer_idx = (hub.push_peer_idx + 1) % peers.len();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(peers) = hub.pending_push_peers.take() {
+                                    if let Some((_, endpoint)) = peers.get(hub.push_peer_idx) {
+                                        if let Some(row) = hub.models_view.selected_row() {
+                                            if row.local.is_some() && !row.digest.is_empty() {
+                                                let source = format!(
+                                                    "http://{}:{}",
+                                                    hub.config.network.api_host,
+                                                    hub.config.network.control_port
+                                                );
+                                                let source = source.replace("0.0.0.0", "127.0.0.1");
+                                                let _ = cmd_tx.try_send(HubCommand::PushModel {
+                                                    peer_endpoint: endpoint.clone(),
+                                                    digest: row.digest.clone(),
+                                                    source_base_url: source,
+                                                });
+                                            } else {
+                                                hub.status_message = Some((
+                                                    "Push requires a local model with digest".into(),
+                                                    Color::Yellow,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -920,10 +1119,69 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 if let Some(m) = hub.models_view.selected_model() {
                                     let path = m.path.clone();
                                     let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection { model_path: path });
+                                } else {
+                                    hub.status_message = Some((
+                                        "Model not local — press [T] to pull from a peer first".into(),
+                                        Color::Yellow,
+                                    ));
                                 }
                             }
                             HubAction::ModelsContextInc => hub.models_view.adjust_context(1),
                             HubAction::ModelsContextDec => hub.models_view.adjust_context(-1),
+                            HubAction::ModelsDownload => {
+                                hub.pending_download_url = Some(String::new());
+                            }
+                            HubAction::ModelsTransfer => {
+                                if let Some(row) = hub.models_view.selected_row() {
+                                    if row.digest.is_empty() {
+                                        hub.status_message = Some((
+                                            "Selected model has no digest to transfer".into(),
+                                            Color::Yellow,
+                                        ));
+                                    } else if let Some(endpoint) = row.peer_endpoints.first() {
+                                        let _ = cmd_tx.try_send(HubCommand::TransferModel {
+                                            peer_endpoint: endpoint.clone(),
+                                            digest: row.digest.clone(),
+                                        });
+                                    } else if row.local.is_some() {
+                                        hub.status_message = Some((
+                                            "Already local — no remote holder to pull from".into(),
+                                            Color::Yellow,
+                                        ));
+                                    } else {
+                                        hub.status_message = Some((
+                                            "No peer endpoint advertising this digest".into(),
+                                            Color::Yellow,
+                                        ));
+                                    }
+                                }
+                            }
+                            HubAction::ModelsPush => {
+                                if let Some(row) = hub.models_view.selected_row() {
+                                    if row.local.is_none() || row.digest.is_empty() {
+                                        hub.status_message = Some((
+                                            "Push requires a local digested model".into(),
+                                            Color::Yellow,
+                                        ));
+                                    } else {
+                                        let list: Vec<(String, String)> = hub
+                                            .cluster_view
+                                            .peers
+                                            .iter()
+                                            .map(|p| (p.label(), p.control_endpoint()))
+                                            .collect();
+                                        if list.is_empty() {
+                                            hub.status_message = Some((
+                                                "No peers visible — open Cluster tab to refresh".into(),
+                                                Color::Yellow,
+                                            ));
+                                        } else {
+                                            hub.push_peer_idx = 0;
+                                            hub.pending_push_peers = Some(list);
+                                        }
+                                    }
+                                }
+                            }
                             HubAction::ClusterRefresh => {
                                 let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                             }

@@ -272,6 +272,10 @@ pub struct NetworkConfig {
     #[serde(default = "default_api_port")]
     pub api_port: u16,
 
+    /// HTTP control-plane port (model catalog / load / unload). Distinct from llama-server `api_port`.
+    #[serde(default = "default_control_port")]
+    pub control_port: u16,
+
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
 
@@ -302,6 +306,7 @@ impl Default for NetworkConfig {
         Self {
             api_host: default_api_host(),
             api_port: default_api_port(),
+            control_port: default_control_port(),
             discovery_port: default_discovery_port(),
             broadcast_interval_ms: default_broadcast_interval_ms(),
             peer_timeout_ms: default_peer_timeout_ms(),
@@ -319,6 +324,15 @@ impl NetworkConfig {
         if self.api_port == 0 || self.discovery_port == 0 || self.discovery_port == self.api_port {
             return Err(ConfigError::Invalid(
                 "network API and discovery ports must be non-zero and distinct".to_string(),
+            ));
+        }
+        if self.control_port == 0
+            || self.control_port == self.api_port
+            || self.control_port == self.discovery_port
+        {
+            return Err(ConfigError::Invalid(
+                "network.control_port must be non-zero and distinct from api_port and discovery_port"
+                    .to_string(),
             ));
         }
         if self.discovery.broadcast_interval_ms == 0 {
@@ -537,6 +551,10 @@ fn default_api_host() -> String {
 
 fn default_api_port() -> u16 {
     8080
+}
+
+fn default_control_port() -> u16 {
+    8081
 }
 
 fn default_discovery_port() -> u16 {

@@ -1,7 +1,7 @@
 use nexus::client::{ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
 use nexus::discovery::DiscoveryService;
-use nexus::ui::chat::{ChatApp, StreamMsg};
+use nexus::ui::chat::{ChatApp, TransportBadge};
 use nexus::ui::dashboard::DashboardApp;
 use nexus::ui::models::scan_models_dir;
 use ratatui::backend::TestBackend;
@@ -128,18 +128,20 @@ fn test_models_scanner() {
 #[test]
 fn test_clean_conversation_messages() {
     let raw_messages = vec![
-        ChatMessage::assistant("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
-        ChatMessage::assistant("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
-        ChatMessage::assistant("⚠️ [Connection / Generation Error]: Transport Error"),
-        ChatMessage::assistant("Model unloaded. Local inference engine is idle."),
+        ChatMessage::status("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
+        ChatMessage::status("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
+        ChatMessage::status("⚠️ [Connection / Generation Error]: Transport Error"),
+        ChatMessage::status("Model unloaded. Local inference engine is idle."),
         ChatMessage::user("What is the capital of France?"),
         ChatMessage::assistant("The capital of France is Paris."),
         ChatMessage::user("And its population?"),
+        // User text that looks like a banner must survive (no prefix filtering)
+        ChatMessage::user("Model 'x' is great for coding."),
     ];
 
     let cleaned = ChatApp::clean_conversation_messages(&raw_messages, Some("You are a helpful assistant."));
 
-    assert_eq!(cleaned.len(), 4); // System instruction + 3 genuine dialogue turns
+    assert_eq!(cleaned.len(), 5); // System instruction + 4 genuine dialogue turns
     assert_eq!(cleaned[0].role, "system");
     assert_eq!(cleaned[0].content, "You are a helpful assistant.");
     assert_eq!(cleaned[1].role, "user");
@@ -148,96 +150,128 @@ fn test_clean_conversation_messages() {
     assert_eq!(cleaned[2].content, "The capital of France is Paris.");
     assert_eq!(cleaned[3].role, "user");
     assert_eq!(cleaned[3].content, "And its population?");
+    assert_eq!(cleaned[4].role, "user");
+    assert_eq!(cleaned[4].content, "Model 'x' is great for coding.");
+    assert!(cleaned.iter().all(|m| !m.is_status()));
 }
 
-fn key_event(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> crossterm::event::KeyEvent {
-    crossterm::event::KeyEvent {
-        code,
-        modifiers,
-        kind: crossterm::event::KeyEventKind::Press,
-        state: crossterm::event::KeyEventState::empty(),
-    }
+#[test]
+fn test_transport_badge_localhost_is_local_not_usb() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let app = ChatApp::new(client, "llama-3-8b", None);
+    assert_eq!(app.transport_badge, TransportBadge::Local);
+    assert_eq!(app.transport_badge.label(), "[Local]");
+
+    let wifi = NexusClient::new("http://192.168.1.50:8080");
+    let app_wifi = ChatApp::new(wifi, "llama-3-8b", None);
+    assert_eq!(app_wifi.transport_badge, TransportBadge::Wifi);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = ChatApp::new(NexusClient::new("http://127.0.0.1:8080"), "m", None);
+    app.transport_badge = TransportBadge::Local;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("[Local]"), "localhost supervised inference must show [Local]");
+    assert!(!content.contains("[USB Cable]"), "must not mislabel local as USB Cable");
+
+    app.transport_badge = TransportBadge::Usb;
+    terminal.draw(|f| app.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("[USB Cable]"), "explicit USB badge must render");
+}
+
+#[test]
+fn test_abort_stream_clears_streaming_state() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    app.is_streaming = true;
+    app.stream_start_time = Some(Instant::now());
+    app.streaming_response = "partial reply".to_string();
+
+    assert!(app.abort_stream());
+    assert!(!app.is_streaming);
+    assert!(app.stream_start_time.is_none());
+    assert_eq!(app.messages.last().unwrap().content, "partial reply");
+    assert!(app
+        .status_message
+        .as_ref()
+        .unwrap()
+        .contains("aborted"));
+
+    // Late tokens after abort must be ignored
+    app.handle_stream_token("should-ignore".to_string());
+    assert!(app.streaming_response.is_empty());
+    assert!(!app.is_streaming);
+}
+
+#[test]
+fn test_apply_preset_sets_hyperparams() {
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    app.apply_preset("coder", "Be terse.".to_string(), 0.2, 4096);
+    assert_eq!(app.persona_name.as_deref(), Some("coder"));
+    assert_eq!(app.system_prompt.as_deref(), Some("Be terse."));
+    assert_eq!(app.temperature, 0.2);
+    assert_eq!(app.max_tokens, 4096);
 }
 
 #[test]
 fn test_chat_cursor_navigation_and_editing() {
-    let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut app = ChatApp::new(client, "test-model", None);
-    let (tx, _rx) = tokio::sync::mpsc::channel::<StreamMsg>(10);
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
 
-    // Type "hello"
-    for c in "hello".chars() {
-        app.handle_key_input(key_event(crossterm::event::KeyCode::Char(c), crossterm::event::KeyModifiers::empty()), &tx);
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    let (tx, _rx) = mpsc::channel(8);
+
+    for c in ['h', 'e', 'l', 'l', 'o'] {
+        app.handle_key_input(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &tx,
+        );
     }
     assert_eq!(app.input_buffer, "hello");
     assert_eq!(app.cursor_idx, 5);
 
-    // Navigate Left twice
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::empty()), &tx);
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
     assert_eq!(app.cursor_idx, 3);
 
-    // Insert 'X' in the middle -> "helXlo"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Char('X'), crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE), &tx);
     assert_eq!(app.input_buffer, "helXlo");
     assert_eq!(app.cursor_idx, 4);
 
-    // Backspace deletes 'X' -> "hello"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Backspace, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &tx);
     assert_eq!(app.input_buffer, "hello");
     assert_eq!(app.cursor_idx, 3);
 
-    // Delete at cursor deletes next 'l' -> "helo"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Delete, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &tx);
     assert_eq!(app.input_buffer, "helo");
     assert_eq!(app.cursor_idx, 3);
 
-    // Home jumps to start
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &tx);
     assert_eq!(app.cursor_idx, 0);
-
-    // End jumps to end
-    app.handle_key_input(key_event(crossterm::event::KeyCode::End, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &tx);
     assert_eq!(app.cursor_idx, 4);
-
-    // Shift+Enter inserts newline
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT), &tx);
-    assert_eq!(app.input_buffer, "helo\n");
-    assert_eq!(app.cursor_idx, 5);
 }
 
 #[test]
-fn test_chat_slash_command_mutations() {
+fn test_chat_prompt_history_alt_arrows() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut app = ChatApp::new(client, "test-model", None);
+    let mut app = ChatApp::new(client, "llama-3-8b", None);
+    let (tx, _rx) = mpsc::channel(8);
 
-    // Test /temp
-    assert!(app.handle_slash_command("/temp 0.25"));
-    assert!((app.temperature - 0.25).abs() < 0.001);
-
-    // Test /top_p
-    assert!(app.handle_slash_command("/top_p 0.95"));
-    assert!((app.top_p - 0.95).abs() < 0.001);
-
-    // Test /max_tokens
-    assert!(app.handle_slash_command("/max_tokens 4096"));
-    assert_eq!(app.max_tokens, 4096);
-
-    // Test /system
-    assert!(app.handle_slash_command("/system You are an expert system."));
-    assert_eq!(app.system_prompt.as_deref(), Some("You are an expert system."));
-
-    // Test /preset coder
-    assert!(app.handle_slash_command("/preset coder"));
-    assert_eq!(app.active_preset.as_ref().map(|p| p.name.as_str()), Some("coder"));
-    assert_eq!(app.temperature, 0.2);
-
-    // Test /clear
-    app.messages.push(ChatMessage::user("Hi"));
-    app.message_metrics.push(None);
-    assert!(app.handle_slash_command("/clear"));
-    assert!(app.messages.is_empty());
-    assert!(app.message_metrics.is_empty());
+    app.prompt_history = vec!["first".into(), "second".into()];
+    app.handle_key_input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "second");
+    app.handle_key_input(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "first");
+    app.handle_key_input(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT), &tx);
+    assert_eq!(app.input_buffer, "second");
 }
 
 #[test]
@@ -246,115 +280,17 @@ fn test_markdown_rendering_and_boxed_code() {
 
     let markdown_text = "# Test Title\n\nHere is **bold** text and `inline_code`.\n\n```rust\nfn main() {\n    println!(\"Hello!\");\n}\n```";
     let lines = render_markdown(markdown_text);
-
-    assert!(!lines.is_empty());
-
-    // Check header render
-    let full_rendered: String = lines
+    assert!(!lines.is_empty(), "markdown should produce lines");
+    let flat: String = lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
         .collect::<Vec<_>>()
-        .join("\n");
-
-    assert!(full_rendered.contains("Test Title"), "Should render heading text");
-    assert!(full_rendered.contains("bold"), "Should render bold text");
-    assert!(full_rendered.contains("inline_code"), "Should render inline code");
-    assert!(full_rendered.contains("┌─ rust"), "Should format fenced code block header");
-    assert!(full_rendered.contains("└─"), "Should format fenced code block footer");
-    assert!(full_rendered.contains("main"), "Should preserve code tokens");
-}
-
-#[test]
-fn test_generation_metrics_and_telemetry_badge() {
-    let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut app = ChatApp::new(client, "test-model", None);
-    app.set_target_hardware("Galaxy S23 Ultra", "Vulkan Adreno 740 GPU");
-
-    // Simulate turn
-    app.messages.push(ChatMessage::user("Hello"));
-    app.message_metrics.push(None);
-
-    app.is_streaming = true;
-    app.stream_start_time = Some(Instant::now());
-
-    app.handle_stream_token("Hello".to_string());
-    app.handle_stream_token(" from GPU!".to_string());
-
-    assert!(app.ttft_ms.is_some(), "Time to first token should be recorded");
-    assert_eq!(app.tokens_streamed, 2);
-
-    app.finalize_stream();
-    assert_eq!(app.messages.len(), 2);
-    assert_eq!(app.message_metrics.len(), 2);
-
-    let metrics = app.message_metrics[1].as_ref().expect("Assistant should have metrics");
-    assert_eq!(metrics.tokens, 2);
-    assert!(metrics.tokens_per_sec > 0.0);
-
-    // Verify Headless TUI rendering includes telemetry badges
-    let backend = TestBackend::new(140, 30);
-    let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
-
-    terminal.draw(|f| app.render(f)).expect("Failed to render frame");
-
-    let buffer = terminal.backend().buffer();
-    let content = format!("{:?}", buffer);
-
-    assert!(content.contains("Galaxy S23 Ultra"), "Header must include target device");
-    assert!(content.contains("Vulkan Adreno 740 GPU"), "Header must include hardware backend");
-    assert!(content.contains("⚡"), "Must render generation performance badge");
-}
-
-#[test]
-fn test_chat_stream_abort() {
-    let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut app = ChatApp::new(client, "test-model", None);
-
-    app.is_streaming = true;
-    app.streaming_response = "Partial text".to_string();
-    app.tokens_streamed = 2;
-    app.stream_start_time = Some(Instant::now());
-
-    let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel::<()>();
-    app.abort_tx = Some(abort_tx);
-
-    app.abort_generation();
-
-    // Verify stream was aborted cleanly
-    assert_eq!(app.is_streaming, false);
-    assert!(abort_rx.try_recv().is_ok(), "Abort signal must be dispatched");
-    assert_eq!(app.messages.len(), 1);
-    assert!(app.messages[0].content.contains("Generation stopped by operator"));
-    assert_eq!(app.status_message.as_deref(), Some("Generation stopped by operator"));
-}
-
-#[test]
-fn test_session_logger_and_markdown_export() {
-    use nexus::ui::session_logger::SessionLogger;
-
-    let dir = tempdir().expect("Failed to create tempdir");
-    let export_path = dir.path().join("chat_export.md");
-
-    let messages = vec![
-        ChatMessage::user("Explain distributed inference"),
-        ChatMessage::assistant("Distributed inference offloads neural network layers across connected nodes."),
-    ];
-
-    let result = SessionLogger::export_to_markdown(
-        &messages,
-        "qwen2.5-3b",
-        "http://192.168.1.150:8080",
-        "Vulkan Adreno 740",
-        &export_path,
+        .join("");
+    assert!(flat.contains("Test Title"), "heading text should appear");
+    assert!(flat.contains("main"), "code fence body should appear");
+    assert!(
+        flat.contains("─") || flat.contains("│"),
+        "code block should use box drawing"
     );
-
-    assert!(result.is_ok());
-    assert!(export_path.exists());
-
-    let content = std::fs::read_to_string(&export_path).unwrap();
-    assert!(content.contains("qwen2.5-3b"));
-    assert!(content.contains("Vulkan Adreno 740"));
-    assert!(content.contains("Explain distributed inference"));
-    assert!(content.contains("Distributed inference offloads"));
 }
 

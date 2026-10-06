@@ -25,12 +25,40 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 3 control_port vs api_port + Hub completeness
+- Category: design-decision
+- Context: IDENTIFIED_UPGRADES Phase 3 (#9/#10/#13/#17/#19) on stacked branch `cursor/phase3-completeness-6a2f`.
+- Finding:
+  1. `control_plane.rs` had clients/handlers but no HTTP listener; remote load posted to `api_port` where llama-server does not speak `/nexus/control/v1/*`.
+  2. The 64-byte UDP beacon has no free field for a second port; advertising control via mDNS TXT `ctrl` and defaulting UDP peers to `network.control_port` (8081) avoids colliding with llama-server on 8080.
+  3. `main` already had markdown + cursor editing (`213ee12`) that was not on the Phase 1/2 stack — porting those features onto Phase 2 was cheaper than reinventing.
+- Action:
+  1. Add `network.control_port` (default 8081), Hyper control-plane server (`control_plane_server.rs`) started from Hub + `nexusd`, catalog `GET /nexus/control/v1/models` (+ `/cluster/models` alias).
+  2. Models merged catalog + in-TUI `[D]` download; help modal `?`/F12; bare `1–4` tab keys removed.
+  3. Chat: cursor editing + Alt+↑/↓ history + `pulldown-cmark` markdown (status lines stay plain).
+- Verification: `cargo test --locked` green on Phase 3 branch.
+
 ## 2026-10-06 — Cloud Agent base image Rust 1.83 cannot compile Cargo.lock
 - Category: environment
 - Context: Setting up the Cursor Cloud Agent environment for nexus-llm on Ubuntu 24.04.
 - Finding: The base image ships Rust 1.83.0. `cargo fetch --locked` fails because `indexmap` 2.14.2 requires the `edition2024` Cargo feature, stabilized in Rust 1.85. `cargo run` also needs `--bin nexus` because the package builds both `nexus` and `nexusd`. A second `nexus discover` process using the same `~/.nexus` identity does not list the local `nexusd` beacon as a peer.
 - Action: Install and default to Rust 1.99.0 with rustup (`--profile minimal`, plus rustfmt and clippy). Run Cargo directly on Cloud Agent VMs. Keep the Penryn rustflags in `.cargo/config.toml`.
 - Verification: `cargo test --locked` passed 73 tests on Rust 1.99.0. `nexus info`, `nexus check`, and `nexusd` startup (UDP 9999 plus mDNS) succeeded.
+
+## 2026-10-06 — Phase 1 P0 Hub/TUI fixes (hot-swap layers, Esc abort, transport badge)
+- Category: bug
+- Context: Implementing IDENTIFIED_UPGRADES.md Phase 1 (#1–#6 + #21) on the Hub TUI.
+- Finding:
+  1. Hot-swap stored only the model path, dropping `custom_gpu_layers` — CPU Safe Mode (`-ngl 0`) was silently lost on confirm, reintroducing Android Vulkan freezes.
+  2. Any `127.0.0.1` endpoint was labeled `[USB Cable]`; plain local `llama-server` was mislabeled.
+  3. Esc quit standalone chat mid-stream and did nothing in Hub Chat; stream `JoinHandle`s were discarded so generation could not be cancelled.
+  4. `SystemProfile::probe()` ran inside Models `render()` every frame.
+- Action:
+  1. Persist `pending_hot_swap: Option<(PathBuf, Option<u32>)>` and confirm via `execute_model_load_with_gpu`.
+  2. Explicit `TransportBadge::{Local,Usb,Wifi}` with ADB `forward --list` cached on the 500ms tick.
+  3. Store stream `JoinHandle`, Esc aborts; quit via Ctrl+C / idle `q` only. Panic hook restores terminal.
+  4. Cache profile on `ModelsView`; wire `[P]` to cycle presets into Hub chat hyperparams.
+- Verification: `cargo test --locked` passed (all suites including new abort/badge/persona/hot-swap assertions).
 
 ## 2026-10-05 — Chat TUI Overhaul: Pure-Rust Markdown, Cursor Ergonomics, Stream Abort, and Telemetry Badges
 - Category: design-decision

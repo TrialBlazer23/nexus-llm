@@ -2,6 +2,7 @@ pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod control_plane;
+pub mod control_plane_server;
 pub mod discovery;
 pub mod mdns;
 pub mod downloader;

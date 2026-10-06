@@ -100,6 +100,7 @@ pub fn endpoint_from_state(
         } else {
             0
         },
+        control_port: endpoint.control_port,
     }
 }
 
@@ -220,26 +221,86 @@ pub async fn dispatch_unload_model(
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCatalogEntry {
+    pub filename: String,
+    pub size_mb: u64,
+    pub architecture: String,
+    pub context_length: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCatalogResponse {
+    pub protocol_version: u16,
+    pub node_id: Uuid,
+    pub models: Vec<ModelCatalogEntry>,
+}
+
+/// Build a catalog response by scanning `models_dir` for `.gguf` files.
+pub fn build_model_catalog(node_id: Uuid, models_dir: &std::path::Path) -> ModelCatalogResponse {
+    let models = crate::ui::models::scan_models_dir(models_dir)
+        .into_iter()
+        .map(|m| ModelCatalogEntry {
+            filename: m.filename,
+            size_mb: m.size_mb,
+            architecture: m.architecture,
+            context_length: m.context_length,
+        })
+        .collect();
+    ModelCatalogResponse {
+        protocol_version: CONTROL_PLANE_VERSION,
+        node_id,
+        models,
+    }
+}
+
+pub async fn fetch_models(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ModelCatalogResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/models");
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
 pub async fn handle_load_model(
     manager: &crate::supervisor::SupervisorManager,
     request: &ModelLoadRequest,
     api_host: &str,
     api_port: u16,
+    models_dir: Option<&std::path::Path>,
 ) -> ModelLoadResponse {
     let raw_path = std::path::PathBuf::from(&request.model_path);
     let model_path = if raw_path.exists() {
         raw_path
     } else {
         let filename = raw_path.file_name().unwrap_or(raw_path.as_os_str());
-        let default_models_dir = std::env::var("HOME")
+        let mut candidates = Vec::new();
+        if let Some(dir) = models_dir {
+            candidates.push(dir.join(filename));
+        }
+        let home_dir = std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join("nexus-models"))
             .unwrap_or_else(|_| std::path::PathBuf::from("models"));
-        let candidate = default_models_dir.join(filename);
-        if candidate.exists() {
-            candidate
-        } else {
-            raw_path
-        }
+        candidates.push(home_dir.join(filename));
+        candidates
+            .into_iter()
+            .find(|p| p.exists())
+            .unwrap_or(raw_path)
     };
     let model_name = model_path
         .file_name()

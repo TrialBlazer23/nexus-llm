@@ -5,6 +5,12 @@ use uuid::Uuid;
 /// Safety multiplier to guard against Out-Of-Memory (OOM) and Android Low Memory Killer (LMK).
 pub const LMK_SAFETY_PERCENT: f64 = 0.75;
 
+/// Default context window used when GGUF metadata has no `context_length`.
+pub const DEFAULT_CONTEXT_SIZE: usize = 4096;
+
+/// Step size for Hub `[+]`/`[-]` context adjustments.
+pub const CONTEXT_STEP: usize = 512;
+
 /// Default standalone RAM budget guideline in Megabytes.
 /// Deprecated: Memory budgets are now determined dynamically via SystemProfile.
 #[deprecated(note = "use dynamic host budget resolution")]
@@ -14,6 +20,58 @@ pub const NODE_A_MAX_STANDALONE_MB: u64 = 8500;
 /// Deprecated: Worker caps are now configured via config.cluster.max_rpc_ram_mb or dynamic policy.
 #[deprecated(note = "use dynamic worker allocatable budget")]
 pub const NODE_B_MAX_RPC_RAM_MB: u64 = 1800;
+
+/// Whether a model+KV footprint fits on a host, needs RPC offload, or exceeds the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFit {
+    Fits,
+    NeedsRpc,
+    WontFit,
+}
+
+impl ModelFit {
+    /// Classify fit given required MB, host-alone capacity, and host+RPC cluster capacity.
+    pub fn classify(required_mb: u64, host_cap_mb: u64, cluster_cap_mb: u64) -> Self {
+        if required_mb <= host_cap_mb {
+            Self::Fits
+        } else if required_mb <= cluster_cap_mb {
+            Self::NeedsRpc
+        } else {
+            Self::WontFit
+        }
+    }
+
+    /// Models-list badge text (ASCII for narrow columns).
+    pub fn list_badge(self) -> &'static str {
+        match self {
+            Self::Fits => "[OK]",
+            Self::NeedsRpc => "[RPC]",
+            Self::WontFit => "[OOM]",
+        }
+    }
+
+    /// Target-selection modal badge.
+    pub fn modal_badge(self) -> &'static str {
+        match self {
+            Self::Fits => "✅ fits",
+            Self::NeedsRpc => "⚠️ needs RPC",
+            Self::WontFit => "❌ won't fit",
+        }
+    }
+}
+
+/// Allocatable host budget under the LMK safety factor.
+pub fn host_lmk_budget_mb(available_ram_mb: u64) -> u64 {
+    (available_ram_mb as f64 * LMK_SAFETY_PERCENT) as u64
+}
+
+/// Clamp a context size to a model-safe range (min 512, max model/default ceiling).
+pub fn clamp_context_size(desired: usize, model_context_limit: Option<usize>) -> usize {
+    let upper = model_context_limit
+        .unwrap_or(DEFAULT_CONTEXT_SIZE)
+        .max(CONTEXT_STEP);
+    desired.clamp(CONTEXT_STEP, upper)
+}
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ClusterError {
@@ -235,5 +293,26 @@ impl ClusterCoordinator {
             budget,
             rpc_endpoint,
         )
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn classify_model_fit_thresholds() {
+        assert_eq!(ModelFit::classify(1000, 2000, 4000), ModelFit::Fits);
+        assert_eq!(ModelFit::classify(3000, 2000, 4000), ModelFit::NeedsRpc);
+        assert_eq!(ModelFit::classify(5000, 2000, 4000), ModelFit::WontFit);
+        assert_eq!(ModelFit::Fits.list_badge(), "[OK]");
+        assert_eq!(ModelFit::NeedsRpc.modal_badge(), "⚠️ needs RPC");
+    }
+
+    #[test]
+    fn clamp_context_respects_model_limit() {
+        assert_eq!(clamp_context_size(100, None), CONTEXT_STEP);
+        assert_eq!(clamp_context_size(8192, Some(4096)), 4096);
+        assert_eq!(clamp_context_size(2048, Some(8192)), 2048);
     }
 }

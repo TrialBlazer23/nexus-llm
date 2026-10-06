@@ -177,6 +177,7 @@ async fn test_peer_cache_expiry_and_pruning() {
                 status: StatusFlags::READY,
                 api_port: 8080,
                 rpc_port: 0,
+                control_port: 8081,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
@@ -223,6 +224,7 @@ async fn test_find_best_host_scoring() {
                 status: StatusFlags::READY,
                 api_port: 8080,
                 rpc_port: 0,
+                control_port: 8081,
                 total_ram_mb: 4000,
                 free_ram_mb: 2000,
                 backend: AccelerationBackend::ArmCpuDotProd,
@@ -242,6 +244,7 @@ async fn test_find_best_host_scoring() {
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
                 api_port: 8080,
                 rpc_port: 0,
+                control_port: 8081,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
                 backend: AccelerationBackend::Vulkan,
@@ -261,6 +264,7 @@ async fn test_find_best_host_scoring() {
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
                 api_port: 8080,
                 rpc_port: 50052,
+                control_port: 8081,
                 total_ram_mb: 3600,
                 free_ram_mb: 1800,
                 backend: AccelerationBackend::X86Baseline,
@@ -384,6 +388,7 @@ async fn test_record_service_endpoint_merges_mdns() {
         addresses: vec!["192.168.1.200:8080".parse().unwrap()],
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
     };
 
     discovery

@@ -176,19 +176,20 @@ nexus
 ```
 
 ### Views & Navigation
-Use `F1` - `F4`, `Tab`, or `Shift+Tab` to navigate between views:
+Use `F1`–`F4`, `Alt+1`–`Alt+4`, `Tab`, or `Shift+Tab` to navigate between views. Press `?` or `F12` for a per-tab help modal.
 
-- **`[F1: 💬 Chat]`**: Full-screen streaming conversation with auto-scroll and multi-turn history.
-  - Press `[C]` to switch the chat endpoint to any discovered node or host.
-  - Press `[Esc]` to abort active streaming generation.
-- **`[F2: 📦 Models]`**: Split-pane model browser and zero-copy GGUF inspector.
-  - Displays file size, quantization type, context length, KV cache overhead, and memory badges (`[OK]`, `[RPC]`, `[OOM]`).
-  - Press `[Enter]` to open the **Target Node Selection Modal**: choose to load the model locally or dispatch it to any connected peer in the mesh.
+- **`[F1: 💬 Chat]`**: Full-screen streaming conversation with auto-scroll, markdown rendering, and multi-turn history.
+  - Press `[Alt+C]` to switch the chat endpoint to any discovered node or host.
+  - Press `[Esc]` to abort active streaming generation. Cursor keys edit the prompt; `Alt+↑/↓` walks prompt history.
+- **`[F2: 📦 Models]`**: Split-pane model browser (local + peer catalogs) and zero-copy GGUF inspector.
+  - Displays host column, file size, architecture, context length, KV cache overhead, and memory badges (`[OK]`, `[RPC]`, `[OOM]`).
+  - Press `[Enter]` to open the **Target Node Selection Modal**: choose to load locally or dispatch to a peer that advertises the file.
+  - Press `[D]` to download a `.gguf` URL into the models directory (progress gauge). Empty lists hint at `D` / `nexus download`.
 - **`[F3: 🌐 Cluster]`**: Interactive WiFi mesh coordinator and live telemetry monitor.
   - Lists discovered peers with endpoints, roles, allocatable RAM, acceleration tier, and active models.
-  - Selected peer actions: `[Enter]` Connect Chat endpoint, `[L]` Remote Load Model, `[W]` Request RPC Worker, `[I]` Inspect Hardware Modal, `[A]` Add Static Peer, `[D]` Disconnect to Local, `[R]` Refresh.
+  - Selected peer actions: `[Enter]` Connect Chat endpoint, `[L]` Remote Load Model (control plane), `[W]` Request RPC Worker, `[I]` Inspect Hardware Modal, `[A]` Add Static Peer, `[D]` Disconnect to Local, `[R]` Refresh.
 - **`[F4: ⚙️ Settings]`**: Live configuration editor with inline text editing and enum cycle selectors.
-  - Edit Node Identity (name, mesh role), Paths & Binaries (models dir, llama-server/rpc-server binaries), Network & Transport (default host, static peers, mDNS), Hardware Acceleration, and RPC offload budgets.
+  - Edit Node Identity (name, mesh role), Paths & Binaries (models dir, llama-server/rpc-server binaries), Network & Transport (default host, static peers, mDNS, `control_port`), Hardware Acceleration, and RPC offload budgets.
   - Press `[S]` to save to `~/.nexus/config.toml` with immediate hot-reload into running services.
 
 ### Safe Model Hot-Swapping

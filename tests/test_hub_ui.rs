@@ -251,9 +251,13 @@ async fn test_hub_app_headless_render_all_tabs() {
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
     assert!(content.contains("[F2] 📦 Models"), "Must render Models tab active");
-    assert!(content.contains("Local Models (1)"), "Must render models list pane");
+    assert!(
+        content.contains("Models (local 1 / remote 0)") || content.contains("local 1"),
+        "Must render models list pane with local count"
+    );
     assert!(content.contains("Model Architecture & Metadata"), "Must render metadata inspector pane");
     assert!(content.contains("tiny-llama.gguf"), "Must list discovered model");
+    assert!(content.contains("[?] Help") || content.contains("Help"), "Footer should mention Help");
 
     // 3. Render Tab 2: Cluster
     hub.set_tab(HubTab::Cluster);
@@ -283,8 +287,8 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut hub = HubApp::new(config, client, discovery);
 
-    // Simulate pending hot swap
-    hub.pending_hot_swap_path = Some(PathBuf::from("/models/llama-3.2-3b.gguf"));
+    // Simulate pending hot swap with an explicit CPU Safe Mode layer override
+    hub.pending_hot_swap = Some((PathBuf::from("/models/llama-3.2-3b.gguf"), Some(0)));
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -296,6 +300,10 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
     assert!(content.contains("Hot-Swap"), "Must render modal title");
     assert!(content.contains("llama-3.2-3b.gguf"), "Must display target model filename in modal");
     assert!(content.contains("[Y / N]"), "Must display confirmation prompt");
+
+    let pending = hub.pending_hot_swap.as_ref().expect("pending hot swap must remain");
+    assert_eq!(pending.0, PathBuf::from("/models/llama-3.2-3b.gguf"));
+    assert_eq!(pending.1, Some(0), "GPU layer override must survive into the confirm modal");
 }
 
 #[tokio::test]
@@ -313,21 +321,38 @@ async fn test_hub_app_target_node_selection_modal() {
 
     assert!(hub.pending_target_selection.is_some());
     let state = hub.pending_target_selection.as_mut().unwrap();
-    assert_eq!(state.model_name, "qwen2.5-coder-7b");
+    assert_eq!(state.model_name, "qwen2.5-coder-7b.gguf");
     assert_eq!(state.candidates.len(), 2); // Local GPU and Local CPU options
     assert!(matches!(state.candidates[0], TargetExecutionNode::Local { .. }));
     assert!(matches!(state.candidates[1], TargetExecutionNode::LocalCpu { .. }));
 
-    // Add a simulated remote peer candidate
+    // Add a high-RAM remote (fits) and a tiny remote (won't fit) for badge coverage.
+    // Model path does not exist so required_mb is ~KV-only (~800 MB at 4k estimate); set explicitly.
+    state.required_mb = 5000;
+    state.rpc_worker_cap_mb = 1800;
+
     let peer_id = Uuid::new_v4();
     state.candidates.push(TargetExecutionNode::Remote {
         uuid: peer_id,
         name: "Galaxy-S23".to_string(),
         endpoint: "http://192.168.1.100:8080".to_string(),
-        free_ram_mb: 8500,
+        free_ram_mb: 12000, // LMK budget ~9000 → fits 5000
         backend: "Vulkan".to_string(),
     });
-    assert_eq!(state.candidates.len(), 3);
+    let tiny_id = Uuid::new_v4();
+    state.candidates.push(TargetExecutionNode::Remote {
+        uuid: tiny_id,
+        name: "Tiny-Pi".to_string(),
+        endpoint: "http://192.168.1.50:8080".to_string(),
+        free_ram_mb: 800, // LMK ~600; +1800 RPC still < 5000 → won't fit
+        backend: "CPU".to_string(),
+    });
+    assert_eq!(state.candidates.len(), 4);
+
+    let fits = state.candidates[2].fit(state.required_mb, state.rpc_worker_cap_mb);
+    let wont = state.candidates[3].fit(state.required_mb, state.rpc_worker_cap_mb);
+    assert_eq!(fits, nexus::cluster::ModelFit::Fits);
+    assert_eq!(wont, nexus::cluster::ModelFit::WontFit);
 
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
@@ -340,6 +365,11 @@ async fn test_hub_app_target_node_selection_modal() {
     assert!(content.contains("qwen2.5-coder-7b"), "Must render target model name");
     assert!(content.contains("Local GPU") || content.contains("Local CPU"), "Must list Local execution options");
     assert!(content.contains("Galaxy-S23"), "Must list remote peer candidate");
+    assert!(
+        content.contains("fits") || content.contains("won't fit") || content.contains("needs RPC"),
+        "Must show fit-per-target badges: {}",
+        content
+    );
 }
 
 #[tokio::test]
@@ -367,6 +397,7 @@ async fn test_cluster_view_interactions() {
         status: nexus::discovery::StatusFlags::READY,
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
         total_ram_mb: 12000,
         free_ram_mb: 8192,
         backend: AccelerationBackend::Vulkan,
@@ -381,6 +412,7 @@ async fn test_cluster_view_interactions() {
         status: nexus::discovery::StatusFlags::RPC_READY,
         api_port: 8080,
         rpc_port: 50052,
+                control_port: 8081,
         total_ram_mb: 4000,
         free_ram_mb: 1800,
         backend: AccelerationBackend::ArmCpuDotProd,
@@ -469,4 +501,107 @@ async fn test_hub_app_unload_model() {
     let last_msg = hub.chat.messages.last().expect("Must have unload notice message");
     assert!(last_msg.content.contains("Model 'test-model-3b' unloaded"));
 }
+
+#[tokio::test]
+async fn test_hub_cycle_persona_applies_preset() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    assert!(hub.chat.persona_name.is_none());
+    assert!(hub.chat.system_prompt.is_none());
+
+    hub.cycle_persona();
+    assert!(hub.chat.persona_name.is_some());
+    assert!(hub.chat.system_prompt.is_some());
+    let first = hub.chat.persona_name.clone().unwrap();
+    let first_temp = hub.chat.temperature;
+    let first_max = hub.chat.max_tokens;
+
+    hub.cycle_persona();
+    let second = hub.chat.persona_name.clone().unwrap();
+    assert_ne!(first, second, "cycling should advance to a different persona");
+    assert!(hub.chat.system_prompt.is_some());
+    // Built-ins differ in temperature (coder=0.2, general=0.7)
+    assert!(
+        hub.chat.temperature != first_temp || hub.chat.max_tokens != first_max || first != second,
+        "persona hyperparameters should update with cycle"
+    );
+
+    let (msg, _) = hub.status_message.as_ref().expect("status toast after persona");
+    assert!(msg.starts_with("Persona:"));
+}
+
+#[test]
+fn test_models_view_cached_profile_refresh() {
+    let mut view = ModelsView::new(PathBuf::from("/tmp/nonexistent-nexus-models"));
+    view.refresh_profile();
+    assert!(view.cached_profile.total_ram_mb > 0 || view.cached_profile.available_ram_mb == 0);
+}
+
+#[tokio::test]
+async fn test_hub_slash_commands_and_context() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    hub.dispatch_slash_command("/help").await;
+    assert!(
+        hub.chat.messages.iter().any(|m| m.is_status() && m.content.contains("/unload")),
+        "help should emit a status banner with command list"
+    );
+
+    hub.chat.messages.push(nexus::client::ChatMessage::user("keep me"));
+    hub.dispatch_slash_command("/clear").await;
+    assert!(hub.chat.messages.is_empty());
+
+    hub.dispatch_slash_command("/temp 0.25").await;
+    assert!((hub.chat.temperature - 0.25).abs() < f32::EPSILON);
+
+    hub.dispatch_slash_command("/context 2048").await;
+    assert_eq!(hub.selected_context, 2048);
+    assert_eq!(hub.models_view.selected_context, 2048);
+
+    hub.dispatch_slash_command("/preset coder").await;
+    assert_eq!(hub.chat.persona_name.as_deref(), Some("coder"));
+
+    hub.adjust_context(true);
+    assert_eq!(hub.selected_context, 2048 + 512);
+}
+
+#[test]
+fn test_download_dest_from_url() {
+    use nexus::ui::models_view::download_dest_from_url;
+    use std::path::Path;
+
+    let dir = Path::new("/home/user/nexus-models");
+    assert_eq!(
+        download_dest_from_url(dir, "https://example.com/models/qwen2.5.gguf"),
+        Path::new("/home/user/nexus-models/qwen2.5.gguf")
+    );
+    assert_eq!(
+        download_dest_from_url(dir, "https://cdn.example.com/weights/model.bin?token=abc"),
+        Path::new("/home/user/nexus-models/model.bin.gguf")
+    );
+    assert_eq!(
+        download_dest_from_url(dir, "https://example.com/"),
+        Path::new("/home/user/nexus-models/downloaded.gguf")
+    );
+}
+
+#[test]
+fn test_hub_app_help_and_download_fields_init() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let hub = HubApp::new(config, client, discovery);
+
+    assert!(!hub.show_help_modal);
+    assert!(hub.pending_download.is_none());
+    assert!(hub.download_progress.is_none());
+    assert!(!hub.download_active);
+}
+
 

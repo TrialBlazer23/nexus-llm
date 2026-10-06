@@ -1,6 +1,8 @@
 use clap::Parser;
 use nexus::config::NexusConfig;
-use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor};
+use nexus::control_plane_server::{spawn_control_plane, ControlPlaneServerState};
+use nexus::discovery::NodeRole;
+use nexus::supervisor::{LlamaServerConfig, ProcessSupervisor, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::path::PathBuf;
 use tracing::{error, info, Level};
@@ -91,6 +93,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         "Autonomous discovery daemon active (Node UUID: {})",
         discovery.node_uuid()
+    );
+
+    // 3b. Control-plane HTTP (catalog / load / unload) — always on, even with no model.
+    let cp_manager = SupervisorManager::new();
+    let bind_host = if config.network.api_host == "0.0.0.0" {
+        "0.0.0.0"
+    } else {
+        config.network.api_host.as_str()
+    };
+    let cp_bind = format!("{}:{}", bind_host, config.network.control_port)
+        .parse()
+        .unwrap_or_else(|_| ([0, 0, 0, 0], config.network.control_port).into());
+    let cp_handle = spawn_control_plane(
+        cp_bind,
+        ControlPlaneServerState {
+            node_id: discovery.node_uuid(),
+            role: NodeRole::from_str_role(&config.node.role),
+            models_dir: config.node.models_dir.clone(),
+            api_host: config.network.api_host.clone(),
+            api_port: config.network.api_port,
+            manager: cp_manager,
+            allocatable_memory_mb: profile.max_allowed_memory_bytes() / (1024 * 1024),
+        },
+    );
+    info!(
+        "Control-plane listening on {}:{}",
+        bind_host, config.network.control_port
     );
 
     // 4. Optional Model Launch
@@ -225,10 +254,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 supervisor.stop().await?;
                 broadcaster_handle.abort();
                 listener_handle.abort();
+                cp_handle.abort();
                 info!("Shutdown complete.");
             }
             Err(e) => {
                 listener_handle.abort();
+                cp_handle.abort();
                 error!("Failed to launch supervisor: {}", e);
                 std::process::exit(1);
             }
@@ -242,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         broadcaster_handle.abort();
         listener_handle.abort();
+        cp_handle.abort();
         info!("Daemon stopped.");
     }
 

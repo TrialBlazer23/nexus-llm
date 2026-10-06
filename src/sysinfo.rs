@@ -271,3 +271,18 @@ impl SystemProfile {
         safe
     }
 }
+
+/// Free disk bytes available on the filesystem that contains `path` (Linux/`statvfs`, Bionic-safe).
+pub fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains interior NUL")
+    })?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+}

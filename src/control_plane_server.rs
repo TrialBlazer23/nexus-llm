@@ -7,32 +7,39 @@
 use crate::config::NexusConfig;
 use crate::control_plane::{
     build_control_plane_state, build_model_catalog, handle_load_model, handle_unload_model,
-    ControlPlaneRequest, ModelLoadRequest, ModelUnloadRequest, PairRequest, PairResponse,
-    CONTROL_PLANE_VERSION, MAX_CONTROL_RESPONSE_BYTES,
+    blob_url, BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest, ModelLoadRequest,
+    ModelUnloadRequest, PairRequest, PairResponse, CONTROL_PLANE_VERSION,
+    MAX_CONTROL_RESPONSE_BYTES,
 };
 use crate::discovery::{DiscoveryService, NodeRole, StatusFlags};
+use crate::downloader::{DownloadAuth, ModelDownloader};
 use crate::node_identity::NodeIdentity;
+use crate::store::ModelIndex;
 use crate::supervisor::SupervisorManager;
 use crate::sysinfo::SystemProfile;
 use crate::trust_auth::{
     authorize_privileged_signer, verify_control_request, AuthError, NonceCache,
 };
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use futures_util::stream::unfold;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+type RespBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// Shared runtime state for the control-plane HTTP server.
 #[derive(Clone)]
@@ -70,7 +77,11 @@ impl ControlPlaneContext {
         Self {
             node_id,
             role,
-            capabilities: vec!["inference".to_string(), "catalog".to_string()],
+            capabilities: vec![
+                "inference".to_string(),
+                "catalog".to_string(),
+                "blob".to_string(),
+            ],
             supervisor,
             api_host: api_host.into(),
             api_port,
@@ -111,7 +122,7 @@ impl ControlPlaneContext {
 
 /// Bind `addr` and serve control-plane routes until the task is aborted.
 pub async fn serve(addr: SocketAddr, ctx: Arc<ControlPlaneContext>) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Control-plane HTTP server listening on {}", addr);
 
     loop {
@@ -142,7 +153,7 @@ pub fn spawn(
 pub async fn spawn_ephemeral(
     ctx: Arc<ControlPlaneContext>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>)> {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(async move {
         info!("Control-plane HTTP server listening on {}", addr);
@@ -168,11 +179,11 @@ async fn route(
     req: Request<Incoming>,
     ctx: Arc<ControlPlaneContext>,
     peer: SocketAddr,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
-    match (method, path.as_str()) {
+    match (method.clone(), path.as_str()) {
         (Method::GET, "/nexus/control/v1/models") | (Method::GET, "/cluster/models") => {
             let models_dir = ctx
                 .config
@@ -182,6 +193,11 @@ async fn route(
             let catalog = build_model_catalog(ctx.node_id, &models_dir);
             json_response(StatusCode::OK, &catalog)
         }
+        (Method::GET, p) if p.starts_with("/nexus/control/v1/blob/") => {
+            let digest = p.trim_start_matches("/nexus/control/v1/blob/");
+            handle_blob_get(req, ctx, peer, digest).await
+        }
+        (Method::POST, "/nexus/control/v1/blob/fetch") => handle_blob_fetch(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/state") => handle_state(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/load") => handle_load(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/unload") => handle_unload(req, ctx, peer).await,
@@ -193,7 +209,7 @@ async fn route(
     }
 }
 
-async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Bytes>>> {
+async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<RespBody>> {
     let limited = Limited::new(req.into_body(), MAX_CONTROL_RESPONSE_BYTES);
     let collected = match limited.collect().await {
         Ok(c) => c.to_bytes(),
@@ -207,16 +223,22 @@ async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Byte
     Ok(collected.to_vec())
 }
 
-fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response<Full<Bytes>> {
+fn full_body(bytes: Bytes) -> RespBody {
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response<RespBody> {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"{}"))))
+        .body(full_body(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b"{}"))))
 }
 
-fn auth_error_response(err: AuthError) -> Response<Full<Bytes>> {
+fn auth_error_response(err: AuthError) -> Response<RespBody> {
     let status = match err {
         AuthError::PairingRequired | AuthError::SignerNotAuthorized => StatusCode::FORBIDDEN,
         AuthError::StaleTimestamp | AuthError::ReplayNonce | AuthError::BadSignature => {
@@ -227,11 +249,257 @@ fn auth_error_response(err: AuthError) -> Response<Full<Bytes>> {
     json_response(status, &serde_json::json!({"error": err.to_string()}))
 }
 
+fn parse_byte_range(header: Option<&str>, file_len: u64) -> Option<(u64, u64)> {
+    let header = header?;
+    let header = header.strip_prefix("bytes=")?;
+    let (start_s, end_s) = header.split_once('-')?;
+    let start: u64 = if start_s.is_empty() {
+        return None;
+    } else {
+        start_s.parse().ok()?
+    };
+    let end: u64 = if end_s.is_empty() {
+        file_len.saturating_sub(1)
+    } else {
+        end_s.parse().ok()?
+    };
+    if start > end || start >= file_len {
+        return None;
+    }
+    Some((start, end.min(file_len.saturating_sub(1))))
+}
+
+async fn handle_blob_get(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+    digest: &str,
+) -> Response<RespBody> {
+    let path = format!("/nexus/control/v1/blob/{}", digest.trim().to_lowercase());
+    let headers = req.headers().clone();
+    let range_header = headers
+        .get(hyper::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let auth = match verify_control_request(
+        &headers,
+        "GET",
+        &path,
+        &[],
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let models_dir = ctx
+        .config
+        .read()
+        .map(|c| PathBuf::from(&c.node.models_dir))
+        .unwrap_or_else(|_| PathBuf::from("models"));
+    let index = match ModelIndex::reconcile_default(&models_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": e.to_string()}),
+            );
+        }
+    };
+    let Some(entry) = index.find_by_digest(digest) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "blob not found"}),
+        );
+    };
+    let file_path = entry.path.clone();
+    let file_len = entry.size_bytes;
+
+    let (start, end, status) = match parse_byte_range(range_header.as_deref(), file_len) {
+        Some((s, e)) => (s, e, StatusCode::PARTIAL_CONTENT),
+        None if range_header.is_some() => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(hyper::header::CONTENT_RANGE, format!("bytes */{file_len}"))
+                .body(full_body(Bytes::new()))
+                .unwrap_or_else(|_| Response::new(full_body(Bytes::new())));
+        }
+        None => (0, file_len.saturating_sub(1), StatusCode::OK),
+    };
+    let content_len = end.saturating_sub(start).saturating_add(1);
+
+    let mut file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": e.to_string()}),
+            );
+        }
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(start)).await {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": e.to_string()}),
+        );
+    }
+
+    let stream = unfold(
+        (file, content_len),
+        |(mut file, remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            let to_read = remaining.min(64 * 1024) as usize;
+            let mut buf = vec![0u8; to_read];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((
+                        Ok::<_, std::io::Error>(Frame::data(Bytes::from(buf))),
+                        (file, remaining - n as u64),
+                    ))
+                }
+                Err(e) => Some((Err(e), (file, 0))),
+            }
+        },
+    );
+    let body = StreamBody::new(stream).boxed_unsync();
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(hyper::header::ACCEPT_RANGES, "bytes")
+        .header(hyper::header::CONTENT_LENGTH, content_len.to_string())
+        .header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            hyper::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{file_len}"),
+        );
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+async fn handle_blob_fetch(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/blob/fetch",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: BlobFetchRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let digest = request.digest.trim().to_lowercase();
+    let digest_for_msg = digest.clone();
+    let source = request.source_base_url.clone();
+    let models_dir = ctx
+        .config
+        .read()
+        .map(|c| PathBuf::from(&c.node.models_dir))
+        .unwrap_or_else(|_| PathBuf::from("models"));
+    let dest_name = format!("{digest}.gguf");
+    let dest = models_dir.join(&dest_name);
+    let identity = ctx.identity.clone();
+    let signer_id = ctx
+        .config
+        .read()
+        .ok()
+        .and_then(|c| c.node_uuid().ok())
+        .unwrap_or(ctx.node_id);
+    let use_auth = ctx
+        .config
+        .read()
+        .map(|c| c.network.security.pairing_enforced())
+        .unwrap_or(false);
+    let url = match blob_url(&source, &digest) {
+        Ok(u) => u,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": e.to_string()}),
+            );
+        }
+    };
+
+    tokio::spawn(async move {
+        let downloader = ModelDownloader::new();
+        let auth = if use_auth {
+            Some(DownloadAuth {
+                identity,
+                signer_id,
+            })
+        } else {
+            None
+        };
+        match downloader
+            .download_authenticated(&url, &dest, Some(&digest), auth.as_ref(), |_| {})
+            .await
+        {
+            Ok(()) => {
+                let _ = ModelIndex::reconcile_default(&models_dir);
+                info!("Background blob fetch completed for {}", digest);
+            }
+            Err(e) => error!("Background blob fetch failed for {}: {}", digest, e),
+        }
+    });
+
+    json_response(
+        StatusCode::ACCEPTED,
+        &BlobFetchResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            accepted: true,
+            message: format!("fetch of {digest_for_msg} accepted"),
+        },
+    )
+}
+
 async fn handle_state(
     req: Request<Incoming>,
     ctx: Arc<ControlPlaneContext>,
     peer: SocketAddr,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     let headers = req.headers().clone();
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -281,7 +549,7 @@ async fn handle_load(
     req: Request<Incoming>,
     ctx: Arc<ControlPlaneContext>,
     peer: SocketAddr,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     let headers = req.headers().clone();
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -350,7 +618,7 @@ async fn handle_unload(
     req: Request<Incoming>,
     ctx: Arc<ControlPlaneContext>,
     peer: SocketAddr,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     let headers = req.headers().clone();
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -417,7 +685,7 @@ async fn handle_pair(
     req: Request<Incoming>,
     ctx: Arc<ControlPlaneContext>,
     peer: SocketAddr,
-) -> Response<Full<Bytes>> {
+) -> Response<RespBody> {
     if !allow_pair_attempt(&ctx, peer) {
         return json_response(
             StatusCode::TOO_MANY_REQUESTS,

@@ -1,7 +1,10 @@
 use crate::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use crate::ui::markdown::render_markdown;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyModifiers},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -70,12 +73,15 @@ pub struct ChatApp {
     pub prompt_history: Vec<String>,
     /// Current position while browsing `prompt_history` (`None` = not browsing).
     pub history_index: Option<usize>,
-    pub scroll_offset: u16,
+    /// Scroll offset in lines; clamped to `u16` only at `Paragraph::scroll`.
+    pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub tokens_streamed: usize,
     pub tokens_per_sec: f64,
     pub stream_start_time: Option<Instant>,
     pub status_message: Option<String>,
+    /// Context window budget (tokens) for the generation header display.
+    pub context_budget: usize,
     pub transport_badge: TransportBadge,
     stream_handle: Option<JoinHandle<()>>,
 }
@@ -103,9 +109,92 @@ impl ChatApp {
             tokens_per_sec: 0.0,
             stream_start_time: None,
             status_message: None,
+            context_budget: 4096,
             transport_badge,
             stream_handle: None,
         }
+    }
+
+    /// Sync the context budget shown in the generation header (from Hub `/context` / Models +/-).
+    pub fn set_context_budget(&mut self, budget: usize) {
+        self.context_budget = budget.max(1);
+    }
+
+    /// Rough conversation token estimate (chars/4) — not a real tokenizer.
+    pub fn estimated_context_used(&self) -> usize {
+        let mut chars = 0usize;
+        if let Some(sys) = &self.system_prompt {
+            chars = chars.saturating_add(sys.len());
+        }
+        for msg in &self.messages {
+            if !msg.is_status() {
+                chars = chars.saturating_add(msg.content.len());
+            }
+        }
+        chars = chars.saturating_add(self.streaming_response.len());
+        chars / 4
+    }
+
+    /// Color for the used/budget context fraction (≥70% yellow, ≥90% red).
+    pub fn context_usage_color(used: usize, budget: usize) -> Color {
+        if budget == 0 {
+            return Color::White;
+        }
+        let ratio = used as f64 / budget as f64;
+        if ratio >= 0.90 {
+            Color::Red
+        } else if ratio >= 0.70 {
+            Color::Yellow
+        } else {
+            Color::Green
+        }
+    }
+
+    /// Pop trailing status + last assistant message and resend the prior user turn.
+    /// Returns `true` if a new stream was started.
+    pub fn regenerate_last(&mut self, tx: &mpsc::Sender<StreamMsg>) -> bool {
+        if self.is_streaming {
+            self.status_message = Some("Busy — Esc to abort before regenerating".to_string());
+            return false;
+        }
+
+        while self
+            .messages
+            .last()
+            .map(|m| m.is_status())
+            .unwrap_or(false)
+        {
+            self.messages.pop();
+        }
+
+        if self
+            .messages
+            .last()
+            .map(|m| m.role == "assistant")
+            .unwrap_or(false)
+        {
+            self.messages.pop();
+        }
+
+        let has_user = self
+            .messages
+            .iter()
+            .rev()
+            .any(|m| m.role == "user" && !m.is_status());
+        if !has_user {
+            self.status_message = Some("Nothing to regenerate".to_string());
+            return false;
+        }
+
+        self.is_streaming = true;
+        self.auto_scroll = true;
+        self.status_message = Some("Regenerating…".to_string());
+        self.streaming_response.clear();
+        self.tokens_streamed = 0;
+        self.tokens_per_sec = 0.0;
+        self.stream_start_time = Some(Instant::now());
+        self.spawn_stream(tx);
+        true
     }
 
     /// Apply a persona's system prompt and generation hyperparameters.
@@ -408,6 +497,10 @@ impl ChatApp {
                 // Shift+Enter / Alt+Enter insert a newline (some terminals emit Char('\n')).
                 if c == '\n' {
                     self.insert_at_cursor('\n');
+                } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (c == 'r' || c == 'R')
+                {
+                    let _ = self.regenerate_last(tx);
                 } else if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                 {
@@ -421,20 +514,28 @@ impl ChatApp {
                 self.history_next();
             }
             KeyCode::Up => {
-                let max = self.total_lines() as u16;
-                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                let max = self.total_lines();
+                let current = if self.auto_scroll {
+                    max
+                } else {
+                    self.scroll_offset
+                };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(1);
             }
             KeyCode::Down => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
-                if self.scroll_offset >= self.total_lines() as u16 {
+                if self.scroll_offset >= self.total_lines() {
                     self.auto_scroll = true;
                 }
             }
             KeyCode::PageUp => {
-                let max = self.total_lines() as u16;
-                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                let max = self.total_lines();
+                let current = if self.auto_scroll {
+                    max
+                } else {
+                    self.scroll_offset
+                };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(10);
             }
@@ -448,7 +549,10 @@ impl ChatApp {
                 self.insert_at_cursor('\n');
             }
             KeyCode::Enter => {
-                if !self.is_streaming && !self.input_buffer.trim().is_empty() {
+                if self.is_streaming {
+                    self.status_message =
+                        Some("Busy — Esc to abort, or wait".to_string());
+                } else if !self.input_buffer.trim().is_empty() {
                     let prompt = std::mem::take(&mut self.input_buffer);
                     self.cursor_idx = 0;
                     self.history_index = None;
@@ -469,23 +573,52 @@ impl ChatApp {
         self.clamp_cursor();
     }
 
+    /// Apply mouse wheel scrolling to chat history.
+    pub fn handle_mouse_scroll(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                let max = self.total_lines();
+                let current = if self.auto_scroll {
+                    max
+                } else {
+                    self.scroll_offset
+                };
+                self.auto_scroll = false;
+                self.scroll_offset = current.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                if self.scroll_offset >= self.total_lines() {
+                    self.auto_scroll = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let used = self.estimated_context_used();
+        let budget = self.context_budget.max(1);
+        let ctx_color = Self::context_usage_color(used, budget);
         let stream_info = if self.is_streaming {
-            format!(" | Generating: {:.1} tokens/s", self.tokens_per_sec)
+            format!(
+                " | {:.1} chunks/s | {}/{} ctx",
+                self.tokens_per_sec, used, budget
+            )
         } else {
-            String::new()
+            format!(" | {}/{} ctx", used, budget)
         };
 
         let title = format!(
-            " Nexus-LLM Terminal | Host: {} {} | Model: {}{}",
+            " Nexus-LLM Terminal | Host: {} {} | Model: {}",
             self.client.endpoint(),
             self.transport_badge.label(),
             self.model_name,
-            stream_info
         );
 
         let header = Paragraph::new(Line::from(vec![
             Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(stream_info, Style::default().fg(ctx_color).add_modifier(Modifier::BOLD)),
         ]))
         .block(
             Block::default()
@@ -561,8 +694,8 @@ impl ChatApp {
             }
         }
 
-        let total_lines = lines.len() as u16;
-        let viewport_height = area.height.saturating_sub(2);
+        let total_lines = lines.len();
+        let viewport_height = area.height.saturating_sub(2) as usize;
         let max_scroll = total_lines.saturating_sub(viewport_height);
 
         let scroll_y = if self.auto_scroll {
@@ -570,6 +703,7 @@ impl ChatApp {
         } else {
             self.scroll_offset.min(max_scroll)
         };
+        let scroll_y_u16 = scroll_y.min(u16::MAX as usize) as u16;
 
         let history = Paragraph::new(lines)
             .block(
@@ -578,7 +712,7 @@ impl ChatApp {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue)),
             )
-            .scroll((scroll_y, 0))
+            .scroll((scroll_y_u16, 0))
             .wrap(Wrap { trim: false });
 
         frame.render_widget(history, area);
@@ -638,12 +772,12 @@ impl ChatApp {
             (status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD))
         } else if self.is_streaming {
             (
-                "[Esc] Abort generation  |  [Ctrl+C] Quit  |  [Up/Down/PgUp/PgDn] Scroll".to_string(),
+                "[Esc] Abort  |  [Ctrl+R] Regen (idle)  |  [Ctrl+C] Quit  |  [Up/Down] Scroll".to_string(),
                 Style::default().fg(Color::DarkGray),
             )
         } else {
             (
-                "[Enter] Submit  |  [Esc] Abort (when generating)  |  [Ctrl+C / q] Quit  |  [Up/Down] Scroll"
+                "[Enter] Submit  |  [Ctrl+R] Regenerate  |  [Esc] Abort  |  [Ctrl+C / q] Quit  |  [Up/Down] Scroll"
                     .to_string(),
                 Style::default().fg(Color::DarkGray),
             )
@@ -662,7 +796,7 @@ pub async fn run_chat_tui(mut app: ChatApp) -> Result<(), Box<dyn std::error::Er
     crate::ui::install_tui_panic_hook();
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -670,7 +804,11 @@ pub async fn run_chat_tui(mut app: ChatApp) -> Result<(), Box<dyn std::error::Er
 
     // Restore terminal safely
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     res
@@ -688,7 +826,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
     loop {
         tokio::select! {
-            // Crossterm keyboard events
+            // Crossterm keyboard / mouse events
             Some(event_res) = event_stream.next() => {
                 match event_res {
                     Ok(Event::Key(key)) => {
@@ -709,6 +847,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                 app.handle_key_input(key, &tx);
                             }
                         }
+                    }
+                    Ok(Event::Mouse(mouse)) => {
+                        app.handle_mouse_scroll(mouse.kind);
                     }
                     _ => {}
                 }

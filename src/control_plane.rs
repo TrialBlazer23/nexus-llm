@@ -101,6 +101,7 @@ pub fn endpoint_from_state(
             0
         },
         control_port: endpoint.control_port,
+        display_name: endpoint.display_name.clone(),
     }
 }
 

@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-06 — Phase 4 peer names via mDNS TXT (not beacon)
+- Category: design-decision
+- Context: IDENTIFIED_UPGRADES Phase 4 #24 on `cursor/phase4-polish-e793`.
+- Finding: The fixed 64-byte UDP `BeaconPacket` is fully consumed (magic through CRC); there is no spare field for a display name without a breaking beacon v2.
+- Action: Advertise `config.node.name` only via mDNS TXT `name=` when non-empty and not `auto`. Store on `PeerNode.display_name` / `ServiceEndpoint.display_name` and expose `PeerNode::friendly_name()` (`Node-{uuid8}` fallback). Preserve existing display names across UDP beacon refreshes.
+- Verification: `test_peer_friendly_name_from_mdns_display_name`; `cargo test --locked` green.
+
 ## 2026-10-06 — Phase 3 control_port vs api_port + Hub completeness
 - Category: design-decision
 - Context: IDENTIFIED_UPGRADES Phase 3 (#9/#10/#13/#17/#19) on stacked branch `cursor/phase3-completeness-6a2f`.

@@ -183,6 +183,7 @@ async fn test_peer_cache_expiry_and_pruning() {
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 30,
                 active_model: "llama-3".to_string(),
+                display_name: None,
                 last_seen: Instant::now(),
             },
         );
@@ -230,6 +231,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::ArmCpuDotProd,
                 thermal_index: 50,
                 active_model: "qwen".to_string(),
+                display_name: None,
                 last_seen: Instant::now(),
             },
         );
@@ -250,6 +252,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::Vulkan,
                 thermal_index: 25,
                 active_model: "llama".to_string(),
+                display_name: None,
                 last_seen: Instant::now(),
             },
         );
@@ -270,6 +273,7 @@ async fn test_find_best_host_scoring() {
                 backend: AccelerationBackend::X86Baseline,
                 thermal_index: 10,
                 active_model: "".to_string(),
+                display_name: None,
                 last_seen: Instant::now(),
             },
         );
@@ -389,7 +393,8 @@ async fn test_record_service_endpoint_merges_mdns() {
         api_port: 8080,
         rpc_port: 50052,
                 control_port: 8081,
-    };
+                display_name: None,
+        };
 
     discovery
         .record_service_endpoint(endpoint, ObservationSource::Mdns)
@@ -422,4 +427,53 @@ async fn test_backend_health_tracking() {
 
     discovery.set_mdns_health(BackendHealth::Healthy).await;
     assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Healthy);
+}
+
+#[tokio::test]
+async fn test_peer_friendly_name_from_mdns_display_name() {
+    let config = NexusConfig::default();
+    let discovery = DiscoveryService::new(config, None);
+    let node_id = Uuid::new_v4();
+
+    let endpoint = ServiceEndpoint {
+        node_id,
+        cluster_id: None,
+        protocol_version: 1,
+        role: NodeRole::HOST,
+        capabilities: vec![],
+        addresses: vec!["192.168.1.50:8080".parse().unwrap()],
+        api_port: 8080,
+        rpc_port: 0,
+        control_port: 8081,
+        display_name: Some("galaxy-s23".to_string()),
+    };
+    discovery
+        .record_service_endpoint(endpoint, ObservationSource::Mdns)
+        .await;
+
+    let peers = discovery.get_active_peers().await;
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].friendly_name(), "galaxy-s23");
+
+    // Without name → Node-{uuid8}
+    let bare = ServiceEndpoint {
+        node_id: Uuid::new_v4(),
+        cluster_id: None,
+        protocol_version: 1,
+        role: NodeRole::CLIENT,
+        capabilities: vec![],
+        addresses: vec!["192.168.1.51:8080".parse().unwrap()],
+        api_port: 8080,
+        rpc_port: 0,
+        control_port: 8081,
+        display_name: None,
+    };
+    let bare_id = bare.node_id;
+    discovery
+        .record_service_endpoint(bare, ObservationSource::Mdns)
+        .await;
+    let peers = discovery.get_active_peers().await;
+    let peer = peers.iter().find(|p| p.uuid == bare_id).unwrap();
+    let expected = format!("Node-{}", &bare_id.to_string()[..8]);
+    assert_eq!(peer.friendly_name(), expected);
 }

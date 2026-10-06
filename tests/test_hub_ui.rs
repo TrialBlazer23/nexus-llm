@@ -403,7 +403,8 @@ async fn test_cluster_view_interactions() {
         backend: AccelerationBackend::Vulkan,
         thermal_index: 45,
         active_model: "llama-3.2-3b.gguf".to_string(),
-        last_seen: std::time::Instant::now(),
+        display_name: None,
+                last_seen: std::time::Instant::now(),
     };
     let peer2 = PeerNode {
         uuid: Uuid::new_v4(),
@@ -418,7 +419,8 @@ async fn test_cluster_view_interactions() {
         backend: AccelerationBackend::ArmCpuDotProd,
         thermal_index: 30,
         active_model: String::new(),
-        last_seen: std::time::Instant::now(),
+        display_name: None,
+                last_seen: std::time::Instant::now(),
     };
 
     cluster.peers.push(peer1);
@@ -493,7 +495,7 @@ async fn test_hub_app_unload_model() {
     assert_eq!(hub.active_model_name, "None (Idle)");
     assert_eq!(hub.chat.model_name, "default");
     assert!(hub.status_message.is_some());
-    let (msg, color) = hub.status_message.as_ref().unwrap();
+    let (msg, color, _) = hub.status_message.as_ref().unwrap();
     assert!(msg.contains("Unloaded model 'test-model-3b'"));
     assert_eq!(*color, ratatui::style::Color::Cyan);
 
@@ -529,7 +531,7 @@ async fn test_hub_cycle_persona_applies_preset() {
         "persona hyperparameters should update with cycle"
     );
 
-    let (msg, _) = hub.status_message.as_ref().expect("status toast after persona");
+    let (msg, _, _) = hub.status_message.as_ref().expect("status toast after persona");
     assert!(msg.starts_with("Persona:"));
 }
 
@@ -563,12 +565,14 @@ async fn test_hub_slash_commands_and_context() {
     hub.dispatch_slash_command("/context 2048").await;
     assert_eq!(hub.selected_context, 2048);
     assert_eq!(hub.models_view.selected_context, 2048);
+    assert_eq!(hub.chat.context_budget, 2048);
 
     hub.dispatch_slash_command("/preset coder").await;
     assert_eq!(hub.chat.persona_name.as_deref(), Some("coder"));
 
     hub.adjust_context(true);
     assert_eq!(hub.selected_context, 2048 + 512);
+    assert_eq!(hub.chat.context_budget, 2048 + 512);
 }
 
 #[test]
@@ -605,3 +609,54 @@ fn test_hub_app_help_and_download_fields_init() {
 }
 
 
+
+#[tokio::test]
+async fn test_hub_status_toast_expiry_and_footer_render() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::time::{Duration, Instant};
+
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = HubApp::new(config, client, discovery);
+
+    hub.status_message = Some((
+        "Active: demo".to_string(),
+        ratatui::style::Color::Green,
+        Instant::now() - Duration::from_secs(6),
+    ));
+    hub.tick_status();
+    assert!(hub.status_message.is_none(), "green toast must expire after 5s");
+
+    hub.status_message = Some((
+        "Launch failed".to_string(),
+        ratatui::style::Color::Red,
+        Instant::now() - Duration::from_secs(60),
+    ));
+    hub.tick_status();
+    assert!(hub.status_message.is_some(), "red toast must stay sticky");
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        content.contains("Launch failed"),
+        "footer must render hub status toast"
+    );
+}
+
+#[test]
+fn test_hub_creates_models_dir_on_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = dir.path().join("nexus-models-phase4");
+    assert!(!models.exists());
+
+    let mut config = NexusConfig::default();
+    config.node.models_dir = models.clone();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let _hub = HubApp::new(config, client, discovery);
+    assert!(models.is_dir(), "HubApp::new must create models_dir");
+}

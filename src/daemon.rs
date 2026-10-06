@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.node.role, config.node.models_dir
     );
 
+    if let Err(e) = std::fs::create_dir_all(&config.node.models_dir) {
+        tracing::warn!("Failed to create models_dir {:?}: {}", config.node.models_dir, e);
+    }
+
     // 2. System Introspection & Android LMK Profiling
     let profile = SystemProfile::probe();
     info!("Hardware Introspection:");

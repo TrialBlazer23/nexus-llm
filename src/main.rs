@@ -560,6 +560,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     model,
                     messages,
                     temperature: Some(0.7),
+                    top_p: Some(0.9),
                     max_tokens: Some(512),
                     stream: true,
                 };

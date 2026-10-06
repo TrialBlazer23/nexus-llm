@@ -311,6 +311,7 @@ fn test_chat_request_serialization() {
             ChatMessage::user("Hello!"),
         ],
         temperature: Some(0.8),
+        top_p: Some(0.95),
         max_tokens: Some(256),
         stream: true,
     };

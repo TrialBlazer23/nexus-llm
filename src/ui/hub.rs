@@ -222,12 +222,14 @@ impl HubApp {
             if let Some(target) = state.candidates.get(state.selected_idx) {
                 match target {
                     TargetExecutionNode::Local { gpu_layers, .. } => {
+                        self.chat.set_target_hardware("Local Host", format!("Local GPU ({} layers)", gpu_layers));
                         self.request_model_load_with_gpu(state.model_path, Some(*gpu_layers)).await;
                     }
                     TargetExecutionNode::LocalCpu { .. } => {
+                        self.chat.set_target_hardware("Local Host", "Local CPU (DotProd / Multi-thread)");
                         self.request_model_load_with_gpu(state.model_path, Some(0)).await;
                     }
-                    TargetExecutionNode::Remote { endpoint, name, .. } => {
+                    TargetExecutionNode::Remote { endpoint, name, backend, .. } => {
                         let client = reqwest::Client::new();
                         let req = crate::control_plane::ModelLoadRequest {
                             protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
@@ -250,6 +252,7 @@ impl HubApp {
                                 };
                                 self.chat.client = NexusClient::new(target_api.clone());
                                 self.chat.model_name = state.model_name.clone();
+                                self.chat.set_target_hardware(name, backend);
                                 self.chat.messages.clear();
                                 self.chat.messages.push(ChatMessage::assistant(format!(
                                     "Connected to remote model '{}' running on {}. Ready for inference.",
@@ -427,6 +430,12 @@ impl HubApp {
                 let endpoint = format!("http://127.0.0.1:{}", self.config.network.api_port);
                 self.chat.client = NexusClient::new(endpoint);
                 self.chat.model_name = model_name;
+                let local_backend = if gpu_layers > 0 {
+                    format!("Local GPU ({} layers)", gpu_layers)
+                } else {
+                    "Local CPU (DotProd / Multi-thread)".to_string()
+                };
+                self.chat.set_target_hardware("Local Host", local_backend);
                 self.chat.messages.clear();
                 self.chat.messages.push(ChatMessage::assistant(format!(
                     "Model '{}' loaded successfully and ready for inference.",
@@ -791,7 +800,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                     // Tab-specific key routing
                     match hub.active_tab {
                         HubTab::Chat => {
-                            if key.code == KeyCode::Tab {
+                            if hub.chat.show_preset_modal {
+                                hub.chat.handle_key_input(key, &tx);
+                            } else if hub.chat.is_streaming && key.code == KeyCode::Esc {
+                                hub.chat.abort_generation();
+                            } else if key.code == KeyCode::Tab {
                                 hub.next_tab();
                             } else if key.code == KeyCode::BackTab {
                                 hub.previous_tab();
@@ -799,6 +812,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 hub.unload_active_model().await;
                             } else if key.code == KeyCode::Enter && hub.chat.input_buffer.trim() == "/unload" {
                                 hub.chat.input_buffer.clear();
+                                hub.chat.cursor_idx = 0;
                                 hub.unload_active_model().await;
                             } else if key.modifiers.contains(KeyModifiers::ALT) && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('C')) {
                                 let peers = hub.discovery.get_active_peers().await;
@@ -813,10 +827,13 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     hub.chat.client = NexusClient::new(ep.clone());
                                     hub.chat.model_name = model.clone();
                                     hub.active_model_name = model.clone();
+                                    let peer_label = format!("Node-{}", &active_peer.uuid.to_string()[..8]);
+                                    hub.chat.set_target_hardware(&peer_label, active_peer.backend.to_string());
                                     hub.status_message = Some((format!("Connected to cluster host at {} (probe sent)", ep), Color::Green));
                                     hub.chat.messages.push(ChatMessage::assistant(format!(
                                         "Connected to active cluster host at {}. Ready for chat.", ep
                                     )));
+                                    hub.chat.message_metrics.push(None);
                                 } else {
                                     hub.status_message = Some(("No active cluster host found".to_string(), Color::Yellow));
                                 }
@@ -908,11 +925,14 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.chat.client = NexusClient::new(ep.clone());
                                             hub.chat.model_name = model.clone();
                                             hub.active_model_name = model.clone();
+                                            let peer_name = format!("Node-{}", &peer.uuid.to_string()[..8]);
+                                            hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
                                             hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
                                             hub.chat.messages.push(ChatMessage::assistant(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
                                                 peer.uuid, ep
                                             )));
+                                            hub.chat.message_metrics.push(None);
                                             hub.set_tab(HubTab::Chat);
                                         } else {
                                             hub.cluster_view.status_message = Some(("No peer selected to connect".to_string(), Color::Yellow));
@@ -941,9 +961,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                         let target_api = if !resp.api_endpoint.is_empty() { resp.api_endpoint } else { peer_ep.clone() };
                                                         hub.chat.client = NexusClient::new(target_api);
                                                         hub.chat.model_name = model_name.clone();
+                                                        hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
                                                         hub.chat.messages.push(ChatMessage::assistant(format!(
                                                             "Loaded '{}' on remote node {}.", model_name, peer_name
                                                         )));
+                                                        hub.chat.message_metrics.push(None);
                                                         hub.status_message = Some((format!("Active on {}: {}", peer_name, model_name), Color::Green));
                                                         hub.set_tab(HubTab::Chat);
                                                     }
@@ -981,8 +1003,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Char('d') | KeyCode::Char('D') => {
                                         let local_ep = format!("http://127.0.0.1:{}", hub.config.network.api_port);
                                         hub.chat.client = NexusClient::new(local_ep.clone());
+                                        hub.chat.set_target_hardware("Local Host", "Local CPU/GPU");
                                         hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
                                         hub.chat.messages.push(ChatMessage::assistant(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
+                                        hub.chat.message_metrics.push(None);
                                     }
                                     KeyCode::Char('u') | KeyCode::Char('U') => hub.unload_active_model().await,
                                     KeyCode::Char('r') | KeyCode::Char('R') => hub.cluster_view.refresh().await,
@@ -1053,6 +1077,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         hub.chat.finalize_stream();
                         hub.chat.auto_scroll = true;
                     }
+                    StreamMsg::Abort => {
+                        hub.chat.finalize_stream();
+                        hub.chat.status_message = Some("Generation aborted by operator".to_string());
+                        hub.chat.auto_scroll = true;
+                    }
                     StreamMsg::Error(err) => {
                         hub.chat.finalize_stream();
                         let hint = if err.contains("Transport Error") || err.contains("error sending request") {
@@ -1061,6 +1090,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             ""
                         };
                         hub.chat.messages.push(ChatMessage::assistant(format!("⚠️ [Connection / Generation Error]: {}{}", err, hint)));
+                        hub.chat.message_metrics.push(None);
                         hub.chat.status_message = Some(format!("Error: {}", err));
                         hub.chat.auto_scroll = true;
                     }

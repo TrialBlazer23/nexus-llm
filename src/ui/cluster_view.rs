@@ -45,10 +45,12 @@ pub struct ClusterView {
     pub udp_status: BackendStatus,
     pub mdns_status: BackendStatus,
     pub registry_trust: HashMap<Uuid, (PeerLifecycle, bool, Option<String>)>,
+    pub peer_states: HashMap<Uuid, crate::control_plane::ControlPlaneState>,
     pub show_pair_code: bool,
     pub enter_pair_code: bool,
     pub pair_code_input: String,
     pub local_identity: Option<std::sync::Arc<NodeIdentity>>,
+    pub link_qualities: HashMap<Uuid, crate::cluster::LinkQuality>,
 }
 
 impl ClusterView {
@@ -81,10 +83,12 @@ impl ClusterView {
             udp_status,
             mdns_status,
             registry_trust: HashMap::new(),
+            peer_states: HashMap::new(),
             show_pair_code: false,
             enter_pair_code: false,
             pair_code_input: String::new(),
             local_identity: None,
+            link_qualities: HashMap::new(),
         }
     }
 
@@ -92,11 +96,25 @@ impl ClusterView {
         self.local_identity = Some(identity);
     }
 
+    pub fn record_peer_state(&mut self, state: crate::control_plane::ControlPlaneState) {
+        self.peer_states.insert(state.node_id, state);
+    }
+
+    pub fn record_link_quality(&mut self, peer_id: Uuid, quality: crate::cluster::LinkQuality) {
+        self.link_qualities.insert(peer_id, quality);
+    }
+
     pub async fn refresh(&mut self) {
         self.local_profile = SystemProfile::probe();
         self.thermal_index = DiscoveryService::probe_thermal_index();
         self.peers = self.discovery.get_active_peers().await;
         self.registry_trust.clear();
+        self.link_qualities.clear();
+        for peer in &self.peers {
+            if let Some(lq) = self.discovery.cached_link_quality(peer.uuid).await {
+                self.link_qualities.insert(peer.uuid, lq);
+            }
+        }
         let registry_arc = self.discovery.peer_registry();
         let registry = registry_arc.read().await;
         for record in registry.records() {
@@ -482,6 +500,7 @@ impl ClusterView {
             Cell::from("Role"),
             Cell::from("Free RAM"),
             Cell::from("Backend"),
+            Cell::from("Link Quality"),
             Cell::from("Thermal"),
             Cell::from("Trust"),
         ])
@@ -528,6 +547,16 @@ impl ClusterView {
                 Style::default().fg(Color::White)
             };
 
+            let link_cell = if let Some(lq) = self.link_qualities.get(&peer.uuid) {
+                Cell::from(crate::ui::badges::format_link_quality(
+                    lq.rtt_ms,
+                    lq.throughput_bps,
+                    lq.unknown,
+                ))
+            } else {
+                Cell::from(crate::ui::badges::BADGE_UNPROBED.span())
+            };
+
             rows.push(
                 Row::new(vec![
                     Cell::from(label),
@@ -535,6 +564,7 @@ impl ClusterView {
                     Cell::from(role_str),
                     Cell::from(format!("{} MB", peer.free_ram_mb)),
                     Cell::from(backend_str),
+                    link_cell,
                     Cell::from(format!("{}/100", peer.thermal_index)),
                     Cell::from(self.trust_label(peer.uuid)),
                 ])
@@ -552,10 +582,11 @@ impl ClusterView {
                 Constraint::Length(18), // Node label
                 Constraint::Length(23), // Endpoint
                 Constraint::Length(12), // Role
-                Constraint::Length(12), // Free RAM
-                Constraint::Length(12), // Backend
-                Constraint::Length(9),  // Thermal
-                Constraint::Min(16),    // Active Model
+                Constraint::Length(11), // Free RAM
+                Constraint::Length(11), // Backend
+                Constraint::Length(18), // Link Quality
+                Constraint::Length(8),  // Thermal
+                Constraint::Min(12),    // Trust / Active Model
             ],
         )
         .header(header)
@@ -691,14 +722,75 @@ impl ClusterView {
                     Style::default().fg(Color::White),
                 ),
             ]),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                " Press [I] or [Esc] to close inspection panel ",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )]),
         ];
+
+        let mut lines = lines;
+        if let Some(lq) = self.link_qualities.get(&peer.uuid) {
+            let mb_s = lq.throughput_bps / (1024.0 * 1024.0);
+            let age_secs = lq.measured_at.elapsed().as_secs();
+            let status_badge = if lq.unknown {
+                crate::ui::badges::BADGE_UNPROBED.span()
+            } else if lq.rtt_ms < 10.0 {
+                crate::ui::badges::BADGE_FAST.span()
+            } else if lq.rtt_ms < 50.0 {
+                crate::ui::badges::BADGE_LAN.span()
+            } else {
+                crate::ui::badges::BADGE_SLOW.span()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" Link Telemetry:  ", Style::default().fg(Color::LightBlue)),
+                status_badge,
+                Span::styled(
+                    format!(" {:.1}ms · {:.1}MB/s (probed {}s ago)", lq.rtt_ms, mb_s, age_secs),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" Link Telemetry:  ", Style::default().fg(Color::LightBlue)),
+                crate::ui::badges::BADGE_UNPROBED.span(),
+                Span::styled(" (no probe cached)", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        if let Some(state) = self.peer_states.get(&peer.uuid) {
+            if !state.loaded_models.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    " Active Model Services (Multi-Slot):",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                for (idx, slot) in state.loaded_models.iter().enumerate() {
+                    let tags_str = if slot.tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", slot.tags.join(", "))
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("   Slot #{}: ", idx + 1), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            &slot.model,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" -> {} ({} MB){}", slot.endpoint, slot.memory_mb, tags_str),
+                            Style::default().fg(Color::Green),
+                        ),
+                    ]));
+                }
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            " Press [I] or [Esc] to close inspection panel ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )]));
 
         let block = Paragraph::new(lines).block(
             Block::default()

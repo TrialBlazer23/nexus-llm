@@ -49,6 +49,9 @@ pub enum HubTab {
     Models = 1,
     Cluster = 2,
     Settings = 3,
+    Tunnel = 4,
+    Agents = 5,
+    Logs = 6,
 }
 
 impl HubTab {
@@ -58,8 +61,37 @@ impl HubTab {
             Self::Models => " [F2] 📦 Models ",
             Self::Cluster => " [F3] 🌐 Cluster ",
             Self::Settings => " [F4] ⚙️ Settings ",
+            Self::Tunnel => " [F5] 🚇 Tunnel ",
+            Self::Agents => " [F6] 🤖 Agents ",
+            Self::Logs => " [F7] 📜 Logs ",
         }
     }
+}
+
+/// Target action for Command Palette execution.
+#[derive(Debug, Clone)]
+pub enum PaletteAction {
+    SwitchTab(HubTab),
+    UnloadModel,
+    OpenHelp,
+    RefreshCluster,
+    RefreshModels,
+    DownloadModel,
+    ToggleLogTail,
+    CycleLogFilter,
+    ClearLogs,
+    ChatSlashCommand(String),
+    SelectModel(PathBuf),
+    ConnectPeer(String, String),
+}
+
+/// Dynamic entry indexed by the Command Palette fuzzy finder.
+#[derive(Debug, Clone)]
+pub struct PaletteItem {
+    pub label: String,
+    pub description: String,
+    pub category: &'static str,
+    pub action: PaletteAction,
 }
 
 /// Target execution node option for running model weights.
@@ -174,6 +206,11 @@ pub struct HubApp {
     pub models_view: ModelsView,
     pub cluster_view: ClusterView,
     pub settings_view: SettingsView,
+    pub tunnel_view: crate::ui::tunnel_view::TunnelView,
+    pub agents_view: crate::ui::agents_view::AgentsView,
+    pub logs_view: crate::ui::logs_view::LogsView,
+    pub task_store: Arc<crate::task::TaskStore>,
+    pub kb_store: Arc<crate::kb::KnowledgeStore>,
     pub supervisor: SupervisorManager,
     pub active_model_name: String,
     pub pending_hot_swap: Option<HotSwapIntent>,
@@ -184,6 +221,9 @@ pub struct HubApp {
     pub config_path: std::path::PathBuf,
     pub load_phase: Option<String>,
     pub show_help: bool,
+    pub show_command_palette: bool,
+    pub palette_input: String,
+    pub palette_selected_idx: usize,
     /// URL input modal for Models [D].
     pub pending_download_url: Option<String>,
     /// Peer picker for [S] push (list of (label, endpoint)).
@@ -207,6 +247,30 @@ impl HubApp {
         let cluster_view = ClusterView::new(discovery.clone());
         let settings_view = SettingsView::new(config.clone());
         let chat = ChatApp::new(client, "default", None);
+        let tunnel_view = crate::ui::tunnel_view::TunnelView::new(
+            config.network.api_port,
+            crate::tunnel::DEFAULT_RPC_PORT,
+        );
+        let task_store = Arc::new(
+            crate::task::TaskStore::load_or_create(crate::task::TaskStore::default_path())
+                .unwrap_or_else(|_| {
+                    crate::task::TaskStore::load_or_create(
+                        std::env::temp_dir().join("nexus_tasks.json"),
+                    )
+                    .expect("fallback task store")
+                }),
+        );
+        let kb_store = Arc::new(
+            crate::kb::KnowledgeStore::open(crate::kb::KnowledgeStore::default_path())
+                .or_else(|_| {
+                    let unique_name = format!("nexus_kb_{}.redb", Uuid::new_v4());
+                    crate::kb::KnowledgeStore::open(std::env::temp_dir().join(unique_name))
+                })
+                .expect("fallback kb store"),
+        );
+        let agents_view =
+            crate::ui::agents_view::AgentsView::new(task_store.clone(), kb_store.clone());
+        let logs_view = crate::ui::logs_view::LogsView::new();
 
         Self {
             config,
@@ -216,6 +280,11 @@ impl HubApp {
             models_view,
             cluster_view,
             settings_view,
+            tunnel_view,
+            agents_view,
+            logs_view,
+            task_store,
+            kb_store,
             supervisor: SupervisorManager::new(),
             active_model_name: "None (Idle)".to_string(),
             pending_hot_swap: None,
@@ -226,6 +295,9 @@ impl HubApp {
             config_path,
             load_phase: None,
             show_help: false,
+            show_command_palette: false,
+            palette_input: String::new(),
+            palette_selected_idx: 0,
             pending_download_url: None,
             pending_push_peers: None,
             push_peer_idx: 0,
@@ -275,22 +347,31 @@ impl HubApp {
         self.active_tab = tab;
         if tab == HubTab::Models {
             self.models_view.refresh();
+        } else if tab == HubTab::Tunnel {
+            self.tunnel_view.refresh();
+        } else if tab == HubTab::Agents {
+            self.agents_view.refresh();
+        } else if tab == HubTab::Logs {
+            self.logs_view.refresh();
         }
     }
 
     pub fn next_tab(&mut self) {
-        let next_idx = ((self.active_tab as usize) + 1) % 4;
+        let next_idx = ((self.active_tab as usize) + 1) % 7;
         self.set_tab(match next_idx {
             0 => HubTab::Chat,
             1 => HubTab::Models,
             2 => HubTab::Cluster,
-            _ => HubTab::Settings,
+            3 => HubTab::Settings,
+            4 => HubTab::Tunnel,
+            5 => HubTab::Agents,
+            _ => HubTab::Logs,
         });
     }
 
     pub fn previous_tab(&mut self) {
         let prev_idx = if (self.active_tab as usize) == 0 {
-            3
+            6
         } else {
             (self.active_tab as usize) - 1
         };
@@ -298,7 +379,10 @@ impl HubApp {
             0 => HubTab::Chat,
             1 => HubTab::Models,
             2 => HubTab::Cluster,
-            _ => HubTab::Settings,
+            3 => HubTab::Settings,
+            4 => HubTab::Tunnel,
+            5 => HubTab::Agents,
+            _ => HubTab::Logs,
         });
     }
 
@@ -466,7 +550,7 @@ impl HubApp {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(10),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
             .split(area);
 
@@ -477,6 +561,9 @@ impl HubApp {
             HubTab::Models => self.models_view.render(frame, chunks[1]),
             HubTab::Cluster => self.cluster_view.render(frame, chunks[1]),
             HubTab::Settings => self.settings_view.render(frame, chunks[1]),
+            HubTab::Tunnel => self.tunnel_view.render(frame, chunks[1]),
+            HubTab::Agents => self.agents_view.render(frame, chunks[1]),
+            HubTab::Logs => self.logs_view.render(frame, chunks[1]),
         }
 
         self.render_footer(frame, chunks[2]);
@@ -491,6 +578,10 @@ impl HubApp {
 
         if self.show_help {
             self.render_help_modal(frame, area);
+        }
+
+        if self.show_command_palette {
+            self.render_command_palette(frame, area);
         }
 
         if let Some((label, percent, downloaded, total, speed)) = &self.download_progress {
@@ -620,6 +711,9 @@ impl HubApp {
             HubTab::Models.title(),
             HubTab::Cluster.title(),
             HubTab::Settings.title(),
+            HubTab::Tunnel.title(),
+            HubTab::Agents.title(),
+            HubTab::Logs.title(),
         ];
         let selected = self.active_tab as usize;
         let tabs = Tabs::new(titles)
@@ -641,36 +735,488 @@ impl HubApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let active_str = format!(
-            "Model: {} | Host: {} | temp={:.2} max={} ctx={}",
-            self.active_model_name,
-            self.chat.client.endpoint(),
-            self.chat.temperature,
-            self.chat.max_tokens,
-            self.models_view.selected_context,
+        // Line 1: Rich Telemetry Dock (ORCHESTRATOR_PLAN.md §3.2)
+        let prompt_tokens: usize = self
+            .chat
+            .messages
+            .iter()
+            .map(|m| (m.message.content.len() / 4).max(1))
+            .sum();
+        let used_tokens = prompt_tokens + self.chat.tokens_streamed;
+        let max_ctx = self.models_view.selected_context.max(512);
+        let ratio = ((used_tokens as f64) / (max_ctx as f64)).clamp(0.0, 1.0);
+        let pct = (ratio * 100.0) as usize;
+        let filled_bars = ((ratio * 10.0).round() as usize).min(10);
+        let gauge_str = format!(
+            "[{}{}] {}/{} ({}%)",
+            "█".repeat(filled_bars),
+            "░".repeat(10 - filled_bars),
+            used_tokens,
+            max_ctx,
+            pct
         );
-        let mut spans = vec![
+
+        let speed_str = if self.chat.is_streaming || self.chat.tokens_per_sec > 0.0 {
+            format!("⚡ {:.1} t/s", self.chat.tokens_per_sec)
+        } else {
+            "Idle".to_string()
+        };
+
+        let status_badge = if self.chat.is_streaming {
+            crate::ui::badges::BADGE_STREAMING.span()
+        } else if self.supervisor.is_running_blocking() {
+            crate::ui::badges::BADGE_READY.span()
+        } else {
+            crate::ui::badges::BADGE_OK.span()
+        };
+
+        let model_label = if self.active_model_name.is_empty()
+            || self.active_model_name == "None (Idle)"
+        {
+            "None (Idle)".to_string()
+        } else {
+            self.active_model_name.clone()
+        };
+
+        let line1 = Line::from(vec![
             Span::styled(
-                " [F1-F4] Tabs ",
+                " Model: ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                model_label,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(active_str, Style::default().fg(Color::White)),
+            Span::styled("Host: ", Style::default().fg(Color::Cyan)),
+            Span::styled(self.chat.client.endpoint(), Style::default().fg(Color::White)),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[?] Help", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                speed_str,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Context: ", Style::default().fg(Color::LightBlue)),
+            Span::styled(
+                gauge_str,
+                Style::default()
+                    .fg(if pct > 85 {
+                        Color::Red
+                    } else if pct > 65 {
+                        Color::Yellow
+                    } else {
+                        Color::Green
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+            status_badge,
+        ]);
+
+        // Line 2: Global Navigation, Hotkeys & Transient Alerts
+        let mut spans2 = vec![
+            Span::styled(
+                " [F1-F7] Tabs ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " [Ctrl+P] Palette ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" [?] Help ", Style::default().fg(Color::White)),
         ];
+
         if self.supervisor.is_running_blocking() {
-            spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
+            spans2.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            spans2.push(Span::styled(
                 " [u] Unload ",
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+        if let Some((msg, color)) = &self.status_message {
+            spans2.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+            spans2.push(Span::styled(
+                format!("ALERT: {}", msg),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(vec![line1, Line::from(spans2)]), area);
+    }
+
+    pub fn build_palette_items(&self) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+        // Navigation
+        items.push(PaletteItem {
+            label: "Go to Chat".into(),
+            description: "Open interactive chat session [F1]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Chat),
+        });
+        items.push(PaletteItem {
+            label: "Go to Models".into(),
+            description: "Browse local models and peer weight transfers [F2]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Models),
+        });
+        items.push(PaletteItem {
+            label: "Go to Cluster".into(),
+            description: "View mesh topology, discovery, and pairing [F3]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Cluster),
+        });
+        items.push(PaletteItem {
+            label: "Go to Settings".into(),
+            description: "Configure ports, hardware limits, and safety [F4]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Settings),
+        });
+        items.push(PaletteItem {
+            label: "Go to Tunnel".into(),
+            description: "ADB and reverse port forwarding manager [F5]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Tunnel),
+        });
+        items.push(PaletteItem {
+            label: "Go to Agents".into(),
+            description: "Agent bus tasks, episodic memory, and routing [F6]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Agents),
+        });
+        items.push(PaletteItem {
+            label: "Go to Logs".into(),
+            description: "Live diagnostic node and daemon log stream [F7]".into(),
+            category: "Navigation",
+            action: PaletteAction::SwitchTab(HubTab::Logs),
+        });
+
+        // Hub Actions
+        items.push(PaletteItem {
+            label: "Unload Active Model".into(),
+            description: format!("Unload running weights ({}) [u]", self.active_model_name),
+            category: "Action",
+            action: PaletteAction::UnloadModel,
+        });
+        items.push(PaletteItem {
+            label: "Scan & Refresh Models".into(),
+            description: "Re-scan ~/.nexus/models/ for GGUF files [r]".into(),
+            category: "Action",
+            action: PaletteAction::RefreshModels,
+        });
+        items.push(PaletteItem {
+            label: "Download Model from URL".into(),
+            description: "Enter a remote GGUF URL to download [D]".into(),
+            category: "Action",
+            action: PaletteAction::DownloadModel,
+        });
+        items.push(PaletteItem {
+            label: "Refresh Cluster Peers".into(),
+            description: "Broadcast discovery probe and refresh peer list [r]".into(),
+            category: "Action",
+            action: PaletteAction::RefreshCluster,
+        });
+        items.push(PaletteItem {
+            label: "Toggle Log Auto-Follow".into(),
+            description: "Pause or resume real-time log tailing [Space]".into(),
+            category: "Action",
+            action: PaletteAction::ToggleLogTail,
+        });
+        items.push(PaletteItem {
+            label: "Cycle Log Filter Level".into(),
+            description: "Filter logs by ALL / INFO / WARN / ERROR [l]".into(),
+            category: "Action",
+            action: PaletteAction::CycleLogFilter,
+        });
+        items.push(PaletteItem {
+            label: "Clear Log Buffer".into(),
+            description: "Clear in-memory log buffer [c]".into(),
+            category: "Action",
+            action: PaletteAction::ClearLogs,
+        });
+        items.push(PaletteItem {
+            label: "Keyboard Shortcuts & Help".into(),
+            description: "Show global and context keybindings reference [?]".into(),
+            category: "Action",
+            action: PaletteAction::OpenHelp,
+        });
+
+        // Slash commands
+        items.push(PaletteItem {
+            label: "/reset".into(),
+            description: "Clear chat history and reset context".into(),
+            category: "Command",
+            action: PaletteAction::ChatSlashCommand("/reset".into()),
+        });
+        items.push(PaletteItem {
+            label: "/doctor".into(),
+            description: "Diagnose mesh preconditions, ports, and GPU health".into(),
+            category: "Command",
+            action: PaletteAction::ChatSlashCommand("/doctor".into()),
+        });
+        items.push(PaletteItem {
+            label: "/compact".into(),
+            description: "Trigger memory compaction and flush KV cache".into(),
+            category: "Command",
+            action: PaletteAction::ChatSlashCommand("/compact".into()),
+        });
+
+        // Discovered local models
+        for m in &self.models_view.models {
+            items.push(PaletteItem {
+                label: format!("Load Model: {}", m.filename),
+                description: format!(
+                    "Target select and load {} ({} MB)",
+                    m.filename,
+                    m.size_mb
+                ),
+                category: "Model",
+                action: PaletteAction::SelectModel(m.path.clone()),
+            });
+        }
+
+        // Discovered peers
+        for p in &self.cluster_view.peers {
+            items.push(PaletteItem {
+                label: format!("Connect Peer: {}", p.label()),
+                description: format!(
+                    "Direct chat client to {} (Free RAM: {} MB)",
+                    p.api_endpoint(),
+                    p.free_ram_mb
+                ),
+                category: "Cluster",
+                action: PaletteAction::ConnectPeer(p.label(), p.api_endpoint()),
+            });
+        }
+
+        items
+    }
+
+    pub fn filter_palette_items<'a>(
+        &self,
+        items: &'a [PaletteItem],
+        query: &str,
+    ) -> Vec<&'a PaletteItem> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return items.iter().collect();
+        }
+
+        let mut scored: Vec<(i32, &'a PaletteItem)> = items
+            .iter()
+            .filter_map(|item| {
+                let label_lower = item.label.to_lowercase();
+                let desc_lower = item.description.to_lowercase();
+                let cat_lower = item.category.to_lowercase();
+
+                let score = if label_lower.starts_with(&q) {
+                    1000 - (label_lower.len() as i32)
+                } else if label_lower
+                    .split_whitespace()
+                    .any(|word| word.starts_with(&q))
+                {
+                    800
+                } else if label_lower.contains(&q) {
+                    600
+                } else if desc_lower.contains(&q) || cat_lower.contains(&q) {
+                    400
+                } else if is_subsequence(&q, &label_lower) {
+                    200
+                } else if is_subsequence(&q, &desc_lower) {
+                    100
+                } else {
+                    return None;
+                };
+
+                Some((score, item))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    pub fn execute_palette_action(
+        &mut self,
+        action: PaletteAction,
+        cmd_tx: &mpsc::Sender<HubCommand>,
+    ) {
+        match action {
+            PaletteAction::SwitchTab(tab) => self.set_tab(tab),
+            PaletteAction::UnloadModel => {
+                let _ = cmd_tx.try_send(HubCommand::Unload {
+                    active_model_name: self.active_model_name.clone(),
+                });
+            }
+            PaletteAction::OpenHelp => self.show_help = true,
+            PaletteAction::RefreshCluster => {
+                self.set_tab(HubTab::Cluster);
+                let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
+            }
+            PaletteAction::RefreshModels => {
+                self.set_tab(HubTab::Models);
+                self.models_view.refresh();
+            }
+            PaletteAction::DownloadModel => {
+                self.set_tab(HubTab::Models);
+                self.pending_download_url = Some(String::new());
+            }
+            PaletteAction::ToggleLogTail => {
+                self.set_tab(HubTab::Logs);
+                self.logs_view.toggle_tail();
+            }
+            PaletteAction::CycleLogFilter => {
+                self.set_tab(HubTab::Logs);
+                self.logs_view.cycle_filter();
+            }
+            PaletteAction::ClearLogs => {
+                self.set_tab(HubTab::Logs);
+                self.logs_view.clear();
+            }
+            PaletteAction::ChatSlashCommand(cmd) => {
+                self.set_tab(HubTab::Chat);
+                self.chat.handle_slash_command(&cmd);
+            }
+            PaletteAction::SelectModel(path) => {
+                let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection { model_path: path });
+            }
+            PaletteAction::ConnectPeer(label, ep) => {
+                self.chat.client = NexusClient::new(ep.clone());
+                self.chat.model_name = "cluster-model".to_string();
+                self.active_model_name = "cluster-model".to_string();
+                self.chat
+                    .set_target_hardware(&label, "Remote RPC".to_string());
+                self.set_tab(HubTab::Chat);
+                self.status_message =
+                    Some((format!("Connected to peer at {}", ep), Color::Green));
+            }
+        }
+    }
+
+    fn render_command_palette(&self, frame: &mut Frame, area: Rect) {
+        let modal = centered_rect(70, 60, area);
+        frame.render_widget(Clear, modal);
+
+        let border_block = Block::default()
+            .title(" 🧭 Command Palette (Ctrl+P) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = border_block.inner(modal);
+        frame.render_widget(border_block, modal);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Search input
+                Constraint::Min(6),    // Results list
+                Constraint::Length(1), // Footer hint
+            ])
+            .split(inner);
+
+        let input_line = Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                &self.palette_input,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+        ]);
+        let input_block = Block::default()
+            .title(" Search commands, tabs, models, peers, shortcuts ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(Paragraph::new(input_line).block(input_block), chunks[0]);
+
+        let items = self.build_palette_items();
+        let filtered = self.filter_palette_items(&items, &self.palette_input);
+
+        if filtered.is_empty() {
+            let empty_p = Paragraph::new(Line::from(Span::styled(
+                "No matching actions found. Press Esc to cancel.",
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(Alignment::Center);
+            frame.render_widget(empty_p, chunks[1]);
+        } else {
+            let height = chunks[1].height as usize;
+            let start = if self.palette_selected_idx >= height {
+                self.palette_selected_idx - height + 1
+            } else {
+                0
+            };
+            let end = (start + height).min(filtered.len());
+
+            let mut lines = Vec::new();
+            for (idx, item) in filtered.iter().enumerate().take(end).skip(start) {
+                let is_selected = idx == self.palette_selected_idx;
+                let cursor = if is_selected { "▶ " } else { "  " };
+
+                let cat_color = match item.category {
+                    "Navigation" => Color::Yellow,
+                    "Action" => Color::Magenta,
+                    "Model" => Color::Green,
+                    "Cluster" => Color::Cyan,
+                    "Command" => Color::LightBlue,
+                    _ => Color::White,
+                };
+
+                let item_style = if is_selected {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+
+                let line = Line::from(vec![
+                    Span::styled(
+                        cursor,
+                        if is_selected {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ),
+                    Span::styled(
+                        format!("[{}] ", item.category),
+                        Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(&item.label, item_style),
+                    Span::styled(
+                        format!("  — {}", item.description),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                lines.push(line);
+            }
+            frame.render_widget(Paragraph::new(lines), chunks[1]);
+        }
+
+        let hint = Paragraph::new(Line::from(Span::styled(
+            " [↑/↓/Ctrl+N/Ctrl+P] Select | [Enter] Run | [Esc] Close ",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Center);
+        frame.render_widget(hint, chunks[2]);
     }
 
     fn render_hot_swap_modal(&self, frame: &mut Frame, area: Rect, intent: &HotSwapIntent) {
@@ -818,6 +1364,16 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut h_chars = haystack.chars();
+    for n_char in needle.chars() {
+        if !h_chars.any(|c| c == n_char) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Launch and execute the main unified hub event loop.
 pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Error>> {
     hub.cluster_view.set_local_identity(hub.identity.clone());
@@ -884,6 +1440,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 if hub.active_tab == HubTab::Cluster {
                     let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                 }
+                if hub.active_tab == HubTab::Logs {
+                    hub.logs_view.refresh();
+                }
                 match hub.supervisor.check_status().await {
                     Ok(Some((exit_status, err_lines))) => {
                         let last_err = err_lines
@@ -916,6 +1475,72 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 if let Ok(Event::Key(key)) = event_res {
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                         break;
+                    }
+
+                    if hub.show_command_palette {
+                        let items = hub.build_palette_items();
+                        let filtered_count =
+                            hub.filter_palette_items(&items, &hub.palette_input).len();
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.show_command_palette = false;
+                                hub.palette_input.clear();
+                            }
+                            KeyCode::Up => {
+                                if filtered_count > 0 {
+                                    if hub.palette_selected_idx == 0 {
+                                        hub.palette_selected_idx = filtered_count - 1;
+                                    } else {
+                                        hub.palette_selected_idx -= 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if filtered_count > 0 {
+                                    hub.palette_selected_idx =
+                                        (hub.palette_selected_idx + 1) % filtered_count;
+                                }
+                            }
+                            KeyCode::Char('p')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if filtered_count > 0 {
+                                    if hub.palette_selected_idx == 0 {
+                                        hub.palette_selected_idx = filtered_count - 1;
+                                    } else {
+                                        hub.palette_selected_idx -= 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if filtered_count > 0 {
+                                    hub.palette_selected_idx =
+                                        (hub.palette_selected_idx + 1) % filtered_count;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let filtered =
+                                    hub.filter_palette_items(&items, &hub.palette_input);
+                                if let Some(selected) = filtered.get(hub.palette_selected_idx) {
+                                    let action = selected.action.clone();
+                                    hub.show_command_palette = false;
+                                    hub.palette_input.clear();
+                                    hub.execute_palette_action(action, &cmd_tx);
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                hub.palette_input.pop();
+                                hub.palette_selected_idx = 0;
+                            }
+                            KeyCode::Char(c) => {
+                                hub.palette_input.push(c);
+                                hub.palette_selected_idx = 0;
+                            }
+                            _ => {}
+                        }
+                        continue;
                     }
 
                     if hub.show_help {
@@ -1194,6 +1819,20 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                             }
                             HubAction::TabSettings => hub.set_tab(HubTab::Settings),
+                            HubAction::TabTunnel => hub.set_tab(HubTab::Tunnel),
+                            HubAction::TabAgents => {
+                                hub.agents_view.refresh();
+                                hub.set_tab(HubTab::Agents);
+                            }
+                            HubAction::TabLogs => {
+                                hub.logs_view.refresh();
+                                hub.set_tab(HubTab::Logs);
+                            }
+                            HubAction::OpenCommandPalette => {
+                                hub.show_command_palette = true;
+                                hub.palette_input.clear();
+                                hub.palette_selected_idx = 0;
+                            }
                             HubAction::NextTab => hub.next_tab(),
                             HubAction::PrevTab => hub.previous_tab(),
                             HubAction::Help => hub.show_help = true,
@@ -1285,6 +1924,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     | HubAction::TabModels
                                     | HubAction::TabCluster
                                     | HubAction::TabSettings
+                                    | HubAction::TabTunnel
+                                    | HubAction::TabAgents
+                                    | HubAction::TabLogs
+                                    | HubAction::OpenCommandPalette
                                     | HubAction::NextTab
                                     | HubAction::PrevTab
                                     | HubAction::Help
@@ -1607,7 +2250,96 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 }
                             }
                         }
-
+                        HubTab::Tunnel => match key.code {
+                            KeyCode::Char('r') | KeyCode::Char('R') => hub.tunnel_view.refresh(),
+                            KeyCode::Char('s') | KeyCode::Char('S') => hub.tunnel_view.setup_tunnel(),
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                hub.tunnel_view.teardown_tunnel()
+                            }
+                            KeyCode::Tab => hub.next_tab(),
+                            KeyCode::BackTab => hub.previous_tab(),
+                            _ => {}
+                        },
+                        HubTab::Agents => match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => hub.agents_view.prev_task(),
+                            KeyCode::Down | KeyCode::Char('j') => hub.agents_view.next_task(),
+                            KeyCode::Char('r') | KeyCode::Char('R') => hub.agents_view.refresh(),
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                let embedder = crate::kb::FastPseudoEmbedder::default();
+                                let janitor = crate::kb::JanitorAgent::new(
+                                    (*hub.kb_store).clone(),
+                                    crate::kb::Embedder::Pseudo(embedder),
+                                );
+                                let chat_turns: Vec<crate::client::ChatMessage> = hub
+                                    .chat
+                                    .messages
+                                    .iter()
+                                    .map(|e| e.message.clone())
+                                    .collect();
+                                let distilled = janitor
+                                    .distill_dialogue(&chat_turns, Some("active_session"))
+                                    .unwrap_or_default();
+                                let count = distilled.len();
+                                hub.agents_view.refresh();
+                                hub.agents_view.status_message = Some((
+                                    format!("Janitor distilled {count} memories from active session"),
+                                    Color::Green,
+                                ));
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                hub.agents_view.status_message = Some((
+                                    "Mesh KB sync requested".to_string(),
+                                    Color::Cyan,
+                                ));
+                            }
+                            KeyCode::Tab => hub.next_tab(),
+                            KeyCode::BackTab => hub.previous_tab(),
+                            _ => {}
+                        },
+                        HubTab::Logs => {
+                            if hub.logs_view.is_searching {
+                                match key.code {
+                                    KeyCode::Enter | KeyCode::Esc => {
+                                        hub.logs_view.is_searching = false;
+                                    }
+                                    KeyCode::Backspace => {
+                                        hub.logs_view.search_query.pop();
+                                        hub.logs_view.scroll_offset = 0;
+                                    }
+                                    KeyCode::Char(c) => {
+                                        hub.logs_view.search_query.push(c);
+                                        hub.logs_view.scroll_offset = 0;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => hub.logs_view.scroll_up(1),
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        hub.logs_view.scroll_down(1)
+                                    }
+                                    KeyCode::PageUp => hub.logs_view.scroll_up(10),
+                                    KeyCode::PageDown => hub.logs_view.scroll_down(10),
+                                    KeyCode::Char(' ') => hub.logs_view.toggle_tail(),
+                                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                                        hub.logs_view.cycle_filter()
+                                    }
+                                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                                        hub.logs_view.clear()
+                                    }
+                                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                                        hub.logs_view.refresh()
+                                    }
+                                    KeyCode::Char('/') => {
+                                        hub.logs_view.is_searching = true;
+                                        hub.logs_view.search_query.clear();
+                                    }
+                                    KeyCode::Tab => hub.next_tab(),
+                                    KeyCode::BackTab => hub.previous_tab(),
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                 }
             }

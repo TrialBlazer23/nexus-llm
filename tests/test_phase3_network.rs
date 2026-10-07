@@ -104,6 +104,7 @@ fn control_plane_validates_identity_protocol_and_policy() {
         rpc_ready: true,
         allocatable_memory_mb: 1800,
         active_model: None,
+        loaded_models: Vec::new(),
         signing_public_key: None,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
@@ -238,6 +239,8 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
         gpu_layers: 99,
         threads: 4,
         rpc_workers: vec!["192.168.1.50:50052".to_string()],
+        tags: vec!["general".to_string()],
+        target_port: Some(8081),
     };
 
     // Serialize and deserialize round-trip

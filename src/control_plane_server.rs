@@ -6,7 +6,7 @@
 
 use crate::config::NexusConfig;
 use crate::control_plane::{
-    blob_url, build_control_plane_state, build_model_catalog, handle_load_model,
+    blob_url, build_control_plane_state_with_host, build_model_catalog, handle_load_model,
     handle_unload_model, BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest,
     ModelLoadRequest, ModelUnloadRequest, PairRequest, PairResponse, CONTROL_PLANE_VERSION,
     MAX_CONTROL_RESPONSE_BYTES,
@@ -60,6 +60,8 @@ pub struct ControlPlaneContext {
     pub config_path: PathBuf,
     pub nonce_cache: Arc<Mutex<NonceCache>>,
     pair_attempts: Arc<Mutex<HashMap<SocketAddr, (u32, Instant)>>>,
+    pub task_store: Arc<crate::task::TaskStore>,
+    pub kb_store: Arc<crate::kb::KnowledgeStore>,
 }
 
 impl ControlPlaneContext {
@@ -76,6 +78,21 @@ impl ControlPlaneContext {
         config: Arc<std::sync::RwLock<NexusConfig>>,
         config_path: PathBuf,
     ) -> Self {
+        let task_store = Arc::new(
+            crate::task::TaskStore::load_or_create(crate::task::TaskStore::default_path())
+                .unwrap_or_else(|_| {
+                    crate::task::TaskStore::load_or_create(std::env::temp_dir().join("nexus_tasks.json"))
+                        .expect("fallback task store")
+                }),
+        );
+        let kb_store = Arc::new(
+            crate::kb::KnowledgeStore::open(crate::kb::KnowledgeStore::default_path())
+                .or_else(|_| {
+                    let unique_name = format!("nexus_kb_{}.redb", Uuid::new_v4());
+                    crate::kb::KnowledgeStore::open(std::env::temp_dir().join(unique_name))
+                })
+                .expect("fallback kb store"),
+        );
         Self {
             node_id,
             role,
@@ -83,6 +100,8 @@ impl ControlPlaneContext {
                 "inference".to_string(),
                 "catalog".to_string(),
                 "blob".to_string(),
+                "embeddings".to_string(),
+                "kb".to_string(),
             ],
             supervisor,
             api_host: api_host.into(),
@@ -97,7 +116,19 @@ impl ControlPlaneContext {
             config_path,
             nonce_cache: Arc::new(Mutex::new(NonceCache::default())),
             pair_attempts: Arc::new(Mutex::new(HashMap::new())),
+            task_store,
+            kb_store,
         }
+    }
+
+    pub fn with_task_store(mut self, task_store: Arc<crate::task::TaskStore>) -> Self {
+        self.task_store = task_store;
+        self
+    }
+
+    pub fn with_kb_store(mut self, kb_store: Arc<crate::kb::KnowledgeStore>) -> Self {
+        self.kb_store = kb_store;
+        self
     }
 
     pub fn with_discovery(mut self, discovery: Arc<DiscoveryService>) -> Self {
@@ -203,6 +234,12 @@ async fn route(
         (Method::POST, "/nexus/control/v1/state") => handle_state(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/load") => handle_load(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/unload") => handle_unload(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/agent/message") => handle_agent_message_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/store") => handle_kb_store_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/query") => handle_kb_query_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/sync/manifest") => handle_kb_manifest_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/sync/pull") => handle_kb_pull_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/sync/push") => handle_kb_push_route(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/pair") => handle_pair(req, ctx, peer).await,
         _ => json_response(
             StatusCode::NOT_FOUND,
@@ -552,7 +589,7 @@ async fn handle_state(
     let profile = SystemProfile::probe();
     let allocatable =
         profile.max_allowed_memory_bytes_pct(ctx.memory_budget_percent) / (1024 * 1024);
-    let state = build_control_plane_state(
+    let state = build_control_plane_state_with_host(
         ctx.node_id,
         ctx.role,
         ctx.capabilities.clone(),
@@ -560,6 +597,7 @@ async fn handle_state(
         allocatable,
         ctx.rpc_ready,
         Some(ctx.identity.public_key_hex()),
+        &ctx.api_host,
     )
     .await;
     json_response(StatusCode::OK, &state)
@@ -699,6 +737,309 @@ async fn handle_unload(
 
     json_response(StatusCode::OK, &response)
 }
+
+async fn handle_agent_message_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/agent/message",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::control_plane::AgentTaskMessage = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response = crate::control_plane::handle_agent_message(
+        &ctx.task_store,
+        &ctx.supervisor,
+        &request,
+        &ctx.api_host,
+    )
+    .await;
+
+    json_response(StatusCode::OK, &response)
+}
+
+async fn handle_kb_store_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/kb/store",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::control_plane::KbStoreRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response = crate::control_plane::handle_kb_store(&ctx.kb_store, &request).await;
+    json_response(StatusCode::OK, &response)
+}
+
+async fn handle_kb_query_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/kb/query",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::control_plane::KbQueryRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response = crate::control_plane::handle_kb_query(&ctx.kb_store, &request).await;
+    json_response(StatusCode::OK, &response)
+}
+
+async fn handle_kb_manifest_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/kb/sync/manifest",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::control_plane::KbManifestRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response =
+        crate::control_plane::handle_kb_manifest(&ctx.kb_store, ctx.node_id, &request).await;
+    json_response(StatusCode::OK, &response)
+}
+
+async fn handle_kb_pull_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/kb/sync/pull",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::kb::sync::KbSyncPullRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response = crate::control_plane::handle_kb_pull(&ctx.kb_store, &request).await;
+    json_response(StatusCode::OK, &response)
+}
+
+async fn handle_kb_push_route(
+    req: Request<Incoming>,
+    ctx: Arc<ControlPlaneContext>,
+    peer: SocketAddr,
+) -> Response<RespBody> {
+    let headers = req.headers().clone();
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
+    let auth = match verify_control_request(
+        &headers,
+        "POST",
+        "/nexus/control/v1/kb/sync/push",
+        &body,
+        &security,
+        &ctx.nonce_cache,
+        None,
+        false,
+        Some(peer.ip()),
+    ) {
+        Ok(a) => a,
+        Err(err) => return auth_error_response(err),
+    };
+    if let Err(err) = authorize_privileged_signer(&security, auth.signer_id) {
+        return auth_error_response(err);
+    }
+
+    let request: crate::kb::sync::KbSyncPushRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": format!("invalid JSON: {e}")}),
+            );
+        }
+    };
+
+    let response = crate::control_plane::handle_kb_push(&ctx.kb_store, &request).await;
+    json_response(StatusCode::OK, &response)
+}
+
 
 fn allow_pair_attempt(ctx: &ControlPlaneContext, peer: SocketAddr) -> bool {
     let mut map = ctx.pair_attempts.lock().expect("pair attempts lock");

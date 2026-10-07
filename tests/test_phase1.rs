@@ -260,6 +260,7 @@ fn test_supervisor_command_args_builder() {
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent: 75,
+        tags: Vec::new(),
     };
 
     // Test Vulkan offload args (-ngl 99)
@@ -339,6 +340,7 @@ async fn test_supervisor_preflight_binary_not_found() {
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent: 75,
+        tags: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -375,6 +377,7 @@ async fn test_supervisor_preflight_model_not_found() {
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent: 75,
+        tags: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -424,6 +427,7 @@ async fn test_supervisor_memory_cap_rejection() {
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent: 75,
+        tags: Vec::new(),
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;

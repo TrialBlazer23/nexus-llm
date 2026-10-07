@@ -243,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_type_k: None,
             cache_type_v: None,
             memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
+            tags: Vec::new(),
         };
 
         info!(

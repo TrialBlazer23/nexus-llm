@@ -321,4 +321,61 @@ impl NexusClient {
 
         Ok(Box::pin(stream))
     }
+
+    /// Request float embeddings for `input` using `model`.
+    pub async fn create_embedding(
+        &self,
+        model: &str,
+        input: &str,
+    ) -> Result<Vec<f32>, ClientError> {
+        let url = format!("{}/v1/embeddings", self.endpoint);
+        let req = EmbeddingRequest {
+            model: model.to_string(),
+            input: input.to_string(),
+        };
+
+        let resp = self.client.post(&url).json(&req).send().await?;
+        if !resp.status().is_success() {
+            return Err(ClientError::ApiError {
+                status: resp.status(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let body: EmbeddingResponse = resp.json().await?;
+        let embedding = body
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .ok_or_else(|| ClientError::ApiError {
+                status: reqwest::StatusCode::OK,
+                message: "Empty embedding data array returned by API".to_string(),
+            })?;
+
+        Ok(embedding)
+    }
 }
+
+/// Request payload for OpenAI-compatible /v1/embeddings endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: String,
+}
+
+/// Response payload from /v1/embeddings endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingResponse {
+    pub data: Vec<EmbeddingData>,
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingData {
+    pub embedding: Vec<f32>,
+    #[serde(default)]
+    pub index: usize,
+}
+

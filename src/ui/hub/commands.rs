@@ -612,6 +612,8 @@ async fn run_remote_load(
         gpu_layers,
         threads: ctx.config.hardware.acceleration.cpu_threads,
         rpc_workers: Vec::new(),
+        tags: Vec::new(),
+        target_port: None,
     };
 
     info!("Dispatching remote model load to {endpoint}: {req:?}");
@@ -841,6 +843,7 @@ async fn run_local_load(
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent: ctx.config.hardware.safety.max_ram_usage_percent,
+        tags: Vec::new(),
     };
 
     let _ = evt_tx

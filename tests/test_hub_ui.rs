@@ -89,11 +89,32 @@ fn test_hub_tab_cycling_and_titles() {
     assert_eq!(hub.active_tab, HubTab::Settings);
     assert!(HubTab::Settings.title().contains("Settings"));
 
+    hub.next_tab();
+    assert_eq!(hub.active_tab, HubTab::Tunnel);
+    assert!(HubTab::Tunnel.title().contains("Tunnel"));
+
+    hub.next_tab();
+    assert_eq!(hub.active_tab, HubTab::Agents);
+    assert!(HubTab::Agents.title().contains("Agents"));
+
+    hub.next_tab();
+    assert_eq!(hub.active_tab, HubTab::Logs);
+    assert!(HubTab::Logs.title().contains("Logs"));
+
     // Wraparound to Chat
     hub.next_tab();
     assert_eq!(hub.active_tab, HubTab::Chat);
 
     // Cycle backward
+    hub.previous_tab();
+    assert_eq!(hub.active_tab, HubTab::Logs);
+
+    hub.previous_tab();
+    assert_eq!(hub.active_tab, HubTab::Agents);
+
+    hub.previous_tab();
+    assert_eq!(hub.active_tab, HubTab::Tunnel);
+
     hub.previous_tab();
     assert_eq!(hub.active_tab, HubTab::Settings);
 
@@ -271,7 +292,7 @@ async fn test_hub_app_headless_render_all_tabs() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut hub = test_hub(config, client, discovery);
 
-    let backend = TestBackend::new(120, 35);
+    let backend = TestBackend::new(140, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
 
     // 1. Render Tab 0: Chat
@@ -349,17 +370,72 @@ async fn test_hub_app_headless_render_all_tabs() {
         content.contains("Configuration & Settings"),
         "Must render settings editor header"
     );
+
+    // 5. Render Tab 4: Tunnel
+    hub.set_tab(HubTab::Tunnel);
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render Tunnel tab");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
     assert!(
-        content.contains("Node Identity"),
-        "Must render Node Identity category"
+        content.contains("[F5] 🚇 Tunnel"),
+        "Must render Tunnel tab active"
+    );
+
+    // 6. Render Tab 5: Agents
+    hub.set_tab(HubTab::Agents);
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render Agents tab");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+    assert!(
+        content.contains("[F6] 🤖 Agents"),
+        "Must render Agents tab active"
+    );
+
+    // 7. Render Tab 6: Logs
+    hub.set_tab(HubTab::Logs);
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render Logs tab");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+    assert!(
+        content.contains("[F7] 📜 Logs"),
+        "Must render Logs tab active"
     );
     assert!(
-        content.contains("Hardware & Acceleration"),
-        "Must render Hardware category"
+        content.contains("Node Diagnostic Logs"),
+        "Must render Logs header"
+    );
+
+    // Verify 2-line persistent dock
+    assert!(
+        content.contains("Context:"),
+        "Must render persistent context gauge"
     );
     assert!(
-        content.contains("Memory & Android LMK Safeguards"),
-        "Must render Memory Safety category"
+        content.contains("[Ctrl+P] Palette"),
+        "Must render Palette shortcut hint"
+    );
+
+    // 8. Render Command Palette modal overlay
+    hub.show_command_palette = true;
+    hub.palette_input = "chat".to_string();
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render Command Palette modal");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+    assert!(
+        content.contains("Command Palette"),
+        "Must render Command Palette modal overlay"
+    );
+    assert!(
+        content.contains("Go to Chat"),
+        "Must match Go to Chat in filtered palette"
     );
 }
 
@@ -604,3 +680,169 @@ async fn test_hub_app_unload_model() {
         .content
         .contains("Model 'test-model-3b' unloaded"));
 }
+
+#[tokio::test]
+async fn test_command_palette_filtering_and_actions() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    let items = hub.build_palette_items();
+    assert!(items.len() >= 10, "Palette should index navigation, actions, and commands");
+
+    // Exact prefix match
+    let filtered_logs = hub.filter_palette_items(&items, "logs");
+    assert!(!filtered_logs.is_empty());
+    assert_eq!(filtered_logs[0].label, "Go to Logs");
+
+    // Action search
+    let filtered_unload = hub.filter_palette_items(&items, "unload");
+    assert!(!filtered_unload.is_empty());
+    assert!(filtered_unload[0].label.contains("Unload"));
+
+    // Slash command search
+    let filtered_doc = hub.filter_palette_items(&items, "doc");
+    assert!(!filtered_doc.is_empty());
+    assert_eq!(filtered_doc[0].label, "/doctor");
+
+    // Execute palette action: switch tab
+    let (tx, _rx) = tokio::sync::mpsc::channel(10);
+    hub.execute_palette_action(nexus::ui::hub::PaletteAction::SwitchTab(HubTab::Logs), &tx);
+    assert_eq!(hub.active_tab, HubTab::Logs);
+
+    // Execute palette action: help modal
+    hub.execute_palette_action(nexus::ui::hub::PaletteAction::OpenHelp, &tx);
+    assert!(hub.show_help);
+}
+
+#[tokio::test]
+async fn test_persistent_dock_telemetry_and_gauge() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    hub.active_model_name = "qwen2.5-coder-7b.gguf".to_string();
+    hub.chat.tokens_per_sec = 28.5;
+    hub.chat.is_streaming = true;
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+
+    // Verify Row 1: Telemetry
+    assert!(content.contains("qwen2.5-coder-7b.gguf"), "Must display active model in persistent bar");
+    assert!(content.contains("28.5 t/s"), "Must display active live tokens/sec");
+    assert!(content.contains("Context:"), "Must display context label");
+    assert!(content.contains("[STREAM]"), "Must display streaming status badge");
+
+    // Verify Row 2: Controls & Shortcuts
+    assert!(content.contains("[F1-F7] Tabs"), "Must display tab range shortcut");
+    assert!(content.contains("[Ctrl+P] Palette"), "Must display Palette hotkey");
+    assert!(content.contains("[?] Help"), "Must display Help hotkey");
+}
+
+#[tokio::test]
+async fn test_cluster_view_link_quality_visuals() {
+    use nexus::cluster::LinkQuality;
+    use nexus::discovery::{NodeRole, PeerNode};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config, None));
+    let mut cluster = nexus::ui::cluster_view::ClusterView::new(discovery);
+
+    let peer_id = Uuid::new_v4();
+    let peer = PeerNode {
+        uuid: peer_id,
+        addr: "192.168.1.42:8080".parse().unwrap(),
+        role: NodeRole::HOST,
+        status: nexus::discovery::StatusFlags::READY,
+        api_port: 8080,
+        control_port: 9998,
+        rpc_port: 50052,
+        total_ram_mb: 8192,
+        free_ram_mb: 4096,
+        backend: nexus::sysinfo::AccelerationBackend::Vulkan,
+        thermal_index: 25,
+        active_model: "phi-4-mini".to_string(),
+        display_name: String::new(),
+        last_seen: std::time::Instant::now(),
+    };
+    cluster.peers.push(peer);
+
+    // Record synthetic measured link quality: 3.2ms RTT, ~50 MB/s
+    let lq = LinkQuality::from_probe(
+        Duration::from_millis(3),
+        50 * 1024 * 1024,
+        Duration::from_secs(1),
+    );
+    cluster.record_link_quality(peer_id, lq);
+
+    let backend = TestBackend::new(140, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // Render table
+    terminal.draw(|f| cluster.render(f, f.area())).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+    assert!(content.contains("Link Quality"), "Must render Link Quality column header");
+    assert!(content.contains("3.0ms"), "Must render measured RTT in table");
+
+    // Render inspect modal
+    cluster.show_info_modal = true;
+    terminal.draw(|f| cluster.render(f, f.area())).unwrap();
+    let modal_content = format!("{:?}", terminal.backend().buffer());
+    assert!(modal_content.contains("Link Telemetry:"), "Must display Link Telemetry row in inspector modal");
+    assert!(modal_content.contains("probed"), "Must show probe details in modal");
+}
+
+#[test]
+fn test_logs_view_streaming_and_filters() {
+    use nexus::ui::logs_view::{LogFilterLevel, LogsView};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp = NamedTempFile::new().unwrap();
+    writeln!(temp, "2026-10-07T12:00:00Z INFO node: node initialized").unwrap();
+    writeln!(temp, "2026-10-07T12:00:01Z WARN node: high peer latency").unwrap();
+    writeln!(temp, "2026-10-07T12:00:02Z ERROR node: socket dropped").unwrap();
+    temp.flush().unwrap();
+
+    let mut logs = LogsView::for_path(temp.path().to_path_buf());
+    assert_eq!(logs.lines.len(), 3);
+    assert_eq!(logs.filtered_lines().len(), 3);
+
+    // Filter cycling
+    logs.cycle_filter();
+    assert_eq!(logs.filter_level, LogFilterLevel::Info);
+    assert_eq!(logs.filtered_lines().len(), 3);
+
+    logs.cycle_filter();
+    assert_eq!(logs.filter_level, LogFilterLevel::Warn);
+    assert_eq!(logs.filtered_lines().len(), 2);
+
+    logs.cycle_filter();
+    assert_eq!(logs.filter_level, LogFilterLevel::Error);
+    assert_eq!(logs.filtered_lines().len(), 1);
+
+    // Live search
+    logs.filter_level = LogFilterLevel::All;
+    logs.search_query = "socket".to_string();
+    assert_eq!(logs.filtered_lines().len(), 1);
+
+    // Auto follow toggling
+    assert!(logs.auto_tail);
+    logs.toggle_tail();
+    assert!(!logs.auto_tail);
+    logs.toggle_tail();
+    assert!(logs.auto_tail);
+
+    // Clear buffer
+    logs.clear();
+    assert_eq!(logs.lines.len(), 0);
+}
+

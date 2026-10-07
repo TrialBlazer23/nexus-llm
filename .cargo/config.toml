@@ -2,4 +2,5 @@
 rustflags = ["-C", "target-feature=-avx,-avx2,-fma,-sse4.2"]
 
 [target.aarch64-linux-android]
-rustflags = ["-C", "target-feature=+dotprod,+i8mm"]
+linker = "/data/data/com.termux/files/usr/bin/clang"
+rustflags = ["-C", "target-feature=+dotprod,+i8mm", "-L", "/system/lib64", "-L", "/data/data/com.termux/files/usr/lib"]

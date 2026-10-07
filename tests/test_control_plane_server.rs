@@ -101,6 +101,8 @@ async fn control_plane_http_load_fails_without_binary_and_unload_succeeds() {
             gpu_layers: 0,
             threads: 2,
             rpc_workers: Vec::new(),
+            tags: Vec::new(),
+            target_port: None,
         },
     )
     .await

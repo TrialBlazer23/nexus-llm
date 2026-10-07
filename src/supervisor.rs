@@ -1,5 +1,5 @@
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -69,6 +69,7 @@ pub struct LlamaServerConfig {
     pub cache_type_v: Option<String>,
     /// LMK / memory ceiling percent (from `hardware.safety.max_ram_usage_percent`).
     pub memory_budget_percent: u8,
+    pub tags: Vec<String>,
 }
 
 /// Restart / demotion policy for unattended nodes.
@@ -119,7 +120,13 @@ impl LlamaServerConfig {
             cache_type_k: None,
             cache_type_v: None,
             memory_budget_percent: 75,
+            tags: Vec::new(),
         }
+    }
+
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
     }
 
     /// Check if RPC distributed layer offloading is enabled in configuration.
@@ -193,6 +200,7 @@ pub struct ProcessSupervisor {
     client: reqwest::Client,
     state_tx: watch::Sender<SupervisorState>,
     stderr_history: Arc<Mutex<VecDeque<String>>>,
+    estimated_memory_bytes: u64,
 }
 
 impl ProcessSupervisor {
@@ -204,6 +212,18 @@ impl ProcessSupervisor {
     /// Return reference to configuration.
     pub fn config(&self) -> &LlamaServerConfig {
         &self.config
+    }
+
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        self.estimated_memory_bytes
+    }
+
+    pub fn tags(&self) -> &[String] {
+        &self.config.tags
+    }
+
+    pub fn port(&self) -> u16 {
+        self.config.port
     }
 
     pub fn subscribe(&self) -> watch::Receiver<SupervisorState> {
@@ -238,6 +258,14 @@ impl ProcessSupervisor {
     /// Spawn llama-server with Vulkan GPU offload if requested, automatically
     /// falling back to CPU mode if Vulkan runtime fails to initialize.
     pub async fn spawn_with_fallback(config: LlamaServerConfig) -> Result<Self, SupervisorError> {
+        Self::spawn_with_fallback_extra_footprint(config, 0).await
+    }
+
+    /// Spawn llama-server taking into account memory already committed to other active model slots.
+    pub async fn spawn_with_fallback_extra_footprint(
+        config: LlamaServerConfig,
+        existing_footprint_bytes: u64,
+    ) -> Result<Self, SupervisorError> {
         // Pre-flight check: Binary existence
         if !config.binary_path.exists() {
             // Also check if binary is in PATH
@@ -251,25 +279,23 @@ impl ProcessSupervisor {
             return Err(SupervisorError::ModelNotFound(config.model_path));
         }
 
-        // Pre-flight check: Android LMK 75% memory ceiling guard (for standalone mode)
-        if !config.is_distributed() {
-            let model_metadata = tokio::fs::metadata(&config.model_path).await?;
-            let model_size_bytes = model_metadata.len();
-            let sys_profile = SystemProfile::probe();
+        let model_metadata = tokio::fs::metadata(&config.model_path).await?;
+        let model_size_bytes = model_metadata.len();
+        let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
+        let this_footprint = model_size_bytes.saturating_add(kv_bytes);
+        let total_required = existing_footprint_bytes.saturating_add(this_footprint);
 
-            if !sys_profile.can_safely_load_pct(
-                model_size_bytes,
-                config.context_size,
-                config.memory_budget_percent,
-            ) {
-                let kv_bytes = SystemProfile::estimate_kv_cache_bytes(config.context_size);
-                let total_required = model_size_bytes + kv_bytes;
+        // Pre-flight check: Android LMK memory ceiling guard (for standalone mode)
+        if !config.is_distributed() {
+            let sys_profile = SystemProfile::probe();
+            let max_allowed = sys_profile
+                .max_allowed_memory_bytes_pct(config.memory_budget_percent);
+
+            if total_required > max_allowed {
                 return Err(SupervisorError::MemoryCapExceeded {
                     required_mb: total_required / (1024 * 1024),
                     available_mb: sys_profile.available_ram_mb,
-                    max_allowed_mb: sys_profile
-                        .max_allowed_memory_bytes_pct(config.memory_budget_percent)
-                        / (1024 * 1024),
+                    max_allowed_mb: max_allowed / (1024 * 1024),
                 });
             }
         }
@@ -315,6 +341,7 @@ impl ProcessSupervisor {
                                 client: http_client.clone(),
                                 state_tx,
                                 stderr_history: stderr_history.clone(),
+                                estimated_memory_bytes: this_footprint,
                             };
 
                             // Wait for /health endpoint readiness
@@ -369,6 +396,7 @@ impl ProcessSupervisor {
             client: http_client,
             state_tx,
             stderr_history,
+            estimated_memory_bytes: this_footprint,
         };
 
         if !supervisor.wait_until_ready(Duration::from_secs(20)).await {
@@ -626,14 +654,31 @@ impl Drop for ProcessSupervisor {
     }
 }
 
-/// Shared thread-safe handle to manage an active ProcessSupervisor instance.
+pub type SlotId = u16;
+
+/// Detailed status information for a model instance slotted in the supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorSlotInfo {
+    pub slot: SlotId,
+    pub model_name: String,
+    pub model_path: PathBuf,
+    pub port: u16,
+    pub tags: Vec<String>,
+    pub context_size: usize,
+    pub state: SupervisorState,
+    pub backend: AccelerationBackend,
+    pub memory_bytes: u64,
+}
+
+/// Shared thread-safe handle to manage multiple concurrent ProcessSupervisor instances.
 #[derive(Clone)]
 pub struct SupervisorManager {
-    inner: std::sync::Arc<tokio::sync::Mutex<Option<ProcessSupervisor>>>,
+    inner: std::sync::Arc<tokio::sync::Mutex<HashMap<SlotId, ProcessSupervisor>>>,
+    base_port: u16,
     policy: SupervisorPolicy,
     restart_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
     vulkan_fail_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    last_config: std::sync::Arc<tokio::sync::Mutex<Option<LlamaServerConfig>>>,
+    last_configs: std::sync::Arc<tokio::sync::Mutex<HashMap<SlotId, LlamaServerConfig>>>,
 }
 
 impl Default for SupervisorManager {
@@ -644,12 +689,17 @@ impl Default for SupervisorManager {
 
 impl SupervisorManager {
     pub fn new() -> Self {
+        Self::with_base_port(8080)
+    }
+
+    pub fn with_base_port(base_port: u16) -> Self {
         Self {
-            inner: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            base_port,
             policy: SupervisorPolicy::default(),
             restart_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             vulkan_fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            last_config: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            last_configs: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -665,34 +715,48 @@ impl SupervisorManager {
         self.policy.backoff_delay(attempt)
     }
 
-    /// True when a supervisor child process slot is occupied (may still be starting).
+    /// True when any supervisor child process slot is occupied (may still be starting).
     pub async fn is_running(&self) -> bool {
         let lock = self.inner.lock().await;
-        lock.is_some()
+        !lock.is_empty()
     }
 
     /// Non-async check for UI rendering (best-effort; treats a held lock as running).
     pub fn is_running_blocking(&self) -> bool {
         match self.inner.try_lock() {
-            Ok(guard) => guard.is_some(),
+            Ok(guard) => !guard.is_empty(),
             Err(_) => true,
         }
     }
 
-    /// Check if a supervisor child process is currently running and healthy.
+    /// Check if at least one supervisor child process is currently running and healthy.
     pub async fn is_healthy(&self) -> bool {
         let lock = self.inner.lock().await;
-        if let Some(sup) = lock.as_ref() {
+        if lock.is_empty() {
+            return false;
+        }
+        for sup in lock.values() {
+            if sup.is_healthy().await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a specific supervisor slot is healthy.
+    pub async fn is_slot_healthy(&self, slot: SlotId) -> bool {
+        let lock = self.inner.lock().await;
+        if let Some(sup) = lock.get(&slot) {
             sup.is_healthy().await
         } else {
             false
         }
     }
 
-    /// Return the active model path/name if currently running.
+    /// Return the active model path/name if currently running (primary/first slot).
     pub async fn active_model(&self) -> Option<String> {
         let lock = self.inner.lock().await;
-        lock.as_ref().map(|sup| {
+        lock.values().next().map(|sup| {
             sup.config()
                 .model_path
                 .file_name()
@@ -701,49 +765,147 @@ impl SupervisorManager {
         })
     }
 
-    /// Poll child process exit status. On exit, returns `(status, last_stderr_lines)`
-    /// and clears the supervisor slot.
+    /// Return all active model names mapped by their slot/port ID.
+    pub async fn active_models(&self) -> Vec<(SlotId, String)> {
+        let lock = self.inner.lock().await;
+        lock.iter()
+            .map(|(&slot, sup)| {
+                let name = sup
+                    .config()
+                    .model_path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "active_model".to_string());
+                (slot, name)
+            })
+            .collect()
+    }
+
+    /// Return structured information about all loaded supervisor slots.
+    pub async fn slots_info(&self) -> Vec<SupervisorSlotInfo> {
+        let lock = self.inner.lock().await;
+        lock.iter()
+            .map(|(&slot, sup)| {
+                let model_name = sup
+                    .config()
+                    .model_path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "active_model".to_string());
+                SupervisorSlotInfo {
+                    slot,
+                    model_name,
+                    model_path: sup.config().model_path.clone(),
+                    port: sup.config().port,
+                    tags: sup.config().tags.clone(),
+                    context_size: sup.config().context_size,
+                    state: sup.state(),
+                    backend: sup.active_backend(),
+                    memory_bytes: sup.estimated_memory_bytes(),
+                }
+            })
+            .collect()
+    }
+
+    /// Total memory in megabytes committed across all loaded models.
+    pub async fn total_memory_used_mb(&self) -> u64 {
+        let lock = self.inner.lock().await;
+        let bytes: u64 = lock.values().map(|s| s.estimated_memory_bytes()).sum();
+        bytes / (1024 * 1024)
+    }
+
+    /// Allocate an unused port for a new slot starting from base_port or preferred.
+    pub async fn allocate_port(&self, preferred_port: Option<u16>) -> u16 {
+        let lock = self.inner.lock().await;
+        if let Some(preferred) = preferred_port {
+            if preferred > 0 && !lock.contains_key(&preferred) {
+                return preferred;
+            }
+        }
+        let mut port = self.base_port;
+        while lock.contains_key(&port) {
+            port = port.saturating_add(1);
+        }
+        port
+    }
+
+    /// Poll child process exit status across all slots. On exit, returns `(status, last_stderr_lines)`
+    /// and removes the exited supervisor from the active map.
     pub async fn check_status(
         &self,
     ) -> Result<Option<(std::process::ExitStatus, Vec<String>)>, std::io::Error> {
         let mut lock = self.inner.lock().await;
-        if let Some(sup) = lock.as_mut() {
-            match sup.check_status()? {
-                Some(status) => {
-                    let lines = sup.last_stderr_lines();
-                    *lock = None;
-                    Ok(Some((status, lines)))
-                }
-                None => Ok(None),
+        let mut exited_slot = None;
+        let mut exit_details = None;
+
+        for (&slot, sup) in lock.iter_mut() {
+            if let Some(status) = sup.check_status()? {
+                let lines = sup.last_stderr_lines();
+                exited_slot = Some(slot);
+                exit_details = Some((status, lines));
+                break;
             }
-        } else {
-            Ok(None)
         }
+
+        if let Some(slot) = exited_slot {
+            lock.remove(&slot);
+        }
+
+        Ok(exit_details)
     }
 
-    /// Last stderr lines from the active supervisor, if any.
+    /// Last stderr lines from any active supervisor, if any.
     pub async fn last_stderr_lines(&self) -> Vec<String> {
         let lock = self.inner.lock().await;
-        lock.as_ref()
-            .map(|sup| sup.last_stderr_lines())
-            .unwrap_or_default()
+        for sup in lock.values() {
+            let lines = sup.last_stderr_lines();
+            if !lines.is_empty() {
+                return lines;
+            }
+        }
+        Vec::new()
     }
 
-    /// Spawn a new model supervisor, stopping any previously running instance.
+    /// Spawn a new model supervisor, assigning an available slot port.
     pub async fn spawn(&self, config: LlamaServerConfig) -> Result<(), SupervisorError> {
+        self.spawn_slot(config).await.map(|_| ())
+    }
+
+    /// Spawn a model supervisor in an available or requested slot, checking the cumulative
+    /// memory footprint across all active instances. Returns the allocated SlotId (port).
+    pub async fn spawn_slot(&self, mut config: LlamaServerConfig) -> Result<SlotId, SupervisorError> {
+        let existing_footprint: u64 = {
+            let lock = self.inner.lock().await;
+            lock.values().map(|s| s.estimated_memory_bytes()).sum()
+        };
+
+        let target_port = if config.port == 0 {
+            self.allocate_port(None).await
+        } else {
+            // Check if slot port already occupied; if so, stop it (hot swap on slot)
+            let mut lock = self.inner.lock().await;
+            if let Some(mut existing) = lock.remove(&config.port) {
+                let _ = existing.stop().await;
+            }
+            config.port
+        };
+        config.port = target_port;
+
+        let sup = ProcessSupervisor::spawn_with_fallback_extra_footprint(
+            config.clone(),
+            existing_footprint,
+        )
+        .await?;
+
         let mut lock = self.inner.lock().await;
-        if let Some(mut existing) = lock.take() {
-            let _ = existing.stop().await;
-        }
-        {
-            let mut last = self.last_config.lock().await;
-            *last = Some(config.clone());
-        }
-        let sup = ProcessSupervisor::spawn_with_fallback(config).await?;
-        *lock = Some(sup);
+        lock.insert(target_port, sup);
+
+        let mut configs = self.last_configs.lock().await;
+        configs.insert(target_port, config);
+
         self.restart_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Ok(target_port)
     }
 
     /// Restart the last config with backoff; demote GPU after repeated Vulkan failures.
@@ -760,13 +922,13 @@ impl SupervisorManager {
         let delay = self.policy.backoff_delay(attempt);
         tokio::time::sleep(delay).await;
 
-        let mut config = self
-            .last_config
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| SupervisorError::SpawnFailed("no prior config to restart".into()))?;
+        let config = {
+            let configs = self.last_configs.lock().await;
+            configs.values().next().cloned()
+        }
+        .ok_or_else(|| SupervisorError::SpawnFailed("no prior config to restart".into()))?;
 
+        let mut config = config;
         let vulkan_fails = self
             .vulkan_fail_count
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -775,7 +937,7 @@ impl SupervisorManager {
             config.gpu_layers = 0;
         }
 
-        self.spawn(config).await
+        self.spawn_slot(config).await.map(|_| ())
     }
 
     pub fn note_vulkan_failure(&self) {
@@ -783,25 +945,83 @@ impl SupervisorManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Stop the active model supervisor.
+    /// Stop all active model supervisors.
     pub async fn stop(&self) -> Result<(), SupervisorError> {
         let mut lock = self.inner.lock().await;
-        if let Some(mut existing) = lock.take() {
-            existing.stop().await?;
+        for (_, mut existing) in lock.drain() {
+            let _ = existing.stop().await;
         }
         Ok(())
     }
 
-    /// Subscribe to supervisor state transitions for UI phase labels.
-    pub async fn subscribe(&self) -> Option<watch::Receiver<SupervisorState>> {
-        let lock = self.inner.lock().await;
-        lock.as_ref().map(|sup| sup.subscribe())
+    /// Stop a specific supervisor slot.
+    pub async fn stop_slot(&self, slot: SlotId) -> Result<bool, SupervisorError> {
+        let mut lock = self.inner.lock().await;
+        if let Some(mut existing) = lock.remove(&slot) {
+            existing.stop().await?;
+            let mut configs = self.last_configs.lock().await;
+            configs.remove(&slot);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    /// Current supervisor state, if a child is slotted.
+    /// Stop a model matching a model name, path, or port string.
+    pub async fn stop_model(&self, target: &str) -> Result<bool, SupervisorError> {
+        let mut lock = self.inner.lock().await;
+        let matched_slot = lock.iter().find_map(|(&slot, sup)| {
+            let model_name = sup
+                .config()
+                .model_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let path_str = sup.config().model_path.to_string_lossy();
+            if model_name == target
+                || path_str == target
+                || slot.to_string() == target
+                || target.ends_with(&model_name)
+            {
+                Some(slot)
+            } else {
+                None
+            }
+        });
+
+        if let Some(slot) = matched_slot {
+            if let Some(mut existing) = lock.remove(&slot) {
+                existing.stop().await?;
+                let mut configs = self.last_configs.lock().await;
+                configs.remove(&slot);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Subscribe to supervisor state transitions for the primary active slot.
+    pub async fn subscribe(&self) -> Option<watch::Receiver<SupervisorState>> {
+        let lock = self.inner.lock().await;
+        lock.values().next().map(|sup| sup.subscribe())
+    }
+
+    /// Subscribe to supervisor state transitions for a specific slot.
+    pub async fn subscribe_slot(&self, slot: SlotId) -> Option<watch::Receiver<SupervisorState>> {
+        let lock = self.inner.lock().await;
+        lock.get(&slot).map(|sup| sup.subscribe())
+    }
+
+    /// Current supervisor state for the primary active slot.
     pub async fn state(&self) -> Option<SupervisorState> {
         let lock = self.inner.lock().await;
-        lock.as_ref().map(|sup| sup.state())
+        lock.values().next().map(|sup| sup.state())
+    }
+
+    /// Current supervisor state for a specific slot.
+    pub async fn state_for_slot(&self, slot: SlotId) -> Option<SupervisorState> {
+        let lock = self.inner.lock().await;
+        lock.get(&slot).map(|sup| sup.state())
     }
 }
 

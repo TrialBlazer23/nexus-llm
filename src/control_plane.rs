@@ -8,7 +8,20 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const CONTROL_PLANE_VERSION: u16 = 1;
-pub const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024;
+pub const MAX_CONTROL_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Information about a model loaded in a supervisor slot on a node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoadedModelInfo {
+    pub model: String,
+    pub endpoint: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub ctx_remaining: usize,
+    #[serde(default)]
+    pub memory_mb: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlPlaneState {
@@ -21,6 +34,8 @@ pub struct ControlPlaneState {
     pub rpc_ready: bool,
     pub allocatable_memory_mb: u64,
     pub active_model: Option<String>,
+    #[serde(default)]
+    pub loaded_models: Vec<LoadedModelInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_public_key: Option<String>,
 }
@@ -123,8 +138,45 @@ pub async fn build_control_plane_state(
     rpc_ready: bool,
     signing_public_key: Option<String>,
 ) -> ControlPlaneState {
+    build_control_plane_state_with_host(
+        node_id,
+        role,
+        capabilities,
+        manager,
+        allocatable_memory_mb,
+        rpc_ready,
+        signing_public_key,
+        "127.0.0.1",
+    )
+    .await
+}
+
+/// Build a control-plane state snapshot with explicit api_host for loaded model endpoints.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_control_plane_state_with_host(
+    node_id: Uuid,
+    role: NodeRole,
+    capabilities: Vec<String>,
+    manager: &crate::supervisor::SupervisorManager,
+    allocatable_memory_mb: u64,
+    rpc_ready: bool,
+    signing_public_key: Option<String>,
+    api_host: &str,
+) -> ControlPlaneState {
     let healthy = manager.is_healthy().await;
     let active_model = manager.active_model().await;
+    let slots = manager.slots_info().await;
+    let loaded_models = slots
+        .into_iter()
+        .map(|slot| LoadedModelInfo {
+            model: slot.model_name,
+            endpoint: format!("http://{}:{}", api_host, slot.port),
+            tags: slot.tags,
+            ctx_remaining: slot.context_size,
+            memory_mb: slot.memory_bytes / (1024 * 1024),
+        })
+        .collect();
+
     ControlPlaneState {
         node_id,
         protocol_version: CONTROL_PLANE_VERSION,
@@ -135,6 +187,7 @@ pub async fn build_control_plane_state(
         rpc_ready,
         allocatable_memory_mb,
         active_model,
+        loaded_models,
         signing_public_key,
     }
 }
@@ -389,6 +442,10 @@ pub struct ModelLoadRequest {
     pub gpu_layers: u32,
     pub threads: usize,
     pub rpc_workers: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub target_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -413,6 +470,104 @@ pub struct ModelUnloadResponse {
     pub success: bool,
     pub message: String,
 }
+
+/// Request envelope for model-to-model task delegation over the agent bus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTaskMessage {
+    pub protocol_version: u16,
+    pub task_id: Uuid,
+    pub from_node: Uuid,
+    pub to_route: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+/// Response returned by the agent bus for a delegated task.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentTaskResponse {
+    pub protocol_version: u16,
+    pub task_id: Uuid,
+    pub success: bool,
+    pub status: crate::task::TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Request to store a document chunk into a node's Knowledge Base.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbStoreRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub document_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub content: String,
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// Response returned after storing a chunk into the Knowledge Base.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbStoreResponse {
+    pub protocol_version: u16,
+    pub success: bool,
+    pub chunk_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Request to query relevant knowledge chunks from a node's Knowledge Base.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbQueryRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+    pub query: String,
+    #[serde(default = "default_query_limit")]
+    pub limit: usize,
+}
+
+fn default_query_limit() -> usize {
+    5
+}
+
+/// Individual chunk result returned from a Knowledge Base query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KbQueryResultItem {
+    pub chunk_id: String,
+    pub document_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub content: String,
+    pub score: f32,
+}
+
+/// Response envelope containing Knowledge Base query search results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KbQueryResponse {
+    pub protocol_version: u16,
+    pub success: bool,
+    pub results: Vec<KbQueryResultItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Request to retrieve a node's Knowledge Base sync manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbManifestRequest {
+    pub protocol_version: u16,
+    pub requester_id: Uuid,
+}
+
+/// Response containing a node's Knowledge Base sync manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbManifestResponse {
+    pub protocol_version: u16,
+    pub manifest: crate::kb::sync::KbSyncManifest,
+}
+
 
 pub async fn dispatch_load_model(
     client: &reqwest::Client,
@@ -518,6 +673,319 @@ pub async fn dispatch_unload_model_signed(
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
 
+pub async fn dispatch_agent_message(
+    client: &reqwest::Client,
+    base_url: &str,
+    msg: &AgentTaskMessage,
+) -> Result<AgentTaskResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/agent/message");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(60))
+        .json(msg)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_agent_message_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    msg: &AgentTaskMessage,
+    identity: &NodeIdentity,
+) -> Result<AgentTaskResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(msg)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/agent/message",
+        &body,
+        Some(identity),
+        msg.from_node,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_store(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbStoreRequest,
+) -> Result<KbStoreResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/kb/store");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(10))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_store_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbStoreRequest,
+    identity: &NodeIdentity,
+) -> Result<KbStoreResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/kb/store",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_query(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbQueryRequest,
+) -> Result<KbQueryResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/kb/query");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(10))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_query_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbQueryRequest,
+    identity: &NodeIdentity,
+) -> Result<KbQueryResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/kb/query",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_manifest(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbManifestRequest,
+) -> Result<KbManifestResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/kb/sync/manifest");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(10))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_manifest_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &KbManifestRequest,
+    identity: &NodeIdentity,
+) -> Result<KbManifestResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/kb/sync/manifest",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_pull(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &crate::kb::sync::KbSyncPullRequest,
+) -> Result<crate::kb::sync::KbSyncPullResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/kb/sync/pull");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(15))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_pull_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &crate::kb::sync::KbSyncPullRequest,
+    identity: &NodeIdentity,
+) -> Result<crate::kb::sync::KbSyncPullResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/kb/sync/pull",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_push(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &crate::kb::sync::KbSyncPushRequest,
+) -> Result<crate::kb::sync::KbSyncPushResponse, ControlPlaneError> {
+    let mut url = Url::parse(base_url)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))?;
+    url.set_path("/nexus/control/v1/kb/sync/push");
+    let response = client
+        .post(url)
+        .timeout(Duration::from_secs(15))
+        .json(request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+pub async fn dispatch_kb_push_signed(
+    client: &reqwest::Client,
+    base_url: &str,
+    request: &crate::kb::sync::KbSyncPushRequest,
+    identity: &NodeIdentity,
+) -> Result<crate::kb::sync::KbSyncPushResponse, ControlPlaneError> {
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let response = signed_post_bytes(
+        client,
+        base_url,
+        "/nexus/control/v1/kb/sync/push",
+        &body,
+        Some(identity),
+        request.requester_id,
+    )
+    .await?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+        return Err(ControlPlaneError::ResponseTooLarge {
+            limit: MAX_CONTROL_RESPONSE_BYTES,
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
+}
+
+
 pub async fn handle_load_model(
     manager: &crate::supervisor::SupervisorManager,
     request: &ModelLoadRequest,
@@ -568,11 +1036,12 @@ pub async fn handle_load_model(
         extra_args.push("layer".to_string());
     }
 
+    let port = request.target_port.unwrap_or(api_port);
     let config = crate::supervisor::LlamaServerConfig {
         binary_path: binary_path.to_path_buf(),
         model_path,
         host: api_host.to_string(),
-        port: api_port,
+        port,
         gpu_layers: request.gpu_layers,
         threads: request.threads,
         context_size: request.context_size,
@@ -584,14 +1053,15 @@ pub async fn handle_load_model(
         cache_type_k: None,
         cache_type_v: None,
         memory_budget_percent,
+        tags: request.tags.clone(),
     };
 
-    match manager.spawn(config).await {
-        Ok(()) => ModelLoadResponse {
+    match manager.spawn_slot(config).await {
+        Ok(slot_port) => ModelLoadResponse {
             protocol_version: CONTROL_PLANE_VERSION,
             success: true,
             active_model: model_name,
-            api_endpoint: format!("http://{}:{}", api_host, api_port),
+            api_endpoint: format!("http://{}:{}", api_host, slot_port),
             error_message: None,
         },
         Err(e) => ModelLoadResponse {
@@ -606,10 +1076,15 @@ pub async fn handle_load_model(
 
 pub async fn handle_unload_model(
     manager: &crate::supervisor::SupervisorManager,
-    _request: &ModelUnloadRequest,
+    request: &ModelUnloadRequest,
 ) -> ModelUnloadResponse {
-    match manager.stop().await {
-        Ok(()) => ModelUnloadResponse {
+    let result = if let Some(target) = &request.model_path {
+        manager.stop_model(target).await
+    } else {
+        manager.stop().await.map(|_| true)
+    };
+    match result {
+        Ok(_) => ModelUnloadResponse {
             protocol_version: CONTROL_PLANE_VERSION,
             success: true,
             message: "Model unloaded successfully".to_string(),
@@ -621,3 +1096,329 @@ pub async fn handle_unload_model(
         },
     }
 }
+
+pub async fn handle_agent_message(
+    task_store: &crate::task::TaskStore,
+    manager: &crate::supervisor::SupervisorManager,
+    request: &AgentTaskMessage,
+    api_host: &str,
+) -> AgentTaskResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return AgentTaskResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            task_id: request.task_id,
+            success: false,
+            status: crate::task::TaskStatus::Failed,
+            output: None,
+            error: Some(format!(
+                "protocol mismatch: expected {}, got {}",
+                CONTROL_PLANE_VERSION, request.protocol_version
+            )),
+        };
+    }
+
+    // Record incoming task in durable TaskStore
+    let _ = task_store.create_task(
+        request.task_id,
+        request.from_node,
+        &request.to_route,
+        &request.prompt,
+    );
+    let _ = task_store.update_status(request.task_id, crate::task::TaskStatus::Running);
+
+    // Look for an active slot matching route tag or model name
+    let slots = manager.slots_info().await;
+    let target_slot = slots
+        .iter()
+        .find(|s| {
+            s.tags.iter().any(|t| t.eq_ignore_ascii_case(&request.to_route))
+                || s.model_name.to_lowercase().contains(&request.to_route.to_lowercase())
+        })
+        .or_else(|| slots.first());
+
+    let response = if let Some(slot) = target_slot {
+        let endpoint = format!("http://{}:{}/v1/chat/completions", api_host, slot.port);
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "model": slot.model_name,
+            "messages": [
+                {"role": "user", "content": &request.prompt}
+            ],
+            "stream": false
+        });
+
+        match client
+            .post(&endpoint)
+            .timeout(Duration::from_secs(30))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(val) => {
+                        let text = val
+                            .get("choices")
+                            .and_then(|c| c.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|txt| txt.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let _ = task_store.complete_task(request.task_id, &text);
+                        AgentTaskResponse {
+                            protocol_version: CONTROL_PLANE_VERSION,
+                            task_id: request.task_id,
+                            success: true,
+                            status: crate::task::TaskStatus::Completed,
+                            output: Some(text),
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("failed to parse model completion: {}", e);
+                        let _ = task_store.fail_task(request.task_id, &err_msg);
+                        AgentTaskResponse {
+                            protocol_version: CONTROL_PLANE_VERSION,
+                            task_id: request.task_id,
+                            success: false,
+                            status: crate::task::TaskStatus::Failed,
+                            output: None,
+                            error: Some(err_msg),
+                        }
+                    }
+                }
+            }
+            Ok(resp) => {
+                let err_msg = format!("model endpoint returned HTTP status {}", resp.status());
+                let _ = task_store.fail_task(request.task_id, &err_msg);
+                AgentTaskResponse {
+                    protocol_version: CONTROL_PLANE_VERSION,
+                    task_id: request.task_id,
+                    success: false,
+                    status: crate::task::TaskStatus::Failed,
+                    output: None,
+                    error: Some(err_msg),
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("failed to reach model slot on port {}: {}", slot.port, e);
+                let _ = task_store.fail_task(request.task_id, &err_msg);
+                AgentTaskResponse {
+                    protocol_version: CONTROL_PLANE_VERSION,
+                    task_id: request.task_id,
+                    success: false,
+                    status: crate::task::TaskStatus::Failed,
+                    output: None,
+                    error: Some(err_msg),
+                }
+            }
+        }
+    } else {
+        // No active slot found; record as accepted / completed with route message
+        let msg = format!(
+            "Task accepted by node but no active model slot currently matches route '{}'",
+            request.to_route
+        );
+        let _ = task_store.update_status(request.task_id, crate::task::TaskStatus::Pending);
+        AgentTaskResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            task_id: request.task_id,
+            success: true,
+            status: crate::task::TaskStatus::Pending,
+            output: Some(msg),
+            error: None,
+        }
+    };
+
+    // If reply_to callback URL was specified, dispatch the response asynchronously
+    if let Some(reply_url) = &request.reply_to {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(reply_url)
+            .timeout(Duration::from_secs(5))
+            .json(&response)
+            .send()
+            .await;
+    }
+
+    response
+}
+
+pub async fn handle_kb_store(
+    store: &crate::kb::KnowledgeStore,
+    request: &KbStoreRequest,
+) -> KbStoreResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return KbStoreResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            chunk_id: String::new(),
+            error_message: Some(format!(
+                "protocol mismatch: expected {}, got {}",
+                CONTROL_PLANE_VERSION, request.protocol_version
+            )),
+        };
+    }
+
+    match store.store_chunk(
+        &request.document_id,
+        request.title.as_deref(),
+        &request.content,
+        request.metadata.clone(),
+        None,
+    ) {
+        Ok(chunk) => KbStoreResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: true,
+            chunk_id: chunk.chunk_id,
+            error_message: None,
+        },
+        Err(e) => KbStoreResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            chunk_id: String::new(),
+            error_message: Some(e.to_string()),
+        },
+    }
+}
+
+pub async fn handle_kb_query(
+    store: &crate::kb::KnowledgeStore,
+    request: &KbQueryRequest,
+) -> KbQueryResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return KbQueryResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            results: Vec::new(),
+            error_message: Some(format!(
+                "protocol mismatch: expected {}, got {}",
+                CONTROL_PLANE_VERSION, request.protocol_version
+            )),
+        };
+    }
+
+    let chunks = match store.list_chunks() {
+        Ok(c) => c,
+        Err(e) => {
+            return KbQueryResponse {
+                protocol_version: CONTROL_PLANE_VERSION,
+                success: false,
+                results: Vec::new(),
+                error_message: Some(e.to_string()),
+            };
+        }
+    };
+
+    let ranked = crate::kb::vector::rank_chunks(None, &request.query, &chunks, request.limit, 0.0);
+    let results = ranked
+        .into_iter()
+        .map(|r| KbQueryResultItem {
+            chunk_id: r.item.chunk_id,
+            document_id: r.item.document_id,
+            title: r.item.title,
+            content: r.item.content,
+            score: r.score,
+        })
+        .collect();
+
+    KbQueryResponse {
+        protocol_version: CONTROL_PLANE_VERSION,
+        success: true,
+        results,
+        error_message: None,
+    }
+}
+
+pub async fn handle_kb_manifest(
+    store: &crate::kb::KnowledgeStore,
+    node_id: Uuid,
+    request: &KbManifestRequest,
+) -> KbManifestResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return KbManifestResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            manifest: crate::kb::sync::KbSyncManifest {
+                protocol_version: CONTROL_PLANE_VERSION,
+                node_id,
+                chunks: Vec::new(),
+                personas: Vec::new(),
+                memories: Vec::new(),
+            },
+        };
+    }
+
+    let manifest = crate::kb::sync::generate_manifest(store, node_id).unwrap_or_else(|_| {
+        crate::kb::sync::KbSyncManifest {
+            protocol_version: CONTROL_PLANE_VERSION,
+            node_id,
+            chunks: Vec::new(),
+            personas: Vec::new(),
+            memories: Vec::new(),
+        }
+    });
+
+    KbManifestResponse {
+        protocol_version: CONTROL_PLANE_VERSION,
+        manifest,
+    }
+}
+
+pub async fn handle_kb_pull(
+    store: &crate::kb::KnowledgeStore,
+    request: &crate::kb::sync::KbSyncPullRequest,
+) -> crate::kb::sync::KbSyncPullResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return crate::kb::sync::KbSyncPullResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            chunks: Vec::new(),
+            personas: Vec::new(),
+            memories: Vec::new(),
+        };
+    }
+
+    crate::kb::sync::apply_pull(store, request).unwrap_or_else(|_| {
+        crate::kb::sync::KbSyncPullResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            chunks: Vec::new(),
+            personas: Vec::new(),
+            memories: Vec::new(),
+        }
+    })
+}
+
+pub async fn handle_kb_push(
+    store: &crate::kb::KnowledgeStore,
+    request: &crate::kb::sync::KbSyncPushRequest,
+) -> crate::kb::sync::KbSyncPushResponse {
+    if request.protocol_version != CONTROL_PLANE_VERSION {
+        return crate::kb::sync::KbSyncPushResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            accepted_chunks: 0,
+            accepted_personas: 0,
+            accepted_memories: 0,
+            error_message: Some(format!(
+                "protocol mismatch: expected {}, got {}",
+                CONTROL_PLANE_VERSION, request.protocol_version
+            )),
+        };
+    }
+
+    crate::kb::sync::apply_push(store, request).unwrap_or_else(|e| {
+        crate::kb::sync::KbSyncPushResponse {
+            protocol_version: CONTROL_PLANE_VERSION,
+            success: false,
+            accepted_chunks: 0,
+            accepted_personas: 0,
+            accepted_memories: 0,
+            error_message: Some(e.to_string()),
+        }
+    })
+}
+
+
+

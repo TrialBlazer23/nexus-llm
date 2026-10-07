@@ -1,7 +1,10 @@
+pub mod agents_view;
+pub mod badges;
 pub mod chat;
 pub mod cluster_view;
 pub mod dashboard;
 pub mod hub;
+pub mod logs_view;
 pub mod markdown;
 pub mod models;
 pub mod models_view;

@@ -177,6 +177,8 @@ async fn control_plane_rejects_unsigned_load_when_pairing_enforced() {
             gpu_layers: 0,
             threads: 2,
             rpc_workers: vec![],
+            tags: vec![],
+            target_port: None,
         },
     )
     .await
@@ -232,6 +234,8 @@ async fn pairing_grants_remote_load() {
         gpu_layers: 0,
         threads: 2,
         rpc_workers: vec![],
+        tags: vec![],
+        target_port: None,
     };
     let load = dispatch_load_model_signed(&client, &base, &load_req, &client_trust.identity)
         .await

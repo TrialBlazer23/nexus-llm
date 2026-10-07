@@ -129,7 +129,7 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
     SettingItem {
         category: "Network & Transport",
         name: "Mesh Gateway Port",
-        description: "OpenAI-compatible mesh front door (default: 8081)",
+        description: "OpenAI-compatible mesh front door (default: 8090)",
         setting_type: SettingType::GatewayPort,
     },
     SettingItem {

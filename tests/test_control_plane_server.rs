@@ -147,7 +147,7 @@ async fn control_plane_http_rejects_unknown_route() {
 fn default_network_control_port_is_distinct() {
     let config = nexus::config::NexusConfig::default();
     assert_eq!(config.network.control_port, 9998);
-    assert_eq!(config.network.gateway_port, 8081);
+    assert_eq!(config.network.gateway_port, 8090);
     assert_ne!(config.network.control_port, config.network.api_port);
     assert_ne!(config.network.control_port, config.network.discovery_port);
     assert_ne!(config.network.gateway_port, config.network.api_port);

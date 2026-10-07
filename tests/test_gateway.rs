@@ -398,7 +398,7 @@ fn model_matches_unit() {
 #[test]
 fn gateway_port_defaults_and_validation() {
     let cfg = NexusConfig::default();
-    assert_eq!(cfg.network.gateway_port, 8081);
+    assert_eq!(cfg.network.gateway_port, 8090);
     assert!(cfg.network.gateway_enabled);
     assert_ne!(cfg.network.gateway_port, cfg.network.api_port);
     assert_ne!(cfg.network.gateway_port, cfg.network.control_port);

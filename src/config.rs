@@ -637,7 +637,7 @@ fn default_control_port() -> u16 {
 }
 
 fn default_gateway_port() -> u16 {
-    8081
+    8090
 }
 
 fn default_discovery_port() -> u16 {

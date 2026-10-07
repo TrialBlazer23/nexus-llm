@@ -8,7 +8,7 @@
 **Implementation status (2026-10-07):** Phases 7–9 (mesh + trust), Phase 8 TUI,
 Phase 10 (model store), Phase 11 (placement), and Continuous (CI / Penryn /
 fake llama) are **Done** on `main`. **Phase 12 §5.1 mesh gateway MVP** ships on
-`cursor/phase12-mesh-gateway-5f3d` (`network.gateway_port` 8081,
+`cursor/phase12-mesh-gateway-5f3d` (`network.gateway_port` 8090,
 `src/gateway.rs`). Remaining Phase 12 items (§5.2–§5.6) and hub rebind collapse
 are follow-ons. Historical findings below are preserved; status markers call out
 what is done vs still open.
@@ -46,7 +46,7 @@ inert — are mechanically reproducible:
 | Placement intelligence | **Done on branch** — Phase 11 | `src/cluster/{memory,split,rank}.rs`, `gguf.rs`, `supervisor.rs` |
 | Model store / LAN transfer | **Done — Phase 10** | `src/store.rs`, blob routes, hardened `downloader.rs`, Models `[D]`/`[T]`/`[S]` |
 | Placement intelligence | **Done — Phase 11** | `src/cluster/{memory,split,rank}.rs` |
-| Mesh OpenAI gateway (`gateway_port` 8081) | **MVP Done — Phase 12 §5.1** | `src/gateway.rs`; hub/nexusd/host; Settings + doctor |
+| Mesh OpenAI gateway (`gateway_port` 8090) | **MVP Done — Phase 12 §5.1** | `src/gateway.rs`; hub/nexusd/host; Settings + doctor |
 
 ---
 
@@ -1021,7 +1021,7 @@ the program can do. Roughly ordered by value per unit of work.
 ### 5.1 A mesh gateway: one endpoint, any node, any client
 
 > **Status (2026-10-07): MVP Done on `cursor/phase12-mesh-gateway-5f3d`.**
-> Dedicated `network.gateway_port` (default 8081) + `gateway_enabled` serves
+> Dedicated `network.gateway_port` (default 8090) + `gateway_enabled` serves
 > OpenAI `/health`, `/v1/models`, and byte-stream proxied `/v1/chat/completions`.
 > Resolves `model` → local supervisor/discovery `active_model` or trusted peer
 > holder; inbound `/v1` stays unauthenticated (LAN posture); pairing restricts
@@ -1264,13 +1264,13 @@ options with predicted tokens per second; a 32 GB worker can advertise more than
 
 > **Status (2026-10-07): §5.1 MVP in progress/shipped on
 > `cursor/phase12-mesh-gateway-5f3d`.** Mesh OpenAI gateway on `gateway_port`
-> 8081 (`src/gateway.rs`). Remaining backlog (§5.2–§5.6) and hub rebind
+> 8090 (`src/gateway.rs`). Remaining backlog (§5.2–§5.6) and hub rebind
 > collapse are follow-on PRs. Out of scope for this track: beacon v2 `ctrl`/
 > display name, control-plane SSE `/events`, Tunnel hub tab, closing stale
 > draft PRs #9–#12.
 
 - ~~Mesh gateway: one OpenAI-compatible endpoint fronting the whole mesh (§5.1)~~
-  **MVP Done** (`gateway_port` 8081; fake-llama multi-holder CI coverage)
+  **MVP Done** (`gateway_port` 8090; fake-llama multi-holder CI coverage)
 - Prompt cache reuse and session restore (§5.2, §2.8) — follow-on
 - Speculative decoding with a draft model (§5.3) — follow-on
 - Thermal, power, and battery-aware scheduling (§5.4) — follow-on

@@ -1,6 +1,6 @@
 //! OpenAI-compatible mesh gateway (Phase 12 §5.1).
 //!
-//! Binds `network.gateway_port` (default 8081) and reverse-proxies
+//! Binds `network.gateway_port` (default 8090) and reverse-proxies
 //! `/v1/chat/completions` to whichever mesh node currently holds the
 //! requested model. Distinct from `api_port` (llama-server) and
 //! `control_port` (signed control plane).

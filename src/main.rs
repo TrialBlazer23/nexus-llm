@@ -591,7 +591,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Expected SHA-256:      {}", hash);
             }
 
-            let downloader = ModelDownloader::new();
+            let config = NexusConfig::load().unwrap_or_default();
+            let hf_token = config.resolved_hf_token();
+            let downloader = ModelDownloader::new().with_hf_token(hf_token);
             downloader
                 .download(&url, &output, sha256.as_deref(), |prog| {
                     let speed_mb = prog.speed_bytes_per_sec / (1024.0 * 1024.0);

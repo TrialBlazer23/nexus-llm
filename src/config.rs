@@ -38,6 +38,9 @@ pub struct NexusConfig {
 
     #[serde(default)]
     pub ui: UiConfig,
+
+    #[serde(default)]
+    pub huggingface: HuggingFaceConfig,
 }
 
 impl NexusConfig {
@@ -124,6 +127,46 @@ impl NexusConfig {
         let id = self.node.id.trim();
         let short = if id.len() >= 8 { &id[..8] } else { id };
         format!("nexus-{}", short)
+    }
+
+    /// Resolve Hugging Face Personal Access Token.
+    /// Checks hierarchy:
+    /// 1. Explicitly configured token in `config.toml` (`[huggingface] token`)
+    /// 2. `HF_TOKEN` environment variable
+    /// 3. `HUGGING_FACE_HUB_TOKEN` environment variable
+    /// 4. Standard CLI cache file at `~/.cache/huggingface/token`
+    pub fn resolved_hf_token(&self) -> Option<String> {
+        if let Some(tok) = &self.huggingface.token {
+            let t = tok.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Ok(tok) = std::env::var("HF_TOKEN") {
+            let t = tok.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Ok(tok) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
+            let t = tok.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let path = Path::new(&home)
+                .join(".cache")
+                .join("huggingface")
+                .join("token");
+            if let Ok(content) = fs::read_to_string(path) {
+                let t = content.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        None
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -591,6 +634,13 @@ impl Default for UiConfig {
             layout_mode: default_layout_mode(),
         }
     }
+}
+
+/// Hugging Face hub integration settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HuggingFaceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 // Default helper functions

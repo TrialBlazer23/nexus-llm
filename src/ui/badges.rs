@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn test_badge_spans_and_cells() {
         assert_eq!(BADGE_OK.label, "[OK]");
-        assert!(BADGE_OK.bold);
+        const { assert!(BADGE_OK.bold) };
         let span = BADGE_OK.span();
         assert_eq!(span.content, "[OK]");
 

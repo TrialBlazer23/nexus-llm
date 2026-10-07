@@ -25,6 +25,46 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-07 — Phase 4: Models Tab Explorer, Sharded GGUF Aggregation, & Sequential Download Queue
+- Category: design-decision | bug
+- Context: Implementing Models tab dual-mode navigation (Local vs HF Explorer), multi-shard GGUF grouping, and automated sequential shard download queueing.
+- Finding:
+  1. **Primary shard path preservation**: When aggregating multi-part split GGUFs (`*-00001-of-*.gguf`) into unified catalog rows with combined sizes, the representative `path` stored in `ModelEntry.path` must always point to the first shard (`00001-of-*`), because llama.cpp's `llama-server` requires the path to shard 1 in order to automatically resolve and stream subsequent shards into memory.
+  2. **Automated sequential multi-shard queue**: Downloading multi-part models over network connections is most reliable when serialized rather than parallelized on mobile ARM64/Termux targets. Streaming sibling shards sequentially through `HubCommand::StartDownloadGroup` preserves connection stability, enables atomic progress reporting (`[1/3] Downloading shard-1...`), and ensures `.part` resume state is cleanly preserved if cancelled.
+  3. **Input mode protection against periodic background ticks**: In dual-mode TUI tabs where one mode accepts text input (search query), `modal_open` in the hub event loop must guard against background ticks while `hf_is_searching` is active. Otherwise, periodic catalog/peer refreshes will steal focus, reset selection indices, or trigger unwanted key aliases.
+- Action: Implemented `parse_shard_info`, `aggregate_model_entries`, `ModelsTabMode` dual-mode rendering, `HubCommand::StartDownloadGroup`, and comprehensive unit/integration test coverage.
+- Verification: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`.
+
+## 2026-10-07 — Phase 3: Hugging Face API Client, Quant Resolution, & Modal Vertical Height Clipping
+- Category: design-decision | bug
+- Context: Implementing Hugging Face model resolution, GGUF quant picker with memory fit badges, and interactive token recovery modal.
+- Finding:
+  1. **Smart repo vs direct file URL detection**: Distinguishing bare repo IDs (`owner/repo`), repo URLs (`https://huggingface.co/owner/repo`), and direct file URLs (`.../resolve/...`) allows the single `[D] Download` entry point to serve both direct downloads and repo exploration seamlessly without separate prompts.
+  2. **Ratatui popup percentage clipping**: When rendering text paragraphs inside modal popups sized with `centered_rect(percent_x, percent_y, area)`, `percent_y` must account for terminal height (e.g. 35 rows) and border padding (2 rows). Setting `percent_y = 24` gives only 8 rows total, leaving 6 visible interior lines. An 8-line paragraph will silently clip bottom lines (such as action buttons or hints). Setting `percent_y >= 40` ensures comfortable rendering across all desktop and standard terminal resolutions.
+  3. **HTTP Header Case Normalization**: Reqwest normalizes header names case-insensitively. In mock HTTP test listeners, inspecting raw incoming request buffers must use `to_ascii_lowercase()` when matching header lines like `authorization: bearer ...`.
+- Action: Implemented `HfClient` with `with_base_url` for mock testing, quant extraction, memory fit calculation, repo resolution in `commands.rs`, and adjusted popup sizing in `HubApp`.
+- Verification: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`.
+
+## 2026-10-07 — Phase 2: Non-Blocking Hub Download Worker & Multi-Shard Deletion Cleanup
+- Category: design-decision | bug
+- Context: Implementing in-TUI model deletion ([X]/[Delete] with confirmation modal) and interactive download cancellation ([Esc]/[C] with resume preservation).
+- Finding:
+  1. **Non-blocking command worker**: Previously, `spawn_hub_worker` awaited `run_download` synchronously inside its command processing loop. This froze the command receiver, making it impossible to process `HubCommand::CancelDownload` or UI requests while a download was active. Spawning downloads on a separate task and using `tokio::sync::watch::channel` allows instant cancellation signaling while keeping the command bus responsive.
+  2. **Multi-shard and sidecar cleanup**: Multi-part models (e.g. `*-00001-of-00003.gguf`) must be detected and deleted as an atomic group along with any `.part` and `.part.json` sidecars to prevent multi-gigabyte disk leaks.
+  3. **Download cancellation state preservation**: On receiving a cancellation signal, the downloader must gracefully flush its `BufWriter` and retain `.part` and `.part.json` so that subsequent download attempts immediately resume via HTTP Range requests (`Range: bytes=offset-`).
+- Action: Implemented `download_with_cancellation`, `detect_model_shards`, `run_delete_model`, delete confirmation modal with active model protection in `HubApp`, and added integration tests verifying cancellation, resume, and shard cleanup.
+- Verification: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`.
+
+## 2026-10-07 — Hugging Face Token Authentication Isolation & Clippy Const Block Assertions
+- Category: design-decision | bug
+- Context: Adding Hugging Face token support to `NexusConfig`, `SettingsView`, and `ModelDownloader` for authenticated downloads of gated/private models.
+- Finding:
+  1. **Credential isolation**: Injecting `Authorization: Bearer <token>` indiscriminately into all HTTP GET requests would leak user tokens to third-party CDNs, LAN peers, and custom mirrors. Restricting bearer headers to `*.huggingface.co` and `*.hf.co` ensures security while letting redirect handlers strip auth before hitting signed S3 CDN URLs.
+  2. **Resolution hierarchy**: Checking `config.toml` -> `HF_TOKEN` -> `HUGGING_FACE_HUB_TOKEN` -> `~/.cache/huggingface/token` allows zero-friction interoperability for users with existing `huggingface-cli login` installations.
+  3. **Rust 1.99 Clippy const block assertion**: Running `assert!(CONST_STRUCT.field)` triggers `clippy::assertions-on-constants`, while changing it to `assert_eq!(CONST_STRUCT.field, true)` triggers `clippy::bool_assert_comparison`. In modern Rust (1.79+), the idiomatic fix is `const { assert!(CONST_STRUCT.field) };`.
+- Action: Implemented `resolved_hf_token()` hierarchy, `is_huggingface_url` domain filtering, masked token display in Settings view, and applied `const { assert!(..) }` in tests.
+- Verification: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`.
+
 ## 2026-10-07 — Mobile Responsive TUI Layout & Ratatui Sub-Area Sizing Gotcha
 - Category: design-decision | bug
 - Context: Responsive TUI redesign for mobile screens (Termux ARM64 / narrow terminal emulators) where width < 85 or height < 24 caused horizontal and vertical clipping.

@@ -32,7 +32,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Tabs},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Tabs},
     Frame, Terminal,
 };
 use std::io::stdout;
@@ -199,6 +199,23 @@ pub struct HotSwapIntent {
     pub extra_args: Vec<String>,
 }
 
+/// State for Hugging Face quant selection modal (Phase 3).
+#[derive(Debug, Clone)]
+pub struct HfQuantPickerState {
+    pub repo_id: String,
+    pub groups: Vec<crate::hf::HfGgufGroup>,
+    pub selected_idx: usize,
+}
+
+/// State for inline Hugging Face token entry & recovery modal (Phase 3).
+#[derive(Debug, Clone)]
+pub struct HfAuthRecoveryState {
+    pub repo_id: String,
+    pub retry_download_url: Option<String>,
+    pub retry_expected_sha: Option<String>,
+    pub input_token: String,
+}
+
 pub struct HubApp {
     pub config: NexusConfig,
     pub discovery: Arc<DiscoveryService>,
@@ -233,6 +250,13 @@ pub struct HubApp {
     // (label, percent, downloaded, total, speed) — keep compact until a dedicated progress type.
     #[allow(clippy::type_complexity)]
     pub download_progress: Option<(String, Option<f32>, u64, Option<u64>, f64)>,
+    /// Pending model deletion: (model_entry, shard_paths, total_bytes).
+    #[allow(clippy::type_complexity)]
+    pub pending_delete_model: Option<(crate::ui::models::ModelEntry, Vec<std::path::PathBuf>, u64)>,
+    /// Hugging Face GGUF quantization picker modal.
+    pub pending_hf_quant_picker: Option<HfQuantPickerState>,
+    /// Inline Hugging Face authentication token recovery modal.
+    pub pending_hf_auth_recovery: Option<HfAuthRecoveryState>,
     pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
@@ -309,6 +333,9 @@ impl HubApp {
             pending_push_peers: None,
             push_peer_idx: 0,
             download_progress: None,
+            pending_delete_model: None,
+            pending_hf_quant_picker: None,
+            pending_hf_auth_recovery: None,
             layout_mode,
         }
     }
@@ -554,8 +581,50 @@ impl HubApp {
                 self.download_progress = None;
                 self.status_message = Some((message, Color::Red));
             }
+            HubEvent::DownloadCancelled { message } => {
+                self.download_progress = None;
+                self.models_view.refresh();
+                self.status_message = Some((message, Color::Yellow));
+            }
+            HubEvent::ModelDeleted { filename } => {
+                self.models_view.refresh();
+                self.status_message = Some((format!("Deleted model {filename}"), Color::Green));
+            }
             HubEvent::ModelCatalogUpdated { remotes } => {
                 self.models_view.apply_remote_catalogs(&remotes);
+            }
+            HubEvent::HfRepoResolved { repo_id, groups } => {
+                self.status_message = None;
+                self.pending_hf_quant_picker = Some(HfQuantPickerState {
+                    repo_id,
+                    groups,
+                    selected_idx: 0,
+                });
+            }
+            HubEvent::HfAuthRequired {
+                repo_id,
+                retry_download_url,
+                retry_expected_sha,
+            } => {
+                self.download_progress = None;
+                self.pending_hf_auth_recovery = Some(HfAuthRecoveryState {
+                    repo_id,
+                    retry_download_url,
+                    retry_expected_sha,
+                    input_token: String::new(),
+                });
+            }
+            HubEvent::HfError { message } => {
+                self.models_view.hf_loading = false;
+                self.status_message = Some((message, Color::Red));
+            }
+            HubEvent::HfModelsLoaded { models } => {
+                let count = models.len();
+                self.models_view.set_hf_models(models);
+                self.status_message = Some((
+                    format!("Loaded {} Hugging Face models", count),
+                    Color::Green,
+                ));
             }
         }
     }
@@ -644,14 +713,65 @@ impl HubApp {
                     speed / (1024.0 * 1024.0)
                 ));
             frame.render_widget(gauge, chunks[1]);
+            let hint = Paragraph::new(Line::from(Span::styled(
+                " [Esc] / [C] Cancel download (saves partial progress) ",
+                Style::default().fg(Color::DarkGray),
+            )))
+            .alignment(Alignment::Center);
+            frame.render_widget(hint, chunks[2]);
+        }
+
+        if let Some((entry, shards, total_bytes)) = &self.pending_delete_model {
+            let modal = centered_rect(60, 24, area);
+            frame.render_widget(Clear, modal);
+            let size_str = if *total_bytes >= 1024 * 1024 * 1024 {
+                format!("{:.2} GB", *total_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+            } else {
+                format!("{} MB", *total_bytes / (1024 * 1024))
+            };
+            let shard_info = if shards.len() > 1 {
+                format!(" ({} shards, {})", shards.len(), size_str)
+            } else {
+                format!(" ({})", size_str)
+            };
+            let p = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " Permanently delete this model from disk? ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        &entry.filename,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(shard_info, Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " [Y] / [Enter] Confirm Delete    [N] / [Esc] Cancel ",
+                    Style::default().fg(Color::Yellow),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(" Delete Model ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            );
+            frame.render_widget(p, modal);
         }
 
         if let Some(url) = &self.pending_download_url {
-            let modal = centered_rect(70, 20, area);
+            let modal = centered_rect(72, 20, area);
             frame.render_widget(Clear, modal);
             let p = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    " Enter GGUF URL (Enter=start, Esc=cancel) ",
+                    " Enter GGUF URL or Hugging Face repo (e.g. bartowski/Llama-3.2-3B-Instruct-GGUF) ",
                     Style::default().fg(Color::Yellow),
                 )),
                 Line::from(""),
@@ -659,9 +779,170 @@ impl HubApp {
             ])
             .block(
                 Block::default()
-                    .title(" Download ")
+                    .title(" Download / HF Resolve ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
+            );
+            frame.render_widget(p, modal);
+        }
+
+        if let Some(picker) = &self.pending_hf_quant_picker {
+            let modal = centered_rect(82, 65, area);
+            frame.render_widget(Clear, modal);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(4),
+                    Constraint::Length(3),
+                ])
+                .margin(1)
+                .split(modal);
+
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled(" Repository: ", Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    &picker.repo_id,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({} quant options)", picker.groups.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .title(" Hugging Face Quantization Picker ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+            frame.render_widget(header, modal);
+
+            let items: Vec<ListItem> = picker
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(i, group)| {
+                    let is_sel = i == picker.selected_idx;
+                    let size_str = if group.total_size_bytes >= 1024 * 1024 * 1024 {
+                        format!(
+                            "{:.2} GB",
+                            group.total_size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                        )
+                    } else {
+                        format!("{} MB", group.total_size_bytes / (1024 * 1024))
+                    };
+                    let shard_str = if group.is_sharded {
+                        format!(" ({} shards)", group.files.len())
+                    } else {
+                        "".to_string()
+                    };
+                    let (prefix, row_style) = if is_sel {
+                        (
+                            "> ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        ("  ", Style::default().fg(Color::White))
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::styled(prefix, row_style),
+                        Span::styled(
+                            format!("{:<10}", group.quant_label),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" {:<16}", format!("{size_str}{shard_str}")),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(
+                            format!(" {:<14}", group.fit_status.badge_text()),
+                            Style::default()
+                                .fg(group.fit_status.color())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" {}", group.base_name),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                })
+                .collect();
+
+            let list = List::new(items).block(
+                Block::default()
+                    .title(" Quantizations ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            frame.render_widget(list, chunks[1]);
+
+            let footer = Paragraph::new(Line::from(vec![Span::styled(
+                " [↑/k] [↓/j] Select Quant    [Enter] Download    [Esc] Cancel ",
+                Style::default().fg(Color::Yellow),
+            )]))
+            .alignment(Alignment::Center);
+            frame.render_widget(footer, chunks[2]);
+        }
+
+        if let Some(recovery) = &self.pending_hf_auth_recovery {
+            let modal = centered_rect(70, 40, area);
+            frame.render_widget(Clear, modal);
+            let masked_token = if recovery.input_token.is_empty() {
+                "Paste HF Access Token here (hf_••••••••)...".to_string()
+            } else {
+                "•".repeat(recovery.input_token.len())
+            };
+            let p = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " 🔐 Hugging Face Access Token Required ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" Model repository '", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        &recovery.repo_id,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "' is gated or requires authentication.",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!(" [ {} ]", masked_token),
+                    Style::default().fg(if recovery.input_token.is_empty() {
+                        Color::DarkGray
+                    } else {
+                        Color::Green
+                    }),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " [Enter] Save Token & Retry    [Esc] Cancel ",
+                    Style::default().fg(Color::Cyan),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(" Authentication Required ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
             );
             frame.render_widget(p, modal);
         }
@@ -1629,7 +1910,15 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 if let Some(url) = hub.pending_download_url.take() {
                                     let url = url.trim().to_string();
                                     if !url.is_empty() {
-                                        let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                        if let Some(repo_id) = crate::hf::HfClient::parse_repo_id(&url) {
+                                            hub.status_message = Some((
+                                                format!("Resolving Hugging Face repo '{repo_id}'..."),
+                                                Color::Yellow,
+                                            ));
+                                            let _ = cmd_tx.try_send(HubCommand::ResolveHfRepo { repo_id });
+                                        } else {
+                                            let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                        }
                                     }
                                 }
                             }
@@ -1641,6 +1930,115 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             KeyCode::Char(c) => {
                                 if let Some(buf) = &mut hub.pending_download_url {
                                     buf.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // HF Quant Picker modal
+                    if let Some(picker) = &mut hub.pending_hf_quant_picker {
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.pending_hf_quant_picker = None;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if picker.selected_idx > 0 {
+                                    picker.selected_idx -= 1;
+                                } else if !picker.groups.is_empty() {
+                                    picker.selected_idx = picker.groups.len() - 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !picker.groups.is_empty() {
+                                    picker.selected_idx =
+                                        (picker.selected_idx + 1) % picker.groups.len();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(picker) = hub.pending_hf_quant_picker.take() {
+                                    if let Some(group) = picker.groups.get(picker.selected_idx) {
+                                        let _ = cmd_tx.try_send(HubCommand::StartDownloadGroup {
+                                            files: group.files.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // HF Auth Recovery modal
+                    if let Some(recovery) = &mut hub.pending_hf_auth_recovery {
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.pending_hf_auth_recovery = None;
+                                hub.status_message =
+                                    Some(("Authentication cancelled".into(), Color::DarkGray));
+                            }
+                            KeyCode::Backspace => {
+                                recovery.input_token.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                recovery.input_token.push(c);
+                            }
+                            KeyCode::Enter => {
+                                if let Some(recovery) = hub.pending_hf_auth_recovery.take() {
+                                    let token = recovery.input_token.trim().to_string();
+                                    if !token.is_empty() {
+                                        hub.config.huggingface.token = Some(token.clone());
+                                        let _ = cmd_tx.try_send(HubCommand::SaveHfToken { token });
+                                        hub.status_message = Some((
+                                            "Token saved. Retrying request...".into(),
+                                            Color::Green,
+                                        ));
+                                        if let Some(url) = recovery.retry_download_url {
+                                            let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                        } else {
+                                            let _ = cmd_tx.try_send(HubCommand::ResolveHfRepo {
+                                                repo_id: recovery.repo_id,
+                                            });
+                                        }
+                                    } else {
+                                        hub.status_message =
+                                            Some(("No token provided".into(), Color::Yellow));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Active download modal cancellation
+                    if hub.download_progress.is_some() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                                let _ = cmd_tx.try_send(HubCommand::CancelDownload);
+                                hub.status_message = Some(("Cancelling download...".into(), Color::Yellow));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Delete model confirmation modal
+                    if hub.pending_delete_model.is_some() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                                hub.pending_delete_model = None;
+                                hub.status_message = Some(("Deletion cancelled".into(), Color::DarkGray));
+                            }
+                            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Some((entry, shards, _)) = hub.pending_delete_model.take() {
+                                    let _ = cmd_tx.try_send(HubCommand::DeleteModel {
+                                        path: entry.path,
+                                        shards,
+                                        filename: entry.filename,
+                                    });
+                                    hub.status_message = Some(("Deleting model...".into(), Color::Yellow));
                                 }
                             }
                             _ => {}
@@ -1869,6 +2267,82 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         continue;
                     }
 
+                    // HF Explorer mode interception when on Models tab
+                    if hub.active_tab == HubTab::Models
+                        && hub.models_view.mode == crate::ui::models_view::ModelsTabMode::HfExplorer
+                    {
+                        if hub.models_view.hf_is_searching {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    hub.models_view.hf_is_searching = false;
+                                }
+                                KeyCode::Enter => {
+                                    hub.models_view.hf_is_searching = false;
+                                    let q = hub.models_view.hf_search_query.trim().to_string();
+                                    if !q.is_empty() {
+                                        hub.models_view.hf_loading = true;
+                                        hub.status_message = Some((
+                                            format!("Searching Hugging Face for '{q}'..."),
+                                            Color::Yellow,
+                                        ));
+                                        let _ = cmd_tx.try_send(HubCommand::SearchHfModels {
+                                            query: q,
+                                            limit: 25,
+                                        });
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    hub.models_view.hf_search_query.pop();
+                                }
+                                KeyCode::Char(c) => {
+                                    hub.models_view.hf_search_query.push(c);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        } else {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('e') | KeyCode::Char('E') => {
+                                    hub.models_view.mode = crate::ui::models_view::ModelsTabMode::Local;
+                                    continue;
+                                }
+                                KeyCode::Char('/') => {
+                                    hub.models_view.hf_is_searching = true;
+                                    continue;
+                                }
+                                KeyCode::Char('t') | KeyCode::Char('T') => {
+                                    hub.models_view.hf_loading = true;
+                                    hub.status_message = Some((
+                                        "Fetching trending GGUF models...".to_string(),
+                                        Color::Yellow,
+                                    ));
+                                    let _ = cmd_tx.try_send(HubCommand::FetchHfTrending { limit: 25 });
+                                    continue;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    hub.models_view.hf_previous();
+                                    continue;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    hub.models_view.hf_next();
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(m) = hub.models_view.selected_hf_model() {
+                                        let repo_id = m.id.clone();
+                                        hub.status_message = Some((
+                                            format!("Resolving Hugging Face repo '{repo_id}'..."),
+                                            Color::Yellow,
+                                        ));
+                                        let _ = cmd_tx.try_send(HubCommand::ResolveHfRepo { repo_id });
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
                     // Global / Models declarative actions
                     if let Some(action) = resolve(KeyScope::Global, key.code, key.modifiers)
                         .or_else(|| {
@@ -1937,6 +2411,35 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             HubAction::ModelsDownload => {
                                 hub.pending_download_url = Some(String::new());
                             }
+                            HubAction::ModelsDelete => {
+                                if let Some(row) = hub.models_view.selected_row() {
+                                    if let Some(ref entry) = row.local {
+                                        let file_stem = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                                        let is_active = hub.active_model_name == entry.filename
+                                            || hub.active_model_name == file_stem;
+                                        if is_active {
+                                            hub.status_message = Some((
+                                                "Cannot delete active model — please unload [U] first".into(),
+                                                Color::Red,
+                                            ));
+                                        } else {
+                                            let shards = crate::ui::models::detect_model_shards(&entry.path);
+                                            let total_bytes = crate::ui::models::calculate_shards_total_bytes(&shards);
+                                            hub.pending_delete_model = Some((entry.clone(), shards, total_bytes));
+                                        }
+                                    } else {
+                                        hub.status_message = Some((
+                                            "Selected model is remote only — cannot delete locally".into(),
+                                            Color::DarkGray,
+                                        ));
+                                    }
+                                } else {
+                                    hub.status_message = Some(("No model selected to delete".into(), Color::DarkGray));
+                                }
+                            }
+                            HubAction::CancelDownload => {
+                                let _ = cmd_tx.try_send(HubCommand::CancelDownload);
+                            }
                             HubAction::ModelsTransfer => {
                                 if let Some(row) = hub.models_view.selected_row() {
                                     if row.digest.is_empty() {
@@ -1986,6 +2489,19 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             hub.pending_push_peers = Some(list);
                                         }
                                     }
+                                }
+                            }
+                            HubAction::ModelsToggleExplorer => {
+                                let new_mode = hub.models_view.toggle_mode();
+                                if new_mode == crate::ui::models_view::ModelsTabMode::HfExplorer
+                                    && hub.models_view.hf_models.is_empty()
+                                {
+                                    hub.models_view.hf_loading = true;
+                                    hub.status_message = Some((
+                                        "Fetching trending GGUF models...".to_string(),
+                                        Color::Yellow,
+                                    ));
+                                    let _ = cmd_tx.try_send(HubCommand::FetchHfTrending { limit: 25 });
                                 }
                             }
                             HubAction::ClusterRefresh => {
@@ -2461,14 +2977,21 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             }
             _ = refresh_interval.tick() => {
                 let modal_open = hub.pending_download_url.is_some()
+                    || hub.pending_delete_model.is_some()
+                    || hub.download_progress.is_some()
+                    || hub.pending_hf_quant_picker.is_some()
+                    || hub.pending_hf_auth_recovery.is_some()
                     || hub.pending_target_selection.is_some()
                     || hub.pending_push_peers.is_some()
                     || hub.pending_hot_swap.is_some()
+                    || (hub.active_tab == HubTab::Models && hub.models_view.hf_is_searching)
                     || hub.show_command_palette
                     || hub.show_help;
 
                 if !modal_open {
-                    if hub.active_tab == HubTab::Models {
+                    if hub.active_tab == HubTab::Models
+                        && hub.models_view.mode == crate::ui::models_view::ModelsTabMode::Local
+                    {
                         if last_models_profile_refresh.elapsed() >= Duration::from_secs(5) {
                             hub.models_view.refresh_profile();
                             last_models_profile_refresh = Instant::now();

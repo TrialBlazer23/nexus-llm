@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod downloader;
 pub mod gateway;
 pub mod gguf;
+pub mod hf;
 pub mod kb;
 pub mod logging;
 pub mod mdns;

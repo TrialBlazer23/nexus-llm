@@ -12,7 +12,7 @@ use crate::control_plane::{
     BlobFetchRequest, ModelLoadRequest, ModelLoadResponse, CONTROL_PLANE_VERSION,
 };
 use crate::discovery::{DiscoveryService, RpcSelectionPolicy, StatusFlags};
-use crate::downloader::{DownloadAuth, ModelDownloader};
+use crate::downloader::{DownloadAuth, DownloaderError, ModelDownloader};
 use crate::node_identity::NodeIdentity;
 use crate::store::ModelIndex;
 use crate::supervisor::{LlamaServerConfig, SupervisorManager, SupervisorState};
@@ -58,6 +58,14 @@ pub enum HubCommand {
     StartDownload {
         url: String,
     },
+    /// Cancel active in-progress WAN download.
+    CancelDownload,
+    /// Delete local model file and any detected shard siblings.
+    DeleteModel {
+        path: PathBuf,
+        shards: Vec<PathBuf>,
+        filename: String,
+    },
     /// LAN blob pull from a peer control endpoint.
     TransferModel {
         peer_endpoint: String,
@@ -71,6 +79,27 @@ pub enum HubCommand {
     },
     /// Refresh mesh model catalogs from peers.
     RefreshModelCatalog,
+    /// Resolve Hugging Face repository and enumerate quants / shards.
+    ResolveHfRepo {
+        repo_id: String,
+    },
+    /// Save Hugging Face personal access token.
+    SaveHfToken {
+        token: String,
+    },
+    /// WAN download of a group of files (e.g. multi-shard GGUFs) sequentially.
+    StartDownloadGroup {
+        files: Vec<crate::hf::HfGgufFile>,
+    },
+    /// Fetch trending Hugging Face models.
+    FetchHfTrending {
+        limit: usize,
+    },
+    /// Search Hugging Face models by query.
+    SearchHfModels {
+        query: String,
+        limit: usize,
+    },
 }
 
 /// Events applied on the UI thread.
@@ -127,8 +156,29 @@ pub enum HubEvent {
     DownloadFailed {
         message: String,
     },
+    DownloadCancelled {
+        message: String,
+    },
+    ModelDeleted {
+        filename: String,
+    },
     ModelCatalogUpdated {
         remotes: Vec<(String, String, crate::control_plane::ModelCatalogResponse)>,
+    },
+    HfRepoResolved {
+        repo_id: String,
+        groups: Vec<crate::hf::HfGgufGroup>,
+    },
+    HfAuthRequired {
+        repo_id: String,
+        retry_download_url: Option<String>,
+        retry_expected_sha: Option<String>,
+    },
+    HfError {
+        message: String,
+    },
+    HfModelsLoaded {
+        models: Vec<crate::hf::HfModelSummary>,
     },
 }
 
@@ -147,6 +197,7 @@ pub fn spawn_hub_worker(
     ctx: HubWorkerCtx,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut active_download_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 HubCommand::OpenTargetSelection { model_path } => {
@@ -193,7 +244,29 @@ pub fn spawn_hub_worker(
                     let _ = evt_tx.send(HubEvent::ClusterRefreshed).await;
                 }
                 HubCommand::StartDownload { url } => {
-                    run_download(&ctx, &evt_tx, url, None).await;
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    active_download_cancel = Some(cancel_tx);
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_download(&ctx_clone, &evt_clone, url, None, Some(cancel_rx)).await;
+                    });
+                }
+                HubCommand::CancelDownload => {
+                    if let Some(cancel_tx) = active_download_cancel.take() {
+                        let _ = cancel_tx.send(true);
+                    }
+                }
+                HubCommand::DeleteModel {
+                    path,
+                    shards,
+                    filename,
+                } => {
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_delete_model(&ctx_clone, &evt_clone, path, shards, filename).await;
+                    });
                 }
                 HubCommand::TransferModel {
                     peer_endpoint,
@@ -215,6 +288,50 @@ pub fn spawn_hub_worker(
                         run_refresh_catalog(&ctx_clone, &evt_clone).await;
                     });
                 }
+                HubCommand::ResolveHfRepo { repo_id } => {
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_resolve_hf_repo(&ctx_clone, &evt_clone, repo_id).await;
+                    });
+                }
+                HubCommand::SaveHfToken { token } => {
+                    let mut cfg = ctx.config.clone();
+                    cfg.huggingface.token = Some(token);
+                    if let Ok(path) = std::env::var("NEXUS_CONFIG")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|_| {
+                            std::env::var("HOME").map(|h| {
+                                std::path::Path::new(&h).join(".nexus").join("config.toml")
+                            })
+                        })
+                    {
+                        let _ = cfg.save_to_path(&path);
+                    }
+                }
+                HubCommand::StartDownloadGroup { files } => {
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    active_download_cancel = Some(cancel_tx);
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_download_group(&ctx_clone, &evt_clone, files, Some(cancel_rx)).await;
+                    });
+                }
+                HubCommand::FetchHfTrending { limit } => {
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_fetch_hf_trending(&ctx_clone, &evt_clone, limit).await;
+                    });
+                }
+                HubCommand::SearchHfModels { query, limit } => {
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_search_hf_models(&ctx_clone, &evt_clone, query, limit).await;
+                    });
+                }
             }
         }
     })
@@ -225,6 +342,7 @@ async fn run_download(
     evt_tx: &mpsc::Sender<HubEvent>,
     url: String,
     expected_sha: Option<String>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
     let dest = ModelsView::download_dest_from_url(&ctx.config.node.models_dir, &url);
     let _ = evt_tx
@@ -240,7 +358,8 @@ async fn run_download(
         })
         .await;
 
-    let downloader = ModelDownloader::new();
+    let hf_token = ctx.config.resolved_hf_token();
+    let downloader = ModelDownloader::new().with_hf_token(hf_token);
     let evt = evt_tx.clone();
     let label = dest
         .file_name()
@@ -248,7 +367,7 @@ async fn run_download(
         .unwrap_or("model")
         .to_string();
     let result = downloader
-        .download(&url, &dest, expected_sha.as_deref(), move |p| {
+        .download_with_cancellation(&url, &dest, expected_sha.as_deref(), cancel_rx, move |p| {
             let _ = evt.try_send(HubEvent::DownloadProgress {
                 downloaded_bytes: p.downloaded_bytes,
                 total_bytes: p.total_bytes,
@@ -268,14 +387,276 @@ async fn run_download(
                 })
                 .await;
         }
+        Err(DownloaderError::Cancelled) => {
+            let _ = evt_tx
+                .send(HubEvent::DownloadCancelled {
+                    message: format!(
+                        "Cancelled download of {} (progress saved)",
+                        dest.file_name().and_then(|s| s.to_str()).unwrap_or("model")
+                    ),
+                })
+                .await;
+        }
+        Err(e) => {
+            if e.is_auth_failure() && crate::downloader::is_huggingface_url(&url) {
+                let repo_id = crate::hf::HfClient::parse_repo_id(&url).unwrap_or_else(|| {
+                    if let Some(pos) = url.find("huggingface.co/") {
+                        let rest = &url[pos + 15..];
+                        let parts: Vec<&str> = rest.split('/').collect();
+                        if parts.len() >= 2 {
+                            format!("{}/{}", parts[0], parts[1])
+                        } else {
+                            "huggingface.co".to_string()
+                        }
+                    } else {
+                        "huggingface.co".to_string()
+                    }
+                });
+                let _ = evt_tx
+                    .send(HubEvent::HfAuthRequired {
+                        repo_id,
+                        retry_download_url: Some(url),
+                        retry_expected_sha: expected_sha,
+                    })
+                    .await;
+            } else {
+                let _ = evt_tx
+                    .send(HubEvent::DownloadFailed {
+                        message: format!("Download failed: {e}"),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+async fn run_resolve_hf_repo(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>, repo_id: String) {
+    let token = ctx.config.resolved_hf_token();
+    let client = crate::hf::HfClient::new(token);
+    match client.model_details(&repo_id).await {
+        Ok(detail) => {
+            let sysinfo = crate::sysinfo::SystemProfile::probe();
+            let available_ram_mb = sysinfo.available_ram_mb;
+            let peers = ctx.discovery.get_active_peers().await;
+            let cluster_free_mb: u64 =
+                peers.iter().map(|p| p.free_ram_mb as u64).sum::<u64>() + available_ram_mb;
+            let groups =
+                crate::hf::HfClient::parse_gguf_groups(&detail, available_ram_mb, cluster_free_mb);
+            if groups.is_empty() {
+                let _ = evt_tx
+                    .send(HubEvent::HfError {
+                        message: format!("No .gguf models found in repository '{repo_id}'"),
+                    })
+                    .await;
+            } else {
+                let _ = evt_tx
+                    .send(HubEvent::HfRepoResolved { repo_id, groups })
+                    .await;
+            }
+        }
+        Err(crate::hf::HfError::GatedOrUnauthorized { repo_id, .. }) => {
+            let _ = evt_tx
+                .send(HubEvent::HfAuthRequired {
+                    repo_id,
+                    retry_download_url: None,
+                    retry_expected_sha: None,
+                })
+                .await;
+        }
         Err(e) => {
             let _ = evt_tx
-                .send(HubEvent::DownloadFailed {
-                    message: format!("Download failed: {e}"),
+                .send(HubEvent::HfError {
+                    message: format!("Hugging Face error: {e}"),
                 })
                 .await;
         }
     }
+}
+
+async fn run_download_group(
+    ctx: &HubWorkerCtx,
+    evt_tx: &mpsc::Sender<HubEvent>,
+    files: Vec<crate::hf::HfGgufFile>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if files.is_empty() {
+        return;
+    }
+    let total_files = files.len();
+    let group_label = if total_files == 1 {
+        files[0].filename.clone()
+    } else {
+        crate::ui::models::parse_shard_prefix(&files[0].filename)
+            .unwrap_or_else(|| files[0].filename.clone())
+    };
+
+    let hf_token = ctx.config.resolved_hf_token();
+    let downloader = ModelDownloader::new().with_hf_token(hf_token);
+
+    for (idx, file) in files.iter().enumerate() {
+        let dest =
+            ModelsView::download_dest_from_url(&ctx.config.node.models_dir, &file.download_url);
+        let shard_label = if total_files > 1 {
+            format!("[{}/{}] {}", idx + 1, total_files, file.filename)
+        } else {
+            file.filename.clone()
+        };
+
+        let _ = evt_tx
+            .send(HubEvent::DownloadProgress {
+                downloaded_bytes: 0,
+                total_bytes: Some(file.size_bytes),
+                percent: Some(0.0),
+                speed_bytes_per_sec: 0.0,
+                label: format!("Downloading {shard_label}"),
+            })
+            .await;
+
+        let evt = evt_tx.clone();
+        let current_label = shard_label.clone();
+        let cancel_rx_clone = cancel_rx.clone();
+
+        let result = downloader
+            .download_with_cancellation(
+                &file.download_url,
+                &dest,
+                file.sha256.as_deref(),
+                cancel_rx_clone,
+                move |p| {
+                    let _ = evt.try_send(HubEvent::DownloadProgress {
+                        downloaded_bytes: p.downloaded_bytes,
+                        total_bytes: p.total_bytes,
+                        percent: p.percent,
+                        speed_bytes_per_sec: p.speed_bytes_per_sec,
+                        label: current_label.clone(),
+                    });
+                },
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                // Shard complete, continue to next shard
+            }
+            Err(DownloaderError::Cancelled) => {
+                let _ = evt_tx
+                    .send(HubEvent::DownloadCancelled {
+                        message: format!("Cancelled download of {shard_label} (progress saved)"),
+                    })
+                    .await;
+                return;
+            }
+            Err(e) => {
+                if e.is_auth_failure() && crate::downloader::is_huggingface_url(&file.download_url)
+                {
+                    let repo_id = crate::hf::HfClient::parse_repo_id(&file.download_url)
+                        .unwrap_or_else(|| {
+                            if let Some(pos) = file.download_url.find("huggingface.co/") {
+                                let rest = &file.download_url[pos + 15..];
+                                let parts: Vec<&str> = rest.split('/').collect();
+                                if parts.len() >= 2 {
+                                    format!("{}/{}", parts[0], parts[1])
+                                } else {
+                                    "huggingface.co".to_string()
+                                }
+                            } else {
+                                "huggingface.co".to_string()
+                            }
+                        });
+                    let _ = evt_tx
+                        .send(HubEvent::HfAuthRequired {
+                            repo_id,
+                            retry_download_url: Some(file.download_url.clone()),
+                            retry_expected_sha: file.sha256.clone(),
+                        })
+                        .await;
+                } else {
+                    let _ = evt_tx
+                        .send(HubEvent::DownloadFailed {
+                            message: format!("Download failed on {shard_label}: {e}"),
+                        })
+                        .await;
+                }
+                return;
+            }
+        }
+    }
+
+    let _ = ModelIndex::reconcile_default(&ctx.config.node.models_dir);
+    let finish_msg = if total_files > 1 {
+        format!("Downloaded all {total_files} shards of {group_label}")
+    } else {
+        format!("Downloaded {group_label}")
+    };
+    let _ = evt_tx
+        .send(HubEvent::DownloadFinished {
+            message: finish_msg,
+        })
+        .await;
+}
+
+async fn run_fetch_hf_trending(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>, limit: usize) {
+    let token = ctx.config.resolved_hf_token();
+    let client = crate::hf::HfClient::new(token);
+    match client.trending_models(limit).await {
+        Ok(models) => {
+            let _ = evt_tx.send(HubEvent::HfModelsLoaded { models }).await;
+        }
+        Err(e) => {
+            let _ = evt_tx
+                .send(HubEvent::HfError {
+                    message: format!("Failed to fetch trending models: {e}"),
+                })
+                .await;
+        }
+    }
+}
+
+async fn run_search_hf_models(
+    ctx: &HubWorkerCtx,
+    evt_tx: &mpsc::Sender<HubEvent>,
+    query: String,
+    limit: usize,
+) {
+    let token = ctx.config.resolved_hf_token();
+    let client = crate::hf::HfClient::new(token);
+    match client.search_models(&query, limit).await {
+        Ok(models) => {
+            let _ = evt_tx.send(HubEvent::HfModelsLoaded { models }).await;
+        }
+        Err(e) => {
+            let _ = evt_tx
+                .send(HubEvent::HfError {
+                    message: format!("Search failed: {e}"),
+                })
+                .await;
+        }
+    }
+}
+
+pub async fn run_delete_model(
+    ctx: &HubWorkerCtx,
+    evt_tx: &mpsc::Sender<HubEvent>,
+    path: PathBuf,
+    shards: Vec<PathBuf>,
+    filename: String,
+) {
+    let targets = if shards.is_empty() {
+        vec![path]
+    } else {
+        shards
+    };
+
+    for target in &targets {
+        let _ = tokio::fs::remove_file(target).await;
+        let part = PathBuf::from(format!("{}.part", target.display()));
+        let sidecar = PathBuf::from(format!("{}.part.json", target.display()));
+        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(&sidecar).await;
+    }
+
+    let _ = ModelIndex::reconcile_default(&ctx.config.node.models_dir);
+    let _ = evt_tx.send(HubEvent::ModelDeleted { filename }).await;
 }
 
 async fn run_transfer(

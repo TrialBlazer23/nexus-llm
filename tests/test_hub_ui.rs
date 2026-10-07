@@ -307,6 +307,27 @@ fn test_settings_view_navigation_and_mutations() {
     view.toggle_or_adjust(false, true);
     assert_eq!(view.config.hardware.acceleration.cpu_threads, 4);
 
+    // Test text editing on Hugging Face Access Token
+    let hf_idx = SettingsView::items()
+        .iter()
+        .position(|i| i.name.contains("Hugging Face Access Token"))
+        .expect("hf_token field must exist");
+    view.selected_index = hf_idx;
+    assert!(view.is_current_text());
+    view.start_editing();
+    assert!(view.editing_text);
+    view.text_buffer = "hf_0123456789abcdef".to_string();
+    view.commit_text();
+    assert!(!view.editing_text);
+    assert_eq!(
+        view.config.huggingface.token.as_deref(),
+        Some("hf_0123456789abcdef")
+    );
+    assert_eq!(
+        nexus::ui::settings_view::mask_hf_token("hf_0123456789abcdef"),
+        "hf_•••••••• (19 chars)"
+    );
+
     // Save settings to disk via save_to
     let save_res = view.save_to(&config_path);
     assert!(save_res.is_ok(), "Settings must save without error");
@@ -322,6 +343,10 @@ fn test_settings_view_navigation_and_mutations() {
     assert!(loaded.hardware.acceleration.prefer_gpu);
     assert_eq!(loaded.hardware.acceleration.cpu_threads, 4);
     assert_eq!(loaded.hardware.safety.max_ram_usage_percent, 75);
+    assert_eq!(
+        loaded.huggingface.token.as_deref(),
+        Some("hf_0123456789abcdef")
+    );
 }
 
 #[test]
@@ -1029,5 +1054,277 @@ async fn test_mobile_responsive_rendering() {
     assert!(
         wide_content.contains("Host:"),
         "Wide override must render Host endpoint in dock"
+    );
+}
+
+#[tokio::test]
+async fn test_hub_app_delete_model_confirmation_modal() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    let entry = nexus::ui::models::ModelEntry {
+        filename: "test-model.gguf".to_string(),
+        path: PathBuf::from("/models/test-model.gguf"),
+        size_mb: 4096,
+        architecture: "llama".to_string(),
+        context_length: 4096,
+        exact_kv_mb: 512,
+        lmk_compatible: true,
+        gguf_version: 3,
+        block_count: 32,
+        head_count: 32,
+        embedding_length: 4096,
+        digest: "abc".to_string(),
+        shard_count: 1,
+        total_shards: None,
+    };
+
+    hub.pending_delete_model = Some((
+        entry,
+        vec![PathBuf::from("/models/test-model.gguf")],
+        4 * 1024 * 1024 * 1024,
+    ));
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame with delete modal");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(
+        content.contains("Delete Model"),
+        "Must render delete modal title"
+    );
+    assert!(
+        content.contains("test-model.gguf"),
+        "Must render model filename"
+    );
+    assert!(
+        content.contains("Confirm Delete") && content.contains("Cancel"),
+        "Must render action buttons"
+    );
+}
+
+#[tokio::test]
+async fn test_hub_app_download_cancellation_hint() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    hub.download_progress = Some((
+        "model.gguf".to_string(),
+        Some(25.0),
+        250_000_000,
+        Some(1_000_000_000),
+        15_000_000.0,
+    ));
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame with download progress");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(
+        content.contains("Transfer"),
+        "Must render download transfer title"
+    );
+    assert!(
+        content.contains("[Esc]") || content.contains("[C]"),
+        "Must render cancellation shortcut hint"
+    );
+    assert!(
+        content.contains("Cancel download"),
+        "Must render cancel hint"
+    );
+}
+
+#[tokio::test]
+async fn test_hub_app_hf_quant_picker_modal() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    let group1 = nexus::hf::HfGgufGroup {
+        base_name: "test-model-Q4_K_M".to_string(),
+        quant_label: "Q4_K_M".to_string(),
+        total_size_bytes: 2_100_000_000,
+        files: vec![nexus::hf::HfGgufFile {
+            filename: "test-model-Q4_K_M.gguf".to_string(),
+            size_bytes: 2_100_000_000,
+            sha256: None,
+            download_url: "https://huggingface.co/test/model/resolve/main/test-model-Q4_K_M.gguf"
+                .to_string(),
+        }],
+        is_sharded: false,
+        fit_status: nexus::hf::FitStatus::Fits,
+    };
+
+    let group2 = nexus::hf::HfGgufGroup {
+        base_name: "test-model-Q8_0".to_string(),
+        quant_label: "Q8_0".to_string(),
+        total_size_bytes: 4_200_000_000,
+        files: vec![nexus::hf::HfGgufFile {
+            filename: "test-model-Q8_0.gguf".to_string(),
+            size_bytes: 4_200_000_000,
+            sha256: None,
+            download_url: "https://huggingface.co/test/model/resolve/main/test-model-Q8_0.gguf"
+                .to_string(),
+        }],
+        is_sharded: false,
+        fit_status: nexus::hf::FitStatus::OffloadRequired,
+    };
+
+    hub.pending_hf_quant_picker = Some(nexus::ui::hub::HfQuantPickerState {
+        repo_id: "test-org/test-model".to_string(),
+        groups: vec![group1, group2],
+        selected_idx: 0,
+    });
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame with quant picker");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(
+        content.contains("Hugging Face Quantization Picker"),
+        "Must render quant picker modal title"
+    );
+    assert!(
+        content.contains("test-org/test-model"),
+        "Must render target repo ID"
+    );
+    assert!(content.contains("Q4_K_M"), "Must render quant label");
+    assert!(
+        content.contains("[OK] Fits"),
+        "Must render memory fit badge"
+    );
+    assert!(
+        content.contains("[RPC] Offload"),
+        "Must render offload badge"
+    );
+    assert!(
+        content.contains("Select Quant"),
+        "Must render controls hint"
+    );
+}
+
+#[tokio::test]
+async fn test_hub_app_hf_auth_recovery_modal() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    hub.pending_hf_auth_recovery = Some(nexus::ui::hub::HfAuthRecoveryState {
+        repo_id: "meta-llama/Llama-3.2-3B".to_string(),
+        retry_download_url: Some(
+            "https://huggingface.co/meta-llama/Llama-3.2-3B/resolve/main/model.gguf".to_string(),
+        ),
+        retry_expected_sha: None,
+        input_token: "hf_testtoken123".to_string(),
+    });
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame with auth recovery modal");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(
+        content.contains("Authentication Required"),
+        "Must render auth recovery modal title"
+    );
+    assert!(
+        content.contains("meta-llama/Llama-3.2-3B"),
+        "Must render repo name"
+    );
+    assert!(
+        content.contains("Save Token & Retry"),
+        "Must render confirmation action"
+    );
+    assert!(content.contains("•••••••••••••••"), "Must mask token input");
+}
+
+#[tokio::test]
+async fn test_hub_app_hf_explorer_mode_rendering() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    hub.set_tab(nexus::ui::hub::HubTab::Models);
+    hub.models_view.toggle_mode();
+    assert_eq!(
+        hub.models_view.mode,
+        nexus::ui::models_view::ModelsTabMode::HfExplorer
+    );
+
+    hub.models_view
+        .set_hf_models(vec![nexus::hf::HfModelSummary {
+            id: "Qwen/Qwen2.5-Coder-7B-GGUF".to_string(),
+            author: Some("Qwen".to_string()),
+            downloads: 54_300,
+            likes: 1_250,
+            private: false,
+            gated: None,
+            pipeline_tag: Some("text-generation".to_string()),
+            tags: vec!["code".to_string(), "gguf".to_string()],
+        }]);
+
+    let backend = TestBackend::new(120, 35);
+    let mut terminal = Terminal::new(backend).expect("Failed to initialize TestBackend");
+
+    terminal
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame in HF Explorer mode");
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(
+        content.contains("HF Explorer"),
+        "Must render HF Explorer tab title"
+    );
+    assert!(content.contains("Qwen2.5-Coder-7B"), "Must render model ID");
+    assert!(
+        content.contains("Hugging Face Model Details"),
+        "Must render details pane"
+    );
+    assert!(
+        content.contains("Press [Enter] to inspect GGUF quants"),
+        "Must render quant inspection action"
+    );
+
+    // Search query active display
+    hub.models_view.hf_is_searching = true;
+    hub.models_view.hf_search_query = "deepseek".to_string();
+
+    let backend2 = TestBackend::new(120, 35);
+    let mut terminal2 = Terminal::new(backend2).expect("Failed to initialize TestBackend");
+    terminal2
+        .draw(|f| hub.render(f))
+        .expect("Failed to render frame in HF Explorer search mode");
+    let buffer2 = terminal2.backend().buffer();
+    let content2 = format!("{:?}", buffer2);
+    assert!(
+        content2.contains("Search: deepseek_"),
+        "Must render search input prompt"
     );
 }

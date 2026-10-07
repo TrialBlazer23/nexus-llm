@@ -27,8 +27,11 @@ pub enum HubAction {
     ModelsContextInc,
     ModelsContextDec,
     ModelsDownload,
+    ModelsDelete,
+    CancelDownload,
     ModelsTransfer,
     ModelsPush,
+    ModelsToggleExplorer,
     ClusterRefresh,
     Help,
 }
@@ -199,6 +202,20 @@ pub fn models_bindings() -> &'static [KeyBinding] {
             scope: KeyScope::Models,
         },
         KeyBinding {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsDelete,
+            label: "X Delete",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsDelete,
+            label: "Del Delete",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
             code: KeyCode::Char('t'),
             modifiers: KeyModifiers::NONE,
             action: HubAction::ModelsTransfer,
@@ -210,6 +227,13 @@ pub fn models_bindings() -> &'static [KeyBinding] {
             modifiers: KeyModifiers::NONE,
             action: HubAction::ModelsPush,
             label: "S Send to peer",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsToggleExplorer,
+            label: "E HF Explorer",
             scope: KeyScope::Models,
         },
     ]
@@ -285,6 +309,7 @@ pub fn resolve(scope: KeyScope, code: KeyCode, modifiers: KeyModifiers) -> Optio
             KeyCode::Char('D') => return Some(HubAction::ModelsDownload),
             KeyCode::Char('T') => return Some(HubAction::ModelsTransfer),
             KeyCode::Char('S') => return Some(HubAction::ModelsPush),
+            KeyCode::Char('E') => return Some(HubAction::ModelsToggleExplorer),
             _ => {}
         }
     }

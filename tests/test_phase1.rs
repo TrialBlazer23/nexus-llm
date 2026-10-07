@@ -440,3 +440,30 @@ async fn test_supervisor_memory_cap_rejection() {
         other => panic!("Expected MemoryCapExceeded error, got: {:?}", other.err()),
     }
 }
+
+#[test]
+fn test_resolved_hf_token_hierarchy() {
+    let mut config = NexusConfig::default();
+    assert_eq!(config.huggingface.token, None);
+
+    // 1. Explicit config token takes highest precedence
+    config.huggingface.token = Some("  hf_explicit_config_123  ".to_string());
+    assert_eq!(
+        config.resolved_hf_token().as_deref(),
+        Some("hf_explicit_config_123")
+    );
+
+    // 2. Custom TOML round trip with huggingface section
+    let custom_toml = r#"
+[node]
+name = "node-alpha"
+
+[huggingface]
+token = "hf_custom_from_toml"
+"#;
+    let loaded: NexusConfig = toml::from_str(custom_toml).expect("parse custom toml with hf token");
+    assert_eq!(
+        loaded.resolved_hf_token().as_deref(),
+        Some("hf_custom_from_toml")
+    );
+}

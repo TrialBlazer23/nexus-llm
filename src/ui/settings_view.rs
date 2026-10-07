@@ -19,6 +19,8 @@ pub enum SettingType {
     PresetsDir,
     LlamaServerBinary,
     RpcServerBinary,
+    // Model Registry & Auth
+    HfToken,
     // Network & Transport
     DefaultHost,
     StaticPeers,
@@ -90,6 +92,13 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "rpc-server Binary Path",
         description: "Path or executable name for llama.cpp distributed rpc-server",
         setting_type: SettingType::RpcServerBinary,
+    },
+    // Model Registry & Auth
+    SettingItem {
+        category: "Model Registry & Auth",
+        name: "Hugging Face Access Token",
+        description: "API token for gated and private models (masked in display)",
+        setting_type: SettingType::HfToken,
     },
     // Network & Transport
     SettingItem {
@@ -256,6 +265,7 @@ impl SettingsView {
                 | SettingType::PresetsDir
                 | SettingType::LlamaServerBinary
                 | SettingType::RpcServerBinary
+                | SettingType::HfToken
                 | SettingType::DefaultHost
                 | SettingType::StaticPeers
         )
@@ -271,6 +281,7 @@ impl SettingsView {
             SettingType::PresetsDir => self.config.node.presets_dir.to_string_lossy().to_string(),
             SettingType::LlamaServerBinary => self.config.node.llama_server_binary.clone(),
             SettingType::RpcServerBinary => self.config.node.rpc_server_binary.clone(),
+            SettingType::HfToken => self.config.huggingface.token.clone().unwrap_or_default(),
             SettingType::DefaultHost => {
                 self.config.network.default_host.clone().unwrap_or_default()
             }
@@ -314,6 +325,13 @@ impl SettingsView {
             SettingType::RpcServerBinary => {
                 if !val.is_empty() {
                     self.config.node.rpc_server_binary = val;
+                }
+            }
+            SettingType::HfToken => {
+                if val.is_empty() || val.eq_ignore_ascii_case("none") {
+                    self.config.huggingface.token = None;
+                } else {
+                    self.config.huggingface.token = Some(val);
                 }
             }
             SettingType::DefaultHost => {
@@ -366,6 +384,7 @@ impl SettingsView {
             | SettingType::PresetsDir
             | SettingType::LlamaServerBinary
             | SettingType::RpcServerBinary
+            | SettingType::HfToken
             | SettingType::DefaultHost
             | SettingType::StaticPeers => {
                 self.start_editing();
@@ -586,6 +605,11 @@ impl SettingsView {
                     SettingType::RpcServerBinary => {
                         format!("[ {} ]", self.config.node.rpc_server_binary)
                     }
+                    SettingType::HfToken => match &self.config.huggingface.token {
+                        None => "[ none ]".to_string(),
+                        Some(tok) if tok.trim().is_empty() => "[ none ]".to_string(),
+                        Some(tok) => format!("[ {} ]", mask_hf_token(tok)),
+                    },
                     SettingType::DefaultHost => format!(
                         "[ {} ]",
                         self.config
@@ -759,5 +783,20 @@ impl SettingsView {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
         frame.render_widget(footer_widget, chunks[1]);
+    }
+}
+
+/// Mask sensitive Hugging Face Personal Access Tokens for safe display.
+pub fn mask_hf_token(tok: &str) -> String {
+    let t = tok.trim();
+    if t.is_empty() {
+        return "none".to_string();
+    }
+    if t.starts_with("hf_") && t.len() > 7 {
+        format!("hf_•••••••• ({} chars)", t.len())
+    } else if t.len() > 4 {
+        format!("•••••••• ({} chars)", t.len())
+    } else {
+        "••••".to_string()
     }
 }

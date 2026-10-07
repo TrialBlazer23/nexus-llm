@@ -40,6 +40,21 @@ pub enum DownloaderError {
 
     #[error("download exhausted retries after transient failures")]
     RetriesExhausted,
+
+    #[error("download cancelled by operator")]
+    Cancelled,
+}
+
+impl DownloaderError {
+    /// Returns true if the download failed due to HTTP 401 Unauthorized or 403 Forbidden.
+    pub fn is_auth_failure(&self) -> bool {
+        match self {
+            DownloaderError::HttpStatus(s) => {
+                *s == reqwest::StatusCode::UNAUTHORIZED || *s == reqwest::StatusCode::FORBIDDEN
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Real-time progress metrics emitted during chunked download.
@@ -73,6 +88,7 @@ struct PartSidecar {
 
 pub struct ModelDownloader {
     client: reqwest::Client,
+    hf_token: Option<String>,
 }
 
 impl Default for ModelDownloader {
@@ -88,7 +104,14 @@ impl ModelDownloader {
                 .timeout(Duration::from_secs(300))
                 .build()
                 .expect("Valid reqwest client"),
+            hf_token: None,
         }
+    }
+
+    /// Set an optional Hugging Face Personal Access Token for authenticated downloads.
+    pub fn with_hf_token(mut self, token: Option<String>) -> Self {
+        self.hf_token = token;
+        self
     }
 
     /// Download a file from `url` to `dest_path` with HTTP Range resume and optional SHA-256.
@@ -102,8 +125,38 @@ impl ModelDownloader {
     where
         F: Fn(DownloadProgress) + Send + Sync,
     {
-        self.download_authenticated(url, dest_path, expected_sha256, None, progress_callback)
-            .await
+        self.download_authenticated_with_cancellation(
+            url,
+            dest_path,
+            expected_sha256,
+            None,
+            None,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Download a file with optional cancellation receiver.
+    pub async fn download_with_cancellation<P: AsRef<Path>, F>(
+        &self,
+        url: &str,
+        dest_path: P,
+        expected_sha256: Option<&str>,
+        cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        progress_callback: F,
+    ) -> Result<(), DownloaderError>
+    where
+        F: Fn(DownloadProgress) + Send + Sync,
+    {
+        self.download_authenticated_with_cancellation(
+            url,
+            dest_path,
+            expected_sha256,
+            None,
+            cancel_rx,
+            progress_callback,
+        )
+        .await
     }
 
     /// Same as [`download`] but signs each GET with the node identity (LAN blob pull).
@@ -113,6 +166,30 @@ impl ModelDownloader {
         dest_path: P,
         expected_sha256: Option<&str>,
         auth: Option<&DownloadAuth>,
+        progress_callback: F,
+    ) -> Result<(), DownloaderError>
+    where
+        F: Fn(DownloadProgress) + Send + Sync,
+    {
+        self.download_authenticated_with_cancellation(
+            url,
+            dest_path,
+            expected_sha256,
+            auth,
+            None,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Download with optional LAN peer authentication and cancellation receiver.
+    pub async fn download_authenticated_with_cancellation<P: AsRef<Path>, F>(
+        &self,
+        url: &str,
+        dest_path: P,
+        expected_sha256: Option<&str>,
+        auth: Option<&DownloadAuth>,
+        cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
         progress_callback: F,
     ) -> Result<(), DownloaderError>
     where
@@ -130,6 +207,7 @@ impl ModelDownloader {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
+            let rx = cancel_rx.clone();
             match self
                 .download_once(
                     url,
@@ -138,6 +216,7 @@ impl ModelDownloader {
                     &sidecar_path,
                     expected.as_deref(),
                     auth,
+                    rx,
                     &progress_callback,
                 )
                 .await
@@ -166,6 +245,7 @@ impl ModelDownloader {
         sidecar_path: &Path,
         expected: Option<&str>,
         auth: Option<&DownloadAuth>,
+        mut cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
         progress_callback: &F,
     ) -> Result<(), DownloaderError>
     where
@@ -206,6 +286,16 @@ impl ModelDownloader {
                 &path_for_sign,
                 &[],
             );
+        } else if let Some(ref token) = self.hf_token {
+            if is_huggingface_url(url) {
+                let token_clean = token.trim();
+                if !token_clean.is_empty() {
+                    req = req.header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {token_clean}"),
+                    );
+                }
+            }
         }
         if existing_bytes > 0 {
             info!("Resuming download from byte offset {}", existing_bytes);
@@ -284,7 +374,34 @@ impl ModelDownloader {
         let mut last_byte_at = Instant::now();
 
         loop {
-            let next = tokio::time::timeout(STALL_TIMEOUT, stream.next()).await;
+            if let Some(ref rx) = cancel_rx {
+                if *rx.borrow() {
+                    writer.flush().await?;
+                    let file = writer.into_inner();
+                    file.sync_all().await?;
+                    return Err(DownloaderError::Cancelled);
+                }
+            }
+
+            let next = tokio::select! {
+                chunk_res = tokio::time::timeout(STALL_TIMEOUT, stream.next()) => chunk_res,
+                _ = async {
+                    if let Some(ref mut rx) = cancel_rx {
+                        while !*rx.borrow_and_update() {
+                            if rx.changed().await.is_err() {
+                                futures_util::future::pending::<()>().await;
+                            }
+                        }
+                    } else {
+                        futures_util::future::pending::<()>().await;
+                    }
+                } => {
+                    writer.flush().await?;
+                    let file = writer.into_inner();
+                    file.sync_all().await?;
+                    return Err(DownloaderError::Cancelled);
+                }
+            };
             let chunk_res = match next {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
@@ -369,6 +486,20 @@ impl ModelDownloader {
     }
 }
 
+/// Returns true if the URL points to a Hugging Face domain (*.huggingface.co or *.hf.co).
+pub fn is_huggingface_url(url: &str) -> bool {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            let host = host.to_ascii_lowercase();
+            return host == "huggingface.co"
+                || host.ends_with(".huggingface.co")
+                || host == "hf.co"
+                || host.ends_with(".hf.co");
+        }
+    }
+    false
+}
+
 fn is_retryable(err: &DownloaderError) -> bool {
     match err {
         DownloaderError::Reqwest(_) | DownloaderError::Stalled(_) | DownloaderError::Io(_) => true,
@@ -377,7 +508,8 @@ fn is_retryable(err: &DownloaderError) -> bool {
         }
         DownloaderError::ChecksumMismatch { .. }
         | DownloaderError::InsufficientDisk { .. }
-        | DownloaderError::RetriesExhausted => false,
+        | DownloaderError::RetriesExhausted
+        | DownloaderError::Cancelled => false,
     }
 }
 
@@ -489,5 +621,46 @@ mod tests {
         std::fs::write(&path, data).unwrap();
         let full = ModelDownloader::calculate_sha256(&path).unwrap();
         assert_eq!(incremental, full);
+    }
+
+    #[test]
+    fn test_is_huggingface_url_domain_isolation() {
+        assert!(is_huggingface_url("https://huggingface.co/repo/model.gguf"));
+        assert!(is_huggingface_url(
+            "https://cdn-lfs.huggingface.co/repos/123/model.gguf"
+        ));
+        assert!(is_huggingface_url("https://hf.co/repo/model.gguf"));
+        assert!(is_huggingface_url("https://sub.hf.co/model.gguf"));
+
+        // Third-party or untrusted domains must return false to prevent token leakage
+        assert!(!is_huggingface_url(
+            "https://github.com/releases/download/v1/model.gguf"
+        ));
+        assert!(!is_huggingface_url("http://192.168.1.50:8080/blob/xyz"));
+        assert!(!is_huggingface_url(
+            "https://fake-huggingface.co.evil.com/model.gguf"
+        ));
+        assert!(!is_huggingface_url("not a valid url"));
+    }
+
+    #[test]
+    fn test_auth_failure_classification() {
+        let err_401 = DownloaderError::HttpStatus(reqwest::StatusCode::UNAUTHORIZED);
+        assert!(err_401.is_auth_failure());
+
+        let err_403 = DownloaderError::HttpStatus(reqwest::StatusCode::FORBIDDEN);
+        assert!(err_403.is_auth_failure());
+
+        let err_404 = DownloaderError::HttpStatus(reqwest::StatusCode::NOT_FOUND);
+        assert!(!err_404.is_auth_failure());
+
+        let err_500 = DownloaderError::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!err_500.is_auth_failure());
+    }
+
+    #[test]
+    fn test_downloader_with_hf_token() {
+        let dl = ModelDownloader::new().with_hf_token(Some("hf_test_123456789".into()));
+        assert_eq!(dl.hf_token.as_deref(), Some("hf_test_123456789"));
     }
 }

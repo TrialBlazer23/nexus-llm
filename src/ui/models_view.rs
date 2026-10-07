@@ -26,6 +26,14 @@ pub struct CatalogRow {
     pub peer_endpoints: Vec<String>,
 }
 
+/// Mode of the Models tab (Local mesh catalog vs Hugging Face explorer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelsTabMode {
+    #[default]
+    Local,
+    HfExplorer,
+}
+
 /// Interactive split-pane model browser and GGUF inspection widget.
 #[derive(Debug, Clone)]
 pub struct ModelsView {
@@ -39,6 +47,14 @@ pub struct ModelsView {
     /// Context size used for local loads (Models +/-).
     pub selected_context: usize,
     pub layout_mode: crate::ui::layout::LayoutMode,
+    /// Active tab mode: Local catalog or Hugging Face Explorer.
+    pub mode: ModelsTabMode,
+    /// Cached Hugging Face models (trending or search results).
+    pub hf_models: Vec<crate::hf::HfModelSummary>,
+    pub hf_selected_idx: usize,
+    pub hf_search_query: String,
+    pub hf_is_searching: bool,
+    pub hf_loading: bool,
 }
 
 impl ModelsView {
@@ -52,6 +68,12 @@ impl ModelsView {
             cached_profile: SystemProfile::probe(),
             selected_context: 4096,
             layout_mode: crate::ui::layout::LayoutMode::Auto,
+            mode: ModelsTabMode::Local,
+            hf_models: Vec::new(),
+            hf_selected_idx: 0,
+            hf_search_query: String::new(),
+            hf_is_searching: false,
+            hf_loading: false,
         };
         view.refresh();
         view
@@ -189,6 +211,43 @@ impl ModelsView {
         self.selected_model().map(|m| m.path.clone())
     }
 
+    pub fn toggle_mode(&mut self) -> ModelsTabMode {
+        self.mode = match self.mode {
+            ModelsTabMode::Local => ModelsTabMode::HfExplorer,
+            ModelsTabMode::HfExplorer => {
+                self.hf_is_searching = false;
+                ModelsTabMode::Local
+            }
+        };
+        self.mode
+    }
+
+    pub fn hf_next(&mut self) {
+        if !self.hf_models.is_empty() {
+            self.hf_selected_idx = (self.hf_selected_idx + 1) % self.hf_models.len();
+        }
+    }
+
+    pub fn hf_previous(&mut self) {
+        if !self.hf_models.is_empty() {
+            if self.hf_selected_idx == 0 {
+                self.hf_selected_idx = self.hf_models.len() - 1;
+            } else {
+                self.hf_selected_idx -= 1;
+            }
+        }
+    }
+
+    pub fn selected_hf_model(&self) -> Option<&crate::hf::HfModelSummary> {
+        self.hf_models.get(self.hf_selected_idx)
+    }
+
+    pub fn set_hf_models(&mut self, models: Vec<crate::hf::HfModelSummary>) {
+        self.hf_models = models;
+        self.hf_selected_idx = 0;
+        self.hf_loading = false;
+    }
+
     pub fn download_dest_from_url(models_dir: &std::path::Path, url: &str) -> PathBuf {
         let name = url
             .rsplit('/')
@@ -211,6 +270,13 @@ impl ModelsView {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        match self.mode {
+            ModelsTabMode::Local => self.render_local(frame, area),
+            ModelsTabMode::HfExplorer => self.render_hf_explorer(frame, area),
+        }
+    }
+
+    fn render_local(&self, frame: &mut Frame, area: Rect) {
         let is_compact = self.layout_mode.is_compact(area);
         let chunks = if is_compact {
             Layout::default()
@@ -289,7 +355,7 @@ impl ModelsView {
         };
 
         let list_title = format!(
-            " Mesh Models ({}) | Path: {:?} ",
+            " [• Local Catalog]  [E: HF Explorer] | Mesh Models ({}) | Path: {:?} ",
             self.catalog.len(),
             self.models_dir
         );
@@ -444,7 +510,7 @@ impl ModelsView {
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
             } else {
-                " [Enter] Load  [D] Download  [T] Pull  [S] Push  [+/-] Ctx  [R] Rescan "
+                " [Enter] Load  [E] HF Explorer  [D] Download  [X] Delete  [T] Pull  [S] Push  [+/-] Ctx  [R] Rescan "
                     .to_string()
             };
 
@@ -463,10 +529,223 @@ impl ModelsView {
             frame.render_widget(action_widget, right_chunks[2]);
         } else {
             let empty_widget =
-                Paragraph::new("No model selected — press [D] to download a GGUF URL")
+                Paragraph::new("No model selected — press [D] to download a GGUF URL or [E] for Hugging Face Explorer")
                     .block(Block::default().title(" Details ").borders(Borders::ALL));
             frame.render_widget(empty_widget, area);
         }
+    }
+
+    fn render_hf_explorer(&self, frame: &mut Frame, area: Rect) {
+        let is_compact = self.layout_mode.is_compact(area);
+        let chunks = if is_compact {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area)
+        };
+
+        self.render_hf_list(frame, chunks[0]);
+        self.render_hf_details(frame, chunks[1]);
+    }
+
+    fn render_hf_list(&self, frame: &mut Frame, area: Rect) {
+        let items: Vec<ListItem> = if self.hf_loading {
+            vec![ListItem::new(Line::from(vec![Span::styled(
+                " Loading Hugging Face models...",
+                Style::default().fg(Color::Yellow),
+            )]))]
+        } else if self.hf_models.is_empty() {
+            vec![ListItem::new(Line::from(vec![Span::styled(
+                " No models found — press [/] to search or [T] for trending",
+                Style::default().fg(Color::DarkGray),
+            )]))]
+        } else {
+            self.hf_models
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let is_selected = i == self.hf_selected_idx;
+                    let prefix = if is_selected { " > " } else { "   " };
+                    let style = if is_selected {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+
+                    let dl_str = format!("↓ {}", format_count(m.downloads));
+                    let likes_str = format!("♥ {}", format_count(m.likes));
+
+                    let line = Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::styled(format!("{:<34}", truncate_string(&m.id, 32)), style),
+                        Span::styled(format!("{:>9} ", dl_str), Style::default().fg(Color::Gray)),
+                        Span::styled(
+                            format!("{:>7}", likes_str),
+                            Style::default().fg(Color::LightMagenta),
+                        ),
+                    ]);
+
+                    ListItem::new(line)
+                })
+                .collect()
+        };
+
+        let search_display = if self.hf_is_searching {
+            format!(
+                "Search: {}_ (Enter: submit, Esc: cancel)",
+                self.hf_search_query
+            )
+        } else if !self.hf_search_query.is_empty() {
+            format!("Query: '{}' ([/] edit)", self.hf_search_query)
+        } else {
+            "Trending GGUF ([/] Search, [T] Refresh)".to_string()
+        };
+
+        let list_title = format!(
+            " [E: Local Catalog]  [• HF Explorer] | {} ({}) ",
+            search_display,
+            self.hf_models.len()
+        );
+
+        let list_widget = List::new(items).block(
+            Block::default()
+                .title(list_title)
+                .borders(Borders::ALL)
+                .border_style(if self.hf_is_searching {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
+        );
+
+        frame.render_widget(list_widget, area);
+    }
+
+    fn render_hf_details(&self, frame: &mut Frame, area: Rect) {
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(12), Constraint::Length(4)])
+            .split(area);
+
+        if let Some(m) = self.selected_hf_model() {
+            let author_str = m
+                .author
+                .clone()
+                .unwrap_or_else(|| m.id.split('/').next().unwrap_or("unknown").to_string());
+            let pipeline_str = m
+                .pipeline_tag
+                .clone()
+                .unwrap_or_else(|| "text-generation".to_string());
+            let gated_str = if m.gated.is_some() {
+                "Yes (Gated / Token Required)"
+            } else {
+                "No (Public)"
+            };
+            let tags_str = if m.tags.is_empty() {
+                "none".to_string()
+            } else {
+                m.tags.join(", ")
+            };
+
+            let info_lines = vec![
+                Line::from(vec![
+                    Span::styled(" Repository:    ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        &m.id,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Author:        ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(author_str, Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Downloads:     ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(format_count(m.downloads), Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Likes:         ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        format_count(m.likes),
+                        Style::default().fg(Color::LightMagenta),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Pipeline:      ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(pipeline_str, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Gated Model:   ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        gated_str,
+                        Style::default().fg(if m.gated.is_some() {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Tags:          ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        truncate_string(&tags_str, 50),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    " Press [Enter] to inspect GGUF quants and check RAM fit",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            ];
+
+            let meta_widget = Paragraph::new(info_lines).block(
+                Block::default()
+                    .title(" Hugging Face Model Details ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            frame.render_widget(meta_widget, right_chunks[0]);
+
+            let action_widget =
+                Paragraph::new(Line::from(vec![Span::styled(
+                " [Enter] View Quants & Download  [/] Search  [T] Trending  [Esc/E] Local Models",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )]))
+                .block(
+                    Block::default()
+                        .title(" Actions ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                );
+            frame.render_widget(action_widget, right_chunks[1]);
+        } else {
+            let empty_widget =
+                Paragraph::new("No model selected. Press [/] to search or [T] to load trending.")
+                    .block(Block::default().title(" Details ").borders(Borders::ALL));
+            frame.render_widget(empty_widget, area);
+        }
+    }
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 

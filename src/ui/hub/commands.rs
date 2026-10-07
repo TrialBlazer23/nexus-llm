@@ -209,7 +209,11 @@ pub fn spawn_hub_worker(
                     run_push(&ctx, &evt_tx, peer_endpoint, digest, source_base_url).await;
                 }
                 HubCommand::RefreshModelCatalog => {
-                    run_refresh_catalog(&ctx, &evt_tx).await;
+                    let ctx_clone = ctx.clone();
+                    let evt_clone = evt_tx.clone();
+                    tokio::spawn(async move {
+                        run_refresh_catalog(&ctx_clone, &evt_clone).await;
+                    });
                 }
             }
         }
@@ -397,19 +401,31 @@ async fn run_push(
 
 async fn run_refresh_catalog(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>) {
     let peers = ctx.discovery.get_active_peers().await;
-    let client = reqwest::Client::new();
-    let mut remotes = Vec::new();
-    for p in peers {
-        let endpoint = p.control_endpoint();
-        match fetch_models(&client, &endpoint).await {
-            Ok(catalog) => {
-                remotes.push((p.label(), endpoint, catalog));
-            }
-            Err(e) => {
-                tracing::debug!("catalog fetch from {} failed: {}", endpoint, e);
+    if peers.is_empty() {
+        let _ = evt_tx.send(HubEvent::ModelCatalogUpdated { remotes: Vec::new() }).await;
+        return;
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(1500))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let futures = peers.into_iter().map(|p| {
+        let client = client.clone();
+        async move {
+            let endpoint = p.control_endpoint();
+            match fetch_models(&client, &endpoint).await {
+                Ok(catalog) => Some((p.label(), endpoint, catalog)),
+                Err(e) => {
+                    tracing::debug!("catalog fetch from {} failed: {}", endpoint, e);
+                    None
+                }
             }
         }
-    }
+    });
+
+    let results = futures_util::future::join_all(futures).await;
+    let remotes: Vec<_> = results.into_iter().flatten().collect();
     let _ = evt_tx.send(HubEvent::ModelCatalogUpdated { remotes }).await;
 }
 

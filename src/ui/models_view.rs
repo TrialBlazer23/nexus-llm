@@ -88,7 +88,6 @@ impl ModelsView {
     /// Merge remote peer catalogs into the mesh-wide list (keyed by digest, else filename).
     pub fn apply_remote_catalogs(&mut self, remotes: &[(String, String, ModelCatalogResponse)]) {
         // remotes: (label, control_endpoint, catalog)
-        self.models = scan_models_dir(&self.models_dir);
         let mut by_key: HashMap<String, CatalogRow> = HashMap::new();
 
         for m in &self.models {

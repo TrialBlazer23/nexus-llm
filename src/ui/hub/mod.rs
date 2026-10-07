@@ -39,7 +39,7 @@ use std::io::stdout;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -1450,51 +1450,23 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
     let mut event_stream = EventStream::new();
     let (tx, mut rx) = mpsc::channel::<StreamMsg>(100);
     let mut refresh_interval = tokio::time::interval(Duration::from_millis(500));
+    let mut last_models_catalog_refresh = Instant::now();
+    let mut last_models_profile_refresh = Instant::now();
 
     loop {
         terminal.draw(|f| hub.render(f))?;
 
         tokio::select! {
-            _ = refresh_interval.tick() => {
-                if hub.active_tab == HubTab::Models {
-                    hub.models_view.refresh_profile();
-                    let _ = cmd_tx.try_send(HubCommand::RefreshModelCatalog);
-                }
-                if hub.active_tab == HubTab::Cluster {
-                    let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
-                }
-                if hub.active_tab == HubTab::Logs {
-                    hub.logs_view.refresh();
-                }
-                match hub.supervisor.check_status().await {
-                    Ok(Some((exit_status, err_lines))) => {
-                        let last_err = err_lines
-                            .last()
-                            .map(|s| s.as_str())
-                            .unwrap_or("No stderr output captured")
-                            .to_string();
-                        let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
-                        hub.discovery.set_active_model("").await;
-                        hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
-                        hub.apply_event(HubEvent::SupervisorCrashed {
-                            model,
-                            code: exit_status.code(),
-                            stderr: last_err,
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(e) => debug!("Failed to check supervisor status: {}", e),
-                }
-            }
-            Some(event) = evt_rx.recv() => {
-                let needs_cluster = matches!(event, HubEvent::ClusterRefreshed);
-                hub.apply_event(event);
-                if needs_cluster {
-                    // Short discovery snapshot — not a 30s load.
-                    hub.cluster_view.refresh().await;
-                }
-            }
+            biased;
+
             Some(event_res) = event_stream.next() => {
+                if let Ok(Event::Paste(text)) = &event_res {
+                    if let Some(buf) = &mut hub.pending_download_url {
+                        buf.push_str(text.trim());
+                        continue;
+                    }
+                }
+
                 if let Ok(Event::Key(key)) = event_res {
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                         break;
@@ -1836,7 +1808,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         match action {
                             HubAction::Quit => break,
                             HubAction::TabChat => hub.set_tab(HubTab::Chat),
-                            HubAction::TabModels => hub.set_tab(HubTab::Models),
+                            HubAction::TabModels => {
+                                hub.set_tab(HubTab::Models);
+                                let _ = cmd_tx.try_send(HubCommand::RefreshModelCatalog);
+                                last_models_catalog_refresh = Instant::now();
+                            }
                             HubAction::TabCluster => {
                                 hub.set_tab(HubTab::Cluster);
                                 let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
@@ -1866,7 +1842,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                             HubAction::ModelsNext => hub.models_view.next(),
                             HubAction::ModelsPrev => hub.models_view.previous(),
-                            HubAction::ModelsRefresh => hub.models_view.refresh(),
+                            HubAction::ModelsRefresh => {
+                                hub.models_view.refresh();
+                                let _ = cmd_tx.try_send(HubCommand::RefreshModelCatalog);
+                                last_models_catalog_refresh = Instant::now();
+                            }
                             HubAction::ModelsEnter => {
                                 if let Some(m) = hub.models_view.selected_model() {
                                     let path = m.path.clone();
@@ -2395,6 +2375,60 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         hub.chat.status_message = Some(format!("Error: {}", err));
                         hub.chat.auto_scroll = true;
                     }
+                }
+            }
+            Some(event) = evt_rx.recv() => {
+                let needs_cluster = matches!(event, HubEvent::ClusterRefreshed);
+                hub.apply_event(event);
+                if needs_cluster {
+                    // Short discovery snapshot — not a 30s load.
+                    hub.cluster_view.refresh().await;
+                }
+            }
+            _ = refresh_interval.tick() => {
+                let modal_open = hub.pending_download_url.is_some()
+                    || hub.pending_target_selection.is_some()
+                    || hub.pending_push_peers.is_some()
+                    || hub.pending_hot_swap.is_some()
+                    || hub.show_command_palette
+                    || hub.show_help;
+
+                if !modal_open {
+                    if hub.active_tab == HubTab::Models {
+                        if last_models_profile_refresh.elapsed() >= Duration::from_secs(5) {
+                            hub.models_view.refresh_profile();
+                            last_models_profile_refresh = Instant::now();
+                        }
+                        if last_models_catalog_refresh.elapsed() >= Duration::from_secs(20) {
+                            let _ = cmd_tx.try_send(HubCommand::RefreshModelCatalog);
+                            last_models_catalog_refresh = Instant::now();
+                        }
+                    }
+                    if hub.active_tab == HubTab::Cluster {
+                        let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
+                    }
+                    if hub.active_tab == HubTab::Logs {
+                        hub.logs_view.refresh();
+                    }
+                }
+                match hub.supervisor.check_status().await {
+                    Ok(Some((exit_status, err_lines))) => {
+                        let last_err = err_lines
+                            .last()
+                            .map(|s| s.as_str())
+                            .unwrap_or("No stderr output captured")
+                            .to_string();
+                        let model = std::mem::replace(&mut hub.active_model_name, "None (Idle)".to_string());
+                        hub.discovery.set_active_model("").await;
+                        hub.discovery.set_status_flags(crate::discovery::StatusFlags(0)).await;
+                        hub.apply_event(HubEvent::SupervisorCrashed {
+                            model,
+                            code: exit_status.code(),
+                            stderr: last_err,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => debug!("Failed to check supervisor status: {}", e),
                 }
             }
         }

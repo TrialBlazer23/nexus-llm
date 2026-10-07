@@ -172,6 +172,55 @@ fn test_models_view_navigation_and_selection() {
 }
 
 #[test]
+fn test_models_view_apply_remote_catalogs_in_memory() {
+    use nexus::control_plane::{ModelCatalogEntry, ModelCatalogResponse};
+    use uuid::Uuid;
+
+    let dir = tempdir().expect("Failed to create tempdir");
+    let model1_path = dir.path().join("local-model.gguf");
+    File::create(&model1_path)
+        .unwrap()
+        .write_all(&build_synthetic_gguf("llama", "Local-Model"))
+        .unwrap();
+
+    let mut view = ModelsView::new(dir.path().to_path_buf());
+    assert_eq!(view.models.len(), 1);
+    assert_eq!(view.catalog.len(), 1);
+
+    // Apply remote peer catalogs without rescanning disk
+    let remotes = vec![(
+        "MacBook-Host".to_string(),
+        "http://192.168.1.50:52021".to_string(),
+        ModelCatalogResponse {
+            protocol_version: 1,
+            node_id: Uuid::new_v4(),
+            models: vec![ModelCatalogEntry {
+                filename: "remote-mac-model.gguf".to_string(),
+                size_mb: 2048,
+                architecture: "llama".to_string(),
+                context_length: 4096,
+                digest: "remote123".to_string(),
+                size_bytes: 2048 * 1024 * 1024,
+            }],
+        },
+    )];
+
+    view.apply_remote_catalogs(&remotes);
+    assert_eq!(view.catalog.len(), 2, "Should contain both local and remote models");
+
+    // Local model is still present and valid
+    let local = view.catalog.iter().find(|r| r.filename == "local-model.gguf");
+    assert!(local.is_some());
+    assert!(local.unwrap().local.is_some());
+
+    // Remote model is present
+    let remote = view.catalog.iter().find(|r| r.filename == "remote-mac-model.gguf");
+    assert!(remote.is_some());
+    assert!(remote.unwrap().local.is_none());
+    assert_eq!(remote.unwrap().holders, vec!["MacBook-Host"]);
+}
+
+#[test]
 fn test_settings_view_navigation_and_mutations() {
     let dir = tempdir().expect("Failed to create tempdir");
     let config_path = dir.path().join("test_config.toml");

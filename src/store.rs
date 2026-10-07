@@ -45,6 +45,8 @@ pub struct ModelIndexEntry {
     pub block_count: usize,
     pub head_count: usize,
     pub embedding_length: usize,
+    #[serde(default)]
+    pub head_count_kv: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -108,15 +110,17 @@ impl ModelIndex {
 
         let mut preserved: Vec<ModelIndexEntry> = Vec::new();
         let mut by_path: HashMap<PathBuf, ModelIndexEntry> = HashMap::new();
-        for e in previous.models {
-            let parent_ok = e
-                .path
+        let mut by_filename: HashMap<String, ModelIndexEntry> = HashMap::new();
+        for e in previous.models.clone() {
+            let canon = e.path.canonicalize().unwrap_or_else(|_| e.path.clone());
+            let parent_ok = canon
                 .parent()
-                .and_then(|p| p.canonicalize().ok())
                 .map(|p| p == models_dir)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || e.path.parent().map(|p| p == models_dir).unwrap_or(false);
             if parent_ok {
-                by_path.insert(e.path.clone(), e);
+                by_filename.insert(e.filename.clone(), e.clone());
+                by_path.insert(canon, e);
             } else {
                 preserved.push(e);
             }
@@ -157,11 +161,22 @@ impl ModelIndex {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
 
-                if let Some(cached) = by_path.remove(&path) {
+                let canon_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let fname = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let cached = by_path
+                    .remove(&canon_path)
+                    .or_else(|| by_filename.remove(&fname));
+
+                if let Some(mut cached) = cached {
                     if cached.size_bytes == size_bytes
                         && cached.mtime == mtime
                         && !cached.digest.is_empty()
                     {
+                        cached.path = path.clone();
                         next.models.push(cached);
                         continue;
                     }
@@ -177,8 +192,12 @@ impl ModelIndex {
         }
 
         next.models.sort_by_key(|a| a.filename.to_lowercase());
-        if let Err(e) = next.save(index_path) {
-            warn!("Failed to persist model index {:?}: {}", index_path, e);
+        let mut prev_sorted = previous.models;
+        prev_sorted.sort_by_key(|a| a.filename.to_lowercase());
+        if prev_sorted != next.models {
+            if let Err(e) = next.save(index_path) {
+                warn!("Failed to persist model index {:?}: {}", index_path, e);
+            }
         }
         Ok(next)
     }
@@ -217,6 +236,7 @@ fn build_entry(path: &Path, size_bytes: u64, mtime: u64) -> Result<ModelIndexEnt
         block_count: gguf.block_count.unwrap_or(0),
         head_count: gguf.head_count.unwrap_or(0),
         embedding_length: gguf.embedding_length.unwrap_or(0),
+        head_count_kv: gguf.head_count_kv.unwrap_or(0),
     })
 }
 
@@ -334,6 +354,7 @@ mod tests {
             block_count: 0,
             head_count: 0,
             embedding_length: 0,
+            head_count_kv: 0,
         };
         let index = ModelIndex {
             version: 1,

@@ -37,6 +37,8 @@ pub enum HubCommand {
         path: PathBuf,
         gpu_layers: Option<u32>,
         context_size: usize,
+        /// Precomputed llama-server extras (e.g. ranked distributed `--rpc` args).
+        extra_args: Vec<String>,
     },
     /// Dispatch remote load via signed/unsigned control plane.
     LoadModelRemote {
@@ -155,8 +157,9 @@ pub fn spawn_hub_worker(
                     path,
                     gpu_layers,
                     context_size,
+                    extra_args,
                 } => {
-                    run_local_load(&ctx, &evt_tx, path, gpu_layers, context_size).await;
+                    run_local_load(&ctx, &evt_tx, path, gpu_layers, context_size, extra_args).await;
                 }
                 HubCommand::LoadModelRemote {
                     endpoint,
@@ -414,6 +417,12 @@ pub(crate) async fn build_target_selection(
     ctx: &HubWorkerCtx,
     model_path: PathBuf,
 ) -> TargetSelectionState {
+    use crate::cluster::{
+        rank_execution_plans, LinkQuality, MemoryPolicy, NodeBudget, PlacementCandidate,
+        PlacementRequest, PlanTarget,
+    };
+    use crate::gguf::GgufMetadata;
+
     let model_name = model_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -421,37 +430,137 @@ pub(crate) async fn build_target_selection(
         .to_string();
 
     let profile = SystemProfile::probe();
-    let local_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
+    let local_cap_mb = profile
+        .max_allowed_memory_bytes_pct(ctx.config.hardware.safety.max_ram_usage_percent)
+        / (1024 * 1024);
     let gpu_layers = if ctx.config.hardware.acceleration.prefer_gpu {
         ctx.config.hardware.acceleration.gpu_layers
     } else {
         99
     };
+    let ctx_size = 4096usize; // refined by selected_context at confirm time
 
-    let mut candidates = vec![
-        TargetExecutionNode::Local {
+    let mut placement_candidates = Vec::new();
+    let peers = ctx.discovery.get_active_peers().await;
+    for p in &peers {
+        if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
+            let link = ctx
+                .discovery
+                .cached_link_quality(p.uuid)
+                .await
+                .unwrap_or_else(LinkQuality::unknown);
+            // Use advertised free RAM (a 32 GB worker can exceed the 1800 MB default cap).
+            let budget_mb = (p.free_ram_mb as u64).max(1);
+            placement_candidates.push(PlacementCandidate {
+                name: p.label(),
+                budget: NodeBudget::new(p.uuid, p.label(), budget_mb),
+                backend: p.backend,
+                rpc_endpoint: if p.is_rpc_ready() {
+                    Some(p.rpc_endpoint())
+                } else {
+                    None
+                },
+                link,
+                is_local: false,
+                thermal_index: p.thermal_index,
+            });
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(gguf) = GgufMetadata::open(&model_path) {
+        let policy = MemoryPolicy::from_safety(
+            ctx.config.hardware.safety.max_ram_usage_percent,
+            ctx.config.hardware.safety.mmap,
+            ctx.config.hardware.safety.mlock,
+            ctx_size,
+        );
+        let req = PlacementRequest {
+            gguf: &gguf,
+            policy,
+            local_profile: profile.clone(),
+            local_name: "local".into(),
+            local_gpu_layers: gpu_layers,
+            candidates: placement_candidates,
+            enable_rpc: ctx.config.cluster.enable_rpc && ctx.config.cluster.auto_offload,
+        };
+        if let Ok(plans) = rank_execution_plans(&req) {
+            for plan in plans {
+                let label = format!("~{:.1} tok/s", plan.predicted_tok_s);
+                match plan.target {
+                    PlanTarget::LocalGpu { ngl } => {
+                        candidates.push(TargetExecutionNode::Local {
+                            allocatable_mb: local_cap_mb,
+                            backend: profile.detected_backend.to_string(),
+                            gpu_layers: ngl,
+                            predicted_label: label,
+                        });
+                    }
+                    PlanTarget::LocalCpu => {
+                        candidates.push(TargetExecutionNode::LocalCpu {
+                            allocatable_mb: local_cap_mb,
+                            backend: "CPU Fallback".into(),
+                            threads: profile.recommended_threads,
+                            predicted_label: label,
+                        });
+                    }
+                    PlanTarget::Remote { peer_name } => {
+                        if let Some(p) = peers.iter().find(|p| p.label() == peer_name) {
+                            candidates.push(TargetExecutionNode::Remote {
+                                uuid: p.uuid,
+                                name: peer_name,
+                                endpoint: p.control_endpoint(),
+                                api_endpoint: p.api_endpoint(),
+                                free_ram_mb: p.free_ram_mb,
+                                backend: p.backend.to_string(),
+                                predicted_label: label,
+                            });
+                        }
+                    }
+                    PlanTarget::Distributed { worker_names } => {
+                        candidates.push(TargetExecutionNode::Distributed {
+                            worker_names,
+                            predicted_label: label,
+                            rpc_endpoints: plan
+                                .split
+                                .as_ref()
+                                .map(|s| s.remote_endpoints.clone())
+                                .unwrap_or_default(),
+                            extra_args: plan.llama_extra_args,
+                            gpu_layers: plan.gpu_layers,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback if ranking produced nothing (missing geometry / parse failure).
+    if candidates.is_empty() {
+        candidates.push(TargetExecutionNode::Local {
             allocatable_mb: local_cap_mb,
             backend: profile.detected_backend.to_string(),
             gpu_layers,
-        },
-        TargetExecutionNode::LocalCpu {
+            predicted_label: "~?".into(),
+        });
+        candidates.push(TargetExecutionNode::LocalCpu {
             allocatable_mb: local_cap_mb,
-            backend: "CPU Fallback (DotProd / Multi-thread)".to_string(),
+            backend: "CPU Fallback".into(),
             threads: profile.recommended_threads,
-        },
-    ];
-
-    let peers = ctx.discovery.get_active_peers().await;
-    for p in peers {
-        if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
-            candidates.push(TargetExecutionNode::Remote {
-                uuid: p.uuid,
-                name: p.label(),
-                endpoint: p.control_endpoint(),
-                api_endpoint: p.api_endpoint(),
-                free_ram_mb: p.free_ram_mb,
-                backend: p.backend.to_string(),
-            });
+            predicted_label: "~?".into(),
+        });
+        for p in &peers {
+            if p.status.is_ready() || p.role.is_host() || p.is_rpc_ready() {
+                candidates.push(TargetExecutionNode::Remote {
+                    uuid: p.uuid,
+                    name: p.label(),
+                    endpoint: p.control_endpoint(),
+                    api_endpoint: p.api_endpoint(),
+                    free_ram_mb: p.free_ram_mb,
+                    backend: p.backend.to_string(),
+                    predicted_label: "~?".into(),
+                });
+            }
         }
     }
 
@@ -582,6 +691,7 @@ async fn run_local_load(
     model_path: PathBuf,
     custom_gpu_layers: Option<u32>,
     context_size: usize,
+    precomputed_extra_args: Vec<String>,
 ) {
     let _ = evt_tx
         .send(HubEvent::ModelLoadProgress {
@@ -614,64 +724,100 @@ async fn run_local_load(
         0
     };
 
-    let model_size_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
-    let kv_bytes = SystemProfile::estimate_kv_cache_bytes(context_size);
-    let total_required_mb = (model_size_bytes + kv_bytes) / (1024 * 1024);
-    let host_cap_mb = profile
-        .max_allowed_memory_bytes_pct(ctx.config.hardware.safety.max_ram_usage_percent)
-        / (1024 * 1024);
+    let mut extra_args = precomputed_extra_args;
 
-    let mut extra_args = Vec::new();
+    if extra_args.is_empty() && ctx.config.cluster.enable_rpc {
+        let host_cap_mb = profile
+            .max_allowed_memory_bytes_pct(ctx.config.hardware.safety.max_ram_usage_percent)
+            / (1024 * 1024);
 
-    if total_required_mb > host_cap_mb && ctx.config.cluster.enable_rpc {
-        let _ = evt_tx
-            .send(HubEvent::ModelLoadProgress {
-                phase: "Selecting RPC offload candidate…".to_string(),
-            })
-            .await;
-        let rpc_peer = if ctx.config.cluster.auto_offload {
-            ctx.discovery
-                .select_rpc_candidate(RpcSelectionPolicy {
-                    max_thermal_index: 75,
-                    max_allocatable_mb: ctx.config.cluster.max_rpc_ram_mb,
-                    require_pairing: ctx.config.network.security.require_pairing,
-                    protocol_version: CONTROL_PLANE_VERSION,
-                })
-                .await
-        } else {
-            None
-        };
-        let rpc_endpoint = rpc_peer.map(|candidate| candidate.peer.rpc_endpoint());
-        let remote_ram = if rpc_endpoint.is_some() {
-            Some(ctx.config.cluster.max_rpc_ram_mb)
-        } else {
-            None
-        };
-        let budget = crate::cluster::ClusterCoordinator::calculate_budget(
-            profile.available_ram_mb,
-            remote_ram,
-        );
-
-        let total_layers = if let Ok(gguf) = crate::gguf::GgufMetadata::open(&model_path) {
-            gguf.block_count.unwrap_or(32) as u32
-        } else {
-            32
-        };
-
-        match crate::cluster::ClusterCoordinator::plan_layer_split(
-            model_size_bytes,
-            kv_bytes,
-            total_layers,
-            &budget,
-            rpc_endpoint.as_deref(),
-        ) {
-            Ok(split) => {
-                extra_args = split.build_llama_args();
+        match crate::gguf::GgufMetadata::open(&model_path) {
+            Ok(gguf) => {
+                if !gguf.has_geometry() {
+                    let _ = evt_tx
+                        .send(HubEvent::ModelFailed {
+                            message:
+                                "GGUF geometry missing (block_count); refuse to plan layer split"
+                                    .into(),
+                        })
+                        .await;
+                    return;
+                }
+                let policy = crate::cluster::MemoryPolicy::from_safety(
+                    ctx.config.hardware.safety.max_ram_usage_percent,
+                    ctx.config.hardware.safety.mmap,
+                    ctx.config.hardware.safety.mlock,
+                    context_size,
+                );
+                let plan = crate::cluster::MemoryPlan::from_gguf(
+                    &gguf,
+                    &profile,
+                    &policy,
+                    ctx.config.cluster.auto_offload,
+                );
+                if matches!(
+                    plan.verdict,
+                    crate::cluster::Verdict::FitsWithOffload | crate::cluster::Verdict::Exceeds
+                ) && ctx.config.cluster.auto_offload
+                {
+                    let _ = evt_tx
+                        .send(HubEvent::ModelLoadProgress {
+                            phase: "Selecting RPC offload candidate(s)…".to_string(),
+                        })
+                        .await;
+                    let rpc_peers = ctx
+                        .discovery
+                        .select_rpc_candidates(RpcSelectionPolicy {
+                            max_thermal_index: 75,
+                            max_allocatable_mb: u64::MAX, // peer free_ram drives budget
+                            require_pairing: ctx.config.network.security.require_pairing,
+                            protocol_version: CONTROL_PLANE_VERSION,
+                        })
+                        .await;
+                    let workers: Vec<(crate::cluster::NodeBudget, String)> = rpc_peers
+                        .iter()
+                        .map(|c| {
+                            (
+                                crate::cluster::NodeBudget::new(
+                                    c.peer.uuid,
+                                    c.peer.label(),
+                                    c.allocatable_mb.max(1),
+                                ),
+                                c.peer.rpc_endpoint(),
+                            )
+                        })
+                        .collect();
+                    let kv = gguf.exact_kv_cache_bytes(context_size);
+                    let compute =
+                        crate::cluster::estimate_compute_buffer_mb(profile.detected_backend, 512);
+                    match crate::cluster::plan_tensor_byte_split(
+                        &gguf,
+                        context_size,
+                        kv,
+                        host_cap_mb,
+                        &workers,
+                        compute,
+                    ) {
+                        Ok(split) => {
+                            extra_args = split.build_llama_args();
+                        }
+                        Err(e) => {
+                            if matches!(plan.verdict, crate::cluster::Verdict::Exceeds) {
+                                let _ = evt_tx
+                                    .send(HubEvent::ModelFailed {
+                                        message: format!("Memory budget error: {e}"),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 let _ = evt_tx
                     .send(HubEvent::ModelFailed {
-                        message: format!("Memory budget error: {e}"),
+                        message: format!("Failed to parse GGUF for placement: {e}"),
                     })
                     .await;
                 return;
@@ -689,6 +835,11 @@ async fn run_local_load(
         context_size,
         extra_args,
         use_mmap: ctx.config.hardware.safety.mmap,
+        use_mlock: ctx.config.hardware.safety.mlock,
+        cpu_threads_batch: ctx.config.hardware.acceleration.cpu_threads_batch,
+        fallback_to_cpu: ctx.config.hardware.acceleration.fallback_to_cpu,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent: ctx.config.hardware.safety.max_ram_usage_percent,
     };
 
@@ -773,17 +924,29 @@ pub async fn request_load_or_hot_swap(
     gpu_layers: Option<u32>,
     context_size: usize,
 ) -> Result<HubCommand, HotSwapIntent> {
+    request_load_or_hot_swap_with_args(supervisor, path, gpu_layers, context_size, Vec::new()).await
+}
+
+pub async fn request_load_or_hot_swap_with_args(
+    supervisor: &SupervisorManager,
+    path: PathBuf,
+    gpu_layers: Option<u32>,
+    context_size: usize,
+    extra_args: Vec<String>,
+) -> Result<HubCommand, HotSwapIntent> {
     if supervisor.is_running().await {
         Err(HotSwapIntent {
             path,
             gpu_layers,
             context_size,
+            extra_args,
         })
     } else {
         Ok(HubCommand::LoadModelLocal {
             path,
             gpu_layers,
             context_size,
+            extra_args,
         })
     }
 }

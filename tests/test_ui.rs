@@ -558,6 +558,7 @@ fn test_hot_swap_intent_preserves_zero_ngl() {
         path: PathBuf::from("/models/m.gguf"),
         gpu_layers: Some(0),
         context_size: 2048,
+        extra_args: Vec::new(),
     };
     assert_eq!(intent.gpu_layers, Some(0));
     assert_eq!(effective_ngl(intent.gpu_layers, true, 99), 0);

@@ -550,7 +550,8 @@ async fn handle_state(
     };
 
     let profile = SystemProfile::probe();
-    let allocatable = profile.max_allowed_memory_bytes() / (1024 * 1024);
+    let allocatable =
+        profile.max_allowed_memory_bytes_pct(ctx.memory_budget_percent) / (1024 * 1024);
     let state = build_control_plane_state(
         ctx.node_id,
         ctx.role,

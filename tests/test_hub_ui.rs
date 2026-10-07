@@ -37,8 +37,8 @@ fn build_synthetic_gguf(arch: &str, name: &str) -> Vec<u8> {
     buf.extend_from_slice(&0x46554747u32.to_le_bytes());
     // 2. Version 3
     buf.extend_from_slice(&3u32.to_le_bytes());
-    // 3. Tensor count: 32
-    buf.extend_from_slice(&32u64.to_le_bytes());
+    // 3. Tensor count: 0 (KV-only fixture; tensor section covered in unit tests)
+    buf.extend_from_slice(&0u64.to_le_bytes());
     // 4. Metadata KV count: 4
     buf.extend_from_slice(&4u64.to_le_bytes());
 
@@ -375,6 +375,7 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
         path: PathBuf::from("/models/llama-3.2-3b.gguf"),
         gpu_layers: Some(0),
         context_size: 4096,
+        extra_args: Vec::new(),
     });
 
     let backend = TestBackend::new(120, 35);
@@ -432,6 +433,7 @@ async fn test_hub_app_target_node_selection_modal() {
         api_endpoint: "http://192.168.1.100:8080".to_string(),
         free_ram_mb: 8500,
         backend: "Vulkan".to_string(),
+        predicted_label: "~28 tok/s".to_string(),
     });
     assert_eq!(state.candidates.len(), 3);
 

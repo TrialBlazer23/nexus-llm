@@ -342,7 +342,8 @@ impl Default for RpcSelectionPolicy {
     fn default() -> Self {
         Self {
             max_thermal_index: 75,
-            max_allocatable_mb: 1800,
+            // No global 1800 ceiling — use peer advertised free RAM (Phase 11).
+            max_allocatable_mb: u64::MAX,
             require_pairing: false,
             protocol_version: crate::control_plane::CONTROL_PLANE_VERSION,
         }
@@ -414,6 +415,8 @@ pub struct DiscoveryService {
     extra_targets: Arc<RwLock<Vec<SocketAddr>>>,
     last_unicast_replies: Arc<RwLock<HashMap<std::net::IpAddr, Instant>>>,
     mdns_enabled: Arc<RwLock<bool>>,
+    /// Cached link-quality probes (Phase 11).
+    link_quality: Arc<RwLock<HashMap<Uuid, crate::cluster::LinkQuality>>>,
 }
 
 impl DiscoveryService {
@@ -463,6 +466,7 @@ impl DiscoveryService {
             extra_targets: Arc::new(RwLock::new(Vec::new())),
             last_unicast_replies: Arc::new(RwLock::new(HashMap::new())),
             mdns_enabled: Arc::new(RwLock::new(mdns_enabled_val)),
+            link_quality: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1113,7 +1117,60 @@ impl DiscoveryService {
     }
 
     pub async fn select_rpc_candidate(&self, policy: RpcSelectionPolicy) -> Option<RpcCandidate> {
-        self.rpc_candidates(policy).await.into_iter().next()
+        self.select_rpc_candidates(policy).await.into_iter().next()
+    }
+
+    /// Ordered list of RPC workers (most allocatable first).
+    pub async fn select_rpc_candidates(&self, policy: RpcSelectionPolicy) -> Vec<RpcCandidate> {
+        self.rpc_candidates(policy).await
+    }
+
+    /// Return cached link quality for a peer, if present and not stale (~60s).
+    pub async fn cached_link_quality(&self, peer_id: Uuid) -> Option<crate::cluster::LinkQuality> {
+        let guard = self.link_quality.read().await;
+        guard.get(&peer_id).and_then(|lq| {
+            if lq.is_stale(Duration::from_secs(60)) {
+                None
+            } else {
+                Some(lq.clone())
+            }
+        })
+    }
+
+    /// Store a link-quality probe result for ranking.
+    pub async fn record_link_quality(&self, peer_id: Uuid, quality: crate::cluster::LinkQuality) {
+        let mut guard = self.link_quality.write().await;
+        guard.insert(peer_id, quality);
+    }
+
+    /// Lightweight RTT probe against a peer control endpoint (`GET /health` or root).
+    pub async fn probe_link_quality(&self, peer: &PeerNode) -> crate::cluster::LinkQuality {
+        let url = format!("{}/", peer.control_endpoint().trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build();
+        let Ok(client) = client else {
+            return crate::cluster::LinkQuality::unknown();
+        };
+        let start = Instant::now();
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let rtt = start.elapsed();
+                let bytes = resp.content_length().unwrap_or(256);
+                let quality = crate::cluster::LinkQuality::from_probe(
+                    rtt,
+                    bytes,
+                    rtt.max(Duration::from_millis(1)),
+                );
+                self.record_link_quality(peer.uuid, quality.clone()).await;
+                quality
+            }
+            Err(_) => {
+                let quality = crate::cluster::LinkQuality::unknown();
+                self.record_link_quality(peer.uuid, quality.clone()).await;
+                quality
+            }
+        }
     }
 
     /// Record a discovered service endpoint (from mDNS, static config, etc.) and merge into active peers.

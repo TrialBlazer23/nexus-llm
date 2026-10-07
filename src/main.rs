@@ -133,14 +133,14 @@ enum Commands {
         dir: Option<PathBuf>,
     },
 
-    /// Run as an RPC compute worker on Node B (MacBook) to receive offloaded model layers
+    /// Run as an RPC compute worker to receive offloaded model layers
     #[command(name = "worker", alias = "rpc")]
     Worker {
         /// TCP port to bind rpc-server (default: 50052)
         #[arg(short, long, default_value_t = 50052)]
         port: u16,
 
-        /// Maximum RAM allocation in Megabytes (default: 1800 MB limit for Node B safety)
+        /// Maximum RAM allocation in Megabytes (default 1800; raise freely on large hosts)
         #[arg(short, long, default_value_t = 1800)]
         mem: u64,
 
@@ -369,6 +369,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 context_size: ctx,
                 extra_args: Vec::new(),
                 use_mmap: config.hardware.safety.mmap,
+                use_mlock: false,
+                cpu_threads_batch: 6,
+                fallback_to_cpu: true,
+                cache_type_k: None,
+                cache_type_v: None,
                 memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
             };
             supervisor.spawn(server_cfg).await?;
@@ -631,9 +636,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Worker { port, mem, binary } => {
-            println!("=== Nexus-LLM RPC Compute Worker (Node B) ===");
-            if mem > 1800 {
-                eprintln!("WARNING: RAM allocation ({} MB) exceeds recommended 1800 MB limit for Node B safety!", mem);
+            println!("=== Nexus-LLM RPC Compute Worker ===");
+            let profile = SystemProfile::probe();
+            let safe = profile.max_allowed_memory_bytes() / (1024 * 1024);
+            if mem > safe {
+                eprintln!(
+                    "WARNING: RAM allocation ({} MB) exceeds this node's LMK-safe budget ({} MB).",
+                    mem, safe
+                );
             }
             println!(
                 "Binding rpc-server on port {} with max memory {} MB...",

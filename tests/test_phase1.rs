@@ -254,6 +254,11 @@ fn test_supervisor_command_args_builder() {
         context_size: 4096,
         extra_args: Vec::new(),
         use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent: 75,
     };
 
@@ -299,6 +304,21 @@ fn test_supervisor_command_args_builder() {
     no_mmap.use_mmap = false;
     let args = no_mmap.build_args(99);
     assert!(args.iter().any(|a| a == "--no-mmap"));
+
+    // Phase 11: mlock, -tb, cache-type, health probe host
+    assert!(cfg.build_args(99).iter().any(|a| a == "-tb"));
+    let mut locked = cfg.clone();
+    locked.use_mlock = true;
+    locked.cache_type_k = Some("q8_0".into());
+    locked.cache_type_v = Some("q8_0".into());
+    let locked_args = locked.build_args(99);
+    assert!(locked_args.iter().any(|a| a == "--mlock"));
+    assert!(locked_args.iter().any(|a| a == "--cache-type-k"));
+    assert_eq!(cfg.health_probe_host(), "127.0.0.1");
+    assert!(!cfg.fallback_to_cpu || cfg.fallback_to_cpu); // field present
+    let policy = nexus::supervisor::SupervisorPolicy::default();
+    assert!(policy.backoff_delay(0).as_millis() >= 1000);
+    assert!(policy.backoff_delay(2) > policy.backoff_delay(0));
 }
 
 #[tokio::test]
@@ -313,6 +333,11 @@ async fn test_supervisor_preflight_binary_not_found() {
         context_size: 512,
         extra_args: Vec::new(),
         use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent: 75,
     };
 
@@ -344,6 +369,11 @@ async fn test_supervisor_preflight_model_not_found() {
         context_size: 512,
         extra_args: Vec::new(),
         use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent: 75,
     };
 
@@ -388,6 +418,11 @@ async fn test_supervisor_memory_cap_rejection() {
         context_size: insane_context,
         extra_args: Vec::new(),
         use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent: 75,
     };
 

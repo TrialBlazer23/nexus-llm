@@ -19,11 +19,12 @@ fn test_cluster_budget_calculation() {
     assert_eq!(budget_low_ram.host_max_mb, 6000);
     assert_eq!(budget_low_ram.total_cluster_mb, 6000);
 
-    // Case 3: Host with explicit cap (e.g., 8500 MB)
-    let budget_capped = ClusterCoordinator::calculate_dynamic_budget(16000, Some(8500), Some(1800));
+    // Case 3: Host with explicit cap (e.g., 8500 MB) + large worker (no 1800 ceiling)
+    let budget_capped =
+        ClusterCoordinator::calculate_dynamic_budget(16000, Some(8500), Some(8192), 75);
     assert_eq!(budget_capped.host_max_mb, 8500);
-    assert_eq!(budget_capped.remote_max_mb, 1800);
-    assert_eq!(budget_capped.total_cluster_mb, 10300);
+    assert_eq!(budget_capped.remote_max_mb, 8192);
+    assert_eq!(budget_capped.total_cluster_mb, 16692);
 
     // Case 4: Host + Remote worker with custom allocatable budget
     let budget_cluster = ClusterCoordinator::calculate_budget(16000, Some(4000));
@@ -42,7 +43,7 @@ fn test_cluster_budget_calculation() {
 
 #[test]
 fn test_cluster_layer_split_standalone_fit() {
-    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800));
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800), 75);
     let model_size = 4000 * 1024 * 1024; // 4000 MB
     let kv_cache = 500 * 1024 * 1024;    // 500 MB
     let total_layers = 32;
@@ -66,7 +67,7 @@ fn test_cluster_layer_split_standalone_fit() {
 
 #[test]
 fn test_cluster_layer_split_overflow_offload() {
-    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800)); // Host: 8500 MB, Remote: 1800 MB, Total: 10300 MB
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800), 75); // Host: 8500 MB, Remote: 1800 MB, Total: 10300 MB
     let model_size = 8500 * 1024 * 1024; // 8500 MB
     let kv_cache = 1000 * 1024 * 1024;   // 1000 MB (Total required: 9500 MB)
     let total_layers = 32;
@@ -97,7 +98,7 @@ fn test_cluster_layer_split_overflow_offload() {
 
 #[test]
 fn test_cluster_memory_cap_exceeded_rejection() {
-    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800)); // Max 10300 MB
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), Some(1800), 75); // Max 10300 MB
     let model_size = 11000 * 1024 * 1024; // 11000 MB
     let kv_cache = 1000 * 1024 * 1024;   // 1000 MB (Total 12000 MB)
 
@@ -120,7 +121,7 @@ fn test_cluster_memory_cap_exceeded_rejection() {
 
 #[test]
 fn test_cluster_missing_rpc_peer_rejection() {
-    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), None); // Standalone only (0 remote)
+    let budget = ClusterCoordinator::calculate_dynamic_budget(12000, Some(8500), None, 75); // Standalone only (0 remote)
     let model_size = 8500 * 1024 * 1024;
     let kv_cache = 1000 * 1024 * 1024; // Total 9500 MB (exceeds 8500 MB host)
 
@@ -172,4 +173,11 @@ fn test_config_cluster_defaults() {
     assert_eq!(config.cluster.max_rpc_ram_mb, 1800);
     assert!(config.cluster.auto_offload);
     assert!(config.cluster.prefer_adb_tunnel);
+}
+
+#[test]
+fn test_max_rpc_ram_allows_large_worker() {
+    let mut config = NexusConfig::default();
+    config.cluster.max_rpc_ram_mb = 32_000; // 32 GB desktop worker
+    assert!(config.validate().is_ok());
 }

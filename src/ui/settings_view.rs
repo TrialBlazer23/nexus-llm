@@ -171,14 +171,14 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
     },
     SettingItem {
         category: "Distributed Cluster RPC",
-        name: "Node B Max RPC RAM Cap",
-        description: "Strict memory budget for Node B (capped at 1800 MB for Mac safety)",
+        name: "Worker Max RPC RAM Cap",
+        description: "Per-node RPC worker allocation default (no global ceiling; raise for large hosts)",
         setting_type: SettingType::MaxRpcRamMb,
     },
     SettingItem {
         category: "Distributed Cluster RPC",
         name: "Automatic Layer Offload Planning",
-        description: "Auto-calculate layer split when model exceeds Node A's 8.5 GB budget",
+        description: "Auto-calculate tensor-byte layer split when model exceeds host LMK budget",
         setting_type: SettingType::AutoOffload,
     },
 ];
@@ -411,9 +411,12 @@ impl SettingsView {
             }
             SettingType::MaxRpcRamMb => {
                 if is_left {
-                    self.config.cluster.max_rpc_ram_mb = self.config.cluster.max_rpc_ram_mb.saturating_sub(100).max(500);
+                    self.config.cluster.max_rpc_ram_mb =
+                        self.config.cluster.max_rpc_ram_mb.saturating_sub(100).max(256);
                 } else if is_right {
-                    self.config.cluster.max_rpc_ram_mb = (self.config.cluster.max_rpc_ram_mb + 100).min(1800);
+                    // No global 1800 MB ceiling — per-node worker caps (Phase 11).
+                    self.config.cluster.max_rpc_ram_mb =
+                        self.config.cluster.max_rpc_ram_mb.saturating_add(100).min(262_144);
                 }
             }
             SettingType::AutoOffload => {

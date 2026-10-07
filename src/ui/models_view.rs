@@ -96,12 +96,10 @@ impl ModelsView {
                 .enumerate()
                 .map(|(i, m)| {
                     let is_selected = i == self.selected_index;
-                    let (badge_text, badge_color) = if m.lmk_compatible {
-                        ("[OK]", Color::Green)
-                    } else if m.size_mb <= 10300 {
-                        ("[RPC]", Color::Yellow)
-                    } else {
-                        ("[OOM]", Color::Red)
+                    let (badge_text, badge_color) = match m.fit_badge.as_str() {
+                        "[OK]" => ("[OK]", Color::Green),
+                        "[RPC]" => ("[RPC]", Color::Yellow),
+                        _ => ("[OOM]", Color::Red),
                     };
 
                     let prefix = if is_selected { " > " } else { "   " };
@@ -166,7 +164,10 @@ impl ModelsView {
             let total_ram_mb = profile.total_ram_mb;
             let avail_ram_mb = profile.available_ram_mb;
             let lmk_cap_mb = profile.max_allowed_memory_bytes() / (1024 * 1024);
-            let required_mb = m.size_mb + m.exact_kv_mb;
+            let required_mb = m
+                .weights_mb
+                .saturating_add(m.exact_kv_mb)
+                .saturating_add(m.compute_buffer_mb);
 
             let ram_ratio = if lmk_cap_mb > 0 {
                 ((required_mb as f64) / (lmk_cap_mb as f64)).min(1.0)
@@ -174,9 +175,9 @@ impl ModelsView {
                 0.0
             };
 
-            let gauge_color = if required_mb <= lmk_cap_mb {
+            let gauge_color = if m.lmk_compatible {
                 Color::Green
-            } else if required_mb <= 10300 {
+            } else if m.cluster_fit {
                 Color::Yellow
             } else {
                 Color::Red
@@ -209,9 +210,18 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled(" Quantization:      ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        &m.quant_label,
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
                     Span::styled(" Weight Size:       ", Style::default().fg(Color::LightBlue)),
                     Span::styled(
-                        format!("{} MB", m.size_mb),
+                        format!("{} MB (plan {} MB)", m.size_mb, m.weights_mb),
                         Style::default().fg(Color::White),
                     ),
                 ]),

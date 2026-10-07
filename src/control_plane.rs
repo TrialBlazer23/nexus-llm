@@ -517,6 +517,11 @@ pub async fn handle_load_model(
         context_size: request.context_size,
         extra_args,
         use_mmap,
+        use_mlock: false,
+        cpu_threads_batch: request.threads,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
         memory_budget_percent,
     };
 

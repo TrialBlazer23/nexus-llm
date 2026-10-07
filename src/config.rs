@@ -146,11 +146,12 @@ impl NexusConfig {
                 "network.anchors.primary_compute_id and primary_client_id must be distinct".to_string(),
             ));
         }
-        if self.cluster.max_rpc_ram_mb > 1800 {
+        if self.cluster.max_rpc_ram_mb == 0 {
             return Err(ConfigError::Invalid(
-                "cluster.max_rpc_ram_mb cannot exceed 1800 MB".to_string(),
+                "cluster.max_rpc_ram_mb must be greater than 0".to_string(),
             ));
         }
+        // No global 1800 MB ceiling — worker caps are per-node (Phase 11 §3.3).
         Ok(())
     }
 

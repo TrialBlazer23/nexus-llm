@@ -59,8 +59,41 @@ pub struct LlamaServerConfig {
     pub extra_args: Vec<String>,
     /// When false, pass `--no-mmap` to llama-server.
     pub use_mmap: bool,
+    /// When true, pass `--mlock` to pin weights in RAM.
+    pub use_mlock: bool,
+    /// Batch thread count (`-tb`).
+    pub cpu_threads_batch: usize,
+    /// When false, Vulkan init failure is fatal (no silent CPU fallback).
+    pub fallback_to_cpu: bool,
+    pub cache_type_k: Option<String>,
+    pub cache_type_v: Option<String>,
     /// LMK / memory ceiling percent (from `hardware.safety.max_ram_usage_percent`).
     pub memory_budget_percent: u8,
+}
+
+/// Restart / demotion policy for unattended nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorPolicy {
+    pub max_restarts: u32,
+    pub base_backoff_ms: u64,
+    pub demote_gpu_after_n_vulkan_fails: u32,
+}
+
+impl Default for SupervisorPolicy {
+    fn default() -> Self {
+        Self {
+            max_restarts: 3,
+            base_backoff_ms: 1_000,
+            demote_gpu_after_n_vulkan_fails: 2,
+        }
+    }
+}
+
+impl SupervisorPolicy {
+    pub fn backoff_delay(&self, attempt: u32) -> Duration {
+        let mult = 1u64 << attempt.min(6);
+        Duration::from_millis(self.base_backoff_ms.saturating_mul(mult))
+    }
 }
 
 impl LlamaServerConfig {
@@ -80,6 +113,11 @@ impl LlamaServerConfig {
             context_size: 4096,
             extra_args: Vec::new(),
             use_mmap: true,
+            use_mlock: false,
+            cpu_threads_batch: 6,
+            fallback_to_cpu: true,
+            cache_type_k: None,
+            cache_type_v: None,
             memory_budget_percent: 75,
         }
     }
@@ -114,11 +152,35 @@ impl LlamaServerConfig {
             "-ngl".to_string(),
             effective_gpu_layers.to_string(),
         ];
+        if self.cpu_threads_batch > 0 {
+            args.push("-tb".to_string());
+            args.push(self.cpu_threads_batch.to_string());
+        }
         if !self.use_mmap {
             args.push("--no-mmap".to_string());
         }
+        if self.use_mlock {
+            args.push("--mlock".to_string());
+        }
+        if let Some(k) = &self.cache_type_k {
+            args.push("--cache-type-k".to_string());
+            args.push(k.clone());
+        }
+        if let Some(v) = &self.cache_type_v {
+            args.push("--cache-type-v".to_string());
+            args.push(v.clone());
+        }
         args.extend(self.extra_args.clone());
         args
+    }
+
+    /// Always probe loopback for health, even when bind host is 0.0.0.0.
+    pub fn health_probe_host(&self) -> &str {
+        if self.host == "0.0.0.0" || self.host == "::" || self.host.is_empty() {
+            "127.0.0.1"
+        } else {
+            &self.host
+        }
     }
 }
 
@@ -262,25 +324,28 @@ impl ProcessSupervisor {
                             }
                         }
                         Err(err_msg) => {
-                            warn!(
-                                "Vulkan initialization failed ({}); falling back to CPU mode...",
-                                err_msg
-                            );
-                            // Kill failed child cleanly
+                            warn!("Vulkan initialization failed ({})", err_msg);
                             let _ = child.kill().await;
+                            if !config.fallback_to_cpu {
+                                return Err(SupervisorError::SpawnFailed(format!(
+                                    "Vulkan init failed and fallback_to_cpu=false: {err_msg}"
+                                )));
+                            }
+                            warn!("Falling back to CPU mode...");
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to spawn with Vulkan flags: {}; falling back to CPU mode...",
-                        e
-                    );
+                    warn!("Failed to spawn with Vulkan flags: {}", e);
+                    if !config.fallback_to_cpu {
+                        return Err(e);
+                    }
+                    warn!("Falling back to CPU mode...");
                 }
             }
         }
 
-        // Attempt 2: CPU fallback
+        // Attempt 2: CPU fallback (or primary when gpu_layers == 0)
         info!(
             "Spawning llama-server in CPU mode (-ngl 0, threads: {})",
             config.threads
@@ -480,9 +545,13 @@ impl ProcessSupervisor {
         false
     }
 
-    /// Query child status and probe `http://{host}:{port}/health`.
+    /// Query child status and probe `http://127.0.0.1:{port}/health` (or bind host).
     pub async fn is_healthy(&self) -> bool {
-        let health_url = format!("http://{}:{}/health", self.config.host, self.config.port);
+        let health_url = format!(
+            "http://{}:{}/health",
+            self.config.health_probe_host(),
+            self.config.port
+        );
 
         match self.client.get(&health_url).send().await {
             Ok(resp) => {
@@ -541,11 +610,12 @@ impl ProcessSupervisor {
 
 impl Drop for ProcessSupervisor {
     fn drop(&mut self) {
+        // Prefer SIGTERM; kill_on_drop(true) still covers hard teardown if needed.
         if let Some(child) = self.child.take() {
             if let Some(pid) = child.id() {
-                debug!("Dropping ProcessSupervisor: sending SIGKILL to PID {}", pid);
+                debug!("Dropping ProcessSupervisor: sending SIGTERM to PID {}", pid);
                 unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
                 }
             }
         }
@@ -553,16 +623,42 @@ impl Drop for ProcessSupervisor {
 }
 
 /// Shared thread-safe handle to manage an active ProcessSupervisor instance.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SupervisorManager {
     inner: std::sync::Arc<tokio::sync::Mutex<Option<ProcessSupervisor>>>,
+    policy: SupervisorPolicy,
+    restart_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    vulkan_fail_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    last_config: std::sync::Arc<tokio::sync::Mutex<Option<LlamaServerConfig>>>,
+}
+
+impl Default for SupervisorManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SupervisorManager {
     pub fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            policy: SupervisorPolicy::default(),
+            restart_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            vulkan_fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_config: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn with_policy(policy: SupervisorPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::new()
+        }
+    }
+
+    /// Exponential backoff delay for the Nth restart attempt.
+    pub fn restart_backoff(&self, attempt: u32) -> Duration {
+        self.policy.backoff_delay(attempt)
     }
 
     /// True when a supervisor child process slot is occupied (may still be starting).
@@ -635,9 +731,55 @@ impl SupervisorManager {
         if let Some(mut existing) = lock.take() {
             let _ = existing.stop().await;
         }
+        {
+            let mut last = self.last_config.lock().await;
+            *last = Some(config.clone());
+        }
         let sup = ProcessSupervisor::spawn_with_fallback(config).await?;
         *lock = Some(sup);
+        self.restart_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Restart the last config with backoff; demote GPU after repeated Vulkan failures.
+    pub async fn restart_with_backoff(&self) -> Result<(), SupervisorError> {
+        let attempt = self
+            .restart_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if attempt >= self.policy.max_restarts {
+            return Err(SupervisorError::SpawnFailed(format!(
+                "exceeded max_restarts ({})",
+                self.policy.max_restarts
+            )));
+        }
+        let delay = self.policy.backoff_delay(attempt);
+        tokio::time::sleep(delay).await;
+
+        let mut config = self
+            .last_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| SupervisorError::SpawnFailed("no prior config to restart".into()))?;
+
+        let vulkan_fails = self
+            .vulkan_fail_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if vulkan_fails >= self.policy.demote_gpu_after_n_vulkan_fails {
+            warn!(
+                "Demoting to CPU after {} Vulkan failures",
+                vulkan_fails
+            );
+            config.gpu_layers = 0;
+        }
+
+        self.spawn(config).await
+    }
+
+    pub fn note_vulkan_failure(&self) {
+        self.vulkan_fail_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Stop the active model supervisor.

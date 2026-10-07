@@ -10,7 +10,11 @@
 (PR #10). Phase 9 trust is **shipped** on `cursor/phase9-trust-4865` (Ed25519
 identity, signed control plane, TOFU pairing, registry verification at runtime).
 Historical findings below are preserved; status markers call out what is done vs
-still open. **Recommended next phase: Phase 10 (model store / LAN transfer).** Phase 8 TUI is Done.
+still open. **Recommended next phase: Phase 10 (model store / LAN transfer) then
+Phase 11 (placement) on `cursor/phase11-placement-intelligence-d6cb`.** Phase 8 TUI is Done.
+Phase 11 placement intelligence is implemented on that branch (MemoryPlan, tensor
+GGUF parse, multi-worker ranking, supervisor harden); still needs live llama.cpp
+validation on target hardware.
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -41,7 +45,8 @@ inert — are mechanically reproducible:
 | `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
 | Peer registry as runtime SoT | **Done** | `src/registry_runtime.rs`, `src/discovery.rs`, Cluster UI |
 | TUI responsiveness / hub split | **Done — Phase 8** | `src/ui/hub/` command/event + ChatEntry |
-| Model store / LAN transfer | **Open — Phase 10** | §4 |
+| Model store / LAN transfer | **Open — Phase 10** (PR #13 draft) | §4 |
+| Placement intelligence | **Done on branch** — Phase 11 | `src/cluster/{memory,split,rank}.rs`, `gguf.rs`, `supervisor.rs` |
 
 ---
 
@@ -1219,23 +1224,25 @@ extended network/control-plane tests.
 verifies by digest, and loads; an interrupted transfer resumes; a corrupted
 partial is detected and discarded rather than resumed.
 
-### Phase 11 — Placement intelligence
+### Phase 11 — Placement intelligence — **Done on branch** (`cursor/phase11-placement-intelligence-d6cb`)
 
 - Explicit `MemoryPlan` replacing the boolean guard; `max_ram_usage_percent`
-  honored (§3.1, §3.2)
-- GGUF tensor section parsed; bounded allocations; quantization displayed (§3.4)
-- Per-tensor layer-split planning validated against real llama.cpp (§3.5)
-- Multiple RPC workers; link-quality probing; predicted-throughput ranking (§3.6)
-- Supervisor: honor `fallback_to_cpu`, plumb memory and performance flags,
-  restart with backoff and GPU demotion (§3.7)
-- Remove the remaining hardcoded device constants (§3.3)
+  honored (§3.1, §3.2) — **Done** (`src/cluster/memory.rs`)
+- GGUF tensor section parsed; bounded allocations; quantization displayed (§3.4) — **Done**
+- Per-tensor layer-split planning; CLI args unit-tested (§3.5) — **Done**;
+  **live llama.cpp validation still required** on Penryn + Snapdragon
+- Multiple RPC workers; link-quality probing; predicted-throughput ranking (§3.6) — **Done**
+- Supervisor: honor `fallback_to_cpu`, plumb memory/performance flags,
+  restart with backoff and GPU demotion (§3.7) — **Done**
+- Remove the remaining hardcoded device constants (§3.3) — **Done** (no global 1800 ceiling)
 
-*Invasiveness:* the largest change to core logic; consolidates placement into one
-module. Requires measurement on both target hardware classes.
-*Acceptance:* a 1.5B model is no longer rejected by the 200 KB/token estimate; a
-split plan derived from tensor bytes loads successfully where the fraction-based
-plan failed; the operator sees ranked options with predicted tokens per second; a
-32 GB worker can advertise more than 1800 MB.
+*Invasiveness:* the largest change to core logic; consolidates placement into
+`src/cluster/`. Requires measurement on both target hardware classes.
+*Acceptance:* a 1.5B model is no longer rejected by the 200 KB/token estimate
+(unit-tested); a split plan derived from tensor bytes loads successfully where
+the fraction-based plan failed (**needs live GGUF**); the operator sees ranked
+options with predicted tokens per second; a 32 GB worker can advertise more than
+1800 MB (config validate unit-tested).
 
 ### Phase 12 — Capability expansion
 

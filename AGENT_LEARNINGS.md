@@ -25,6 +25,28 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-07 — Phase 11 placement: MemoryPlan, tensor split, ranking, supervisor
+- Category: design-decision
+- Context: CAPABILITY_REVIEW §3 / Phase 11 on `cursor/phase11-placement-intelligence-d6cb` from `origin/main` @ `2e9003f`. Phase 10 PR #13 still draft — branch does not depend on the model store.
+- Finding:
+  1. Boolean LMK + 200 KB/token heuristic over-rejects 1.5B-class models; `MemoryPlan` with GGUF dims + mmap-resident weights + kv_dtype is the right API.
+  2. Fraction×layers under-offloads when embeddings/output are large; plan from per-tensor `blk.N.*` bytes and refuse missing `block_count` (no more `unwrap_or(32)`).
+  3. Global `max_rpc_ram_mb > 1800` reject blocked 32 GB workers — keep 1800 as default only, not a ceiling.
+  4. Ranking objective is predicted tok/s (`min(compute, network)`); unknown link quality demotes offload. Network offload is last-resort for fit, not a perf feature.
+  5. Supervisor must honor `fallback_to_cpu=false`, probe health on `127.0.0.1`, pass `--mlock`/`-tb`/`--cache-type-k/v`, and expose restart backoff + GPU demotion policy.
+- Action: Grew `src/cluster/{mod,memory,split,rank}.rs`; hardened `gguf.rs`; wired hub target modal + Models badges; lifted 1800 clamps.
+- Verification: `cargo test --locked` green. **Still unverified live:** tensor-byte `--rpc --split-mode layer` (+ optional `--tensor-split`) against real `llama-server`/`rpc-server` on Penryn and Snapdragon; calibrate `compute_buffer_mb` defaults and record measured numbers here.
+
+### Live validation runbook (Phase 11)
+```bash
+# On each target class, with a GGUF that fraction-planning under-offloaded:
+cargo run --locked --bin nexus -- info
+# Load via hub target modal; confirm ranked tok/s labels and distributed option.
+# Compare emitted args to a manual llama-server invocation:
+#   llama-server -m MODEL -c 2048 -ngl 99 --rpc WORKER:50052 --split-mode layer [--tensor-split H,W]
+# Confirm load succeeds; note RSS vs MemoryPlan; update compute_buffer_mb if far off.
+```
+
 ## 2026-10-06 — Phase 8 TUI: command/event bus, ChatEntry, hot-swap -ngl
 - Category: design-decision
 - Context: CAPABILITY_REVIEW §2 Phase 8 on `cursor/phase8-tui-responsiveness-4865` stacked on Phase 9 trust.

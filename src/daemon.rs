@@ -199,16 +199,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 remote_ram,
             );
 
-            let total_layers = if let Ok(gguf) = nexus::gguf::GgufMetadata::open(&model_path) {
-                gguf.block_count.unwrap_or(32) as u32
-            } else {
-                32
-            };
+            let gguf = nexus::gguf::GgufMetadata::open(&model_path)
+                .map_err(|e| format!("GGUF parse failed for placement: {e}"))?;
+            if !gguf.has_geometry() {
+                return Err(
+                    "GGUF geometry missing (block_count); refuse to plan layer split".into(),
+                );
+            }
 
-            let split = nexus::cluster::ClusterCoordinator::plan_layer_split(
-                model_size_bytes,
-                kv_bytes,
-                total_layers,
+            let split = nexus::cluster::ClusterCoordinator::plan_from_gguf(
+                &gguf,
+                args.ctx,
                 &budget,
                 rpc_endpoint.as_deref(),
             )?;
@@ -235,6 +236,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             context_size: args.ctx,
             extra_args,
             use_mmap: config.hardware.safety.mmap,
+            use_mlock: false,
+            cpu_threads_batch: 6,
+            fallback_to_cpu: true,
+            cache_type_k: None,
+            cache_type_v: None,
             memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
         };
 

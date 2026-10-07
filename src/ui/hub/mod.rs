@@ -18,7 +18,8 @@ use crate::ui::cluster_view::ClusterView;
 use crate::ui::models_view::ModelsView;
 use crate::ui::settings_view::SettingsView;
 use commands::{
-    request_load_or_hot_swap, spawn_hub_worker, HubCommand, HubEvent, HubWorkerCtx,
+    request_load_or_hot_swap, request_load_or_hot_swap_with_args, spawn_hub_worker, HubCommand,
+    HubEvent, HubWorkerCtx,
 };
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
@@ -70,11 +71,13 @@ pub enum TargetExecutionNode {
         allocatable_mb: u64,
         backend: String,
         gpu_layers: u32,
+        predicted_label: String,
     },
     LocalCpu {
         allocatable_mb: u64,
         backend: String,
         threads: usize,
+        predicted_label: String,
     },
     Remote {
         uuid: Uuid,
@@ -83,6 +86,14 @@ pub enum TargetExecutionNode {
         api_endpoint: String,
         free_ram_mb: u32,
         backend: String,
+        predicted_label: String,
+    },
+    Distributed {
+        worker_names: Vec<String>,
+        predicted_label: String,
+        rpc_endpoints: Vec<String>,
+        extra_args: Vec<String>,
+        gpu_layers: u32,
     },
 }
 
@@ -93,20 +104,33 @@ impl TargetExecutionNode {
                 allocatable_mb,
                 backend,
                 gpu_layers,
+                predicted_label,
             } => {
                 format!(
-                    "⚡ Local GPU (Accelerated - {} layers) - {} MB allocatable | {}",
-                    gpu_layers, allocatable_mb, backend
+                    "⚡ Local GPU ({} layers) - {} MB | {} | {}",
+                    gpu_layers, allocatable_mb, backend, predicted_label
                 )
             }
             Self::LocalCpu {
                 allocatable_mb,
                 backend,
                 threads,
+                predicted_label,
             } => {
                 format!(
-                    "🛡️  Local CPU (Safe Mode - 0 GPU layers, {} threads) - {} MB allocatable | {}",
-                    threads, allocatable_mb, backend
+                    "🛡️  Local CPU (0 GPU layers, {} threads) - {} MB | {} | {}",
+                    threads, allocatable_mb, backend, predicted_label
+                )
+            }
+            Self::Distributed {
+                worker_names,
+                predicted_label,
+                ..
+            } => {
+                format!(
+                    "🔗 Distributed RPC [{}] | {}",
+                    worker_names.join(", "),
+                    predicted_label
                 )
             }
             Self::Remote {
@@ -114,11 +138,12 @@ impl TargetExecutionNode {
                 endpoint,
                 free_ram_mb,
                 backend,
+                predicted_label,
                 ..
             } => {
                 format!(
-                    "📱 {} ({}) - {} MB free | {}",
-                    name, endpoint, free_ram_mb, backend
+                    "📱 {} ({}) - {} MB free | {} | {}",
+                    name, endpoint, free_ram_mb, backend, predicted_label
                 )
             }
         }
@@ -140,6 +165,7 @@ pub struct HotSwapIntent {
     pub path: PathBuf,
     pub gpu_layers: Option<u32>,
     pub context_size: usize,
+    pub extra_args: Vec<String>,
 }
 
 pub struct HubApp {
@@ -835,6 +861,35 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     gpu_layers,
                                                 });
                                             }
+                                            TargetExecutionNode::Distributed {
+                                                extra_args,
+                                                gpu_layers,
+                                                worker_names,
+                                                ..
+                                            } => {
+                                                hub.chat.set_target_hardware(
+                                                    "Distributed",
+                                                    format!("RPC [{}]", worker_names.join(", ")),
+                                                );
+                                                match request_load_or_hot_swap_with_args(
+                                                    &hub.supervisor,
+                                                    state.model_path.clone(),
+                                                    Some(*gpu_layers),
+                                                    ctx_size,
+                                                    extra_args.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(cmd) => {
+                                                        hub.load_phase =
+                                                            Some("Queued distributed load…".into());
+                                                        let _ = cmd_tx.try_send(cmd);
+                                                    }
+                                                    Err(intent) => {
+                                                        hub.pending_hot_swap = Some(intent);
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -863,6 +918,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             path: intent.path,
                                             gpu_layers: intent.gpu_layers,
                                             context_size: intent.context_size,
+                                            extra_args: intent.extra_args,
                                         });
                                     }
                                 }
@@ -878,6 +934,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     path: intent.path,
                                     gpu_layers: intent.gpu_layers,
                                     context_size: intent.context_size,
+                                    extra_args: intent.extra_args,
                                 });
                             }
                         } else if matches!(key.code, KeyCode::Char('N')) {

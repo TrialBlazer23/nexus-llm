@@ -15,8 +15,8 @@ fn build_synthetic_gguf() -> Vec<u8> {
     // 2. Version 3 (u32)
     buf.extend_from_slice(&3u32.to_le_bytes());
 
-    // 3. Tensor count: 128 (u64)
-    buf.extend_from_slice(&128u64.to_le_bytes());
+    // 3. Tensor count: 0 (u64) — header/KV-only fixture (tensor section tested separately)
+    buf.extend_from_slice(&0u64.to_le_bytes());
 
     // 4. Metadata KV count: 6 (u64)
     buf.extend_from_slice(&6u64.to_le_bytes());
@@ -67,7 +67,7 @@ fn test_gguf_synthetic_v3_header_parsing() {
     let meta = GgufMetadata::read(&mut cursor).expect("Failed to parse synthetic GGUF");
 
     assert_eq!(meta.version, 3);
-    assert_eq!(meta.tensor_count, 128);
+    assert_eq!(meta.tensor_count, 0);
     assert_eq!(meta.kv_count, 6);
     assert_eq!(meta.architecture.as_deref(), Some("llama"));
     assert_eq!(meta.model_name.as_deref(), Some("Llama-3-8B-Instruct"));

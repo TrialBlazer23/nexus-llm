@@ -92,17 +92,24 @@ Nexus-LLM enforces an explicit acceleration and memory waterfall whenever a mode
 In addition to the advisory 64-byte UDP beacon (port 9999) and mDNS-SD browsing, the Nexus control plane handles verified state synchronization and remote process dispatch over HTTP.
 
 ### Endpoints
-- **`GET /cluster/state`**: Returns verified node identity, protocol version, active role, current model, and allocatable memory budget.
-- **`POST /cluster/model/load`**: Dispatches a model execution request to the target node.
+
+Canonical paths (Phase 7+). A `GET /cluster/models` alias remains for catalog convenience.
+
+- **`POST /nexus/control/v1/state`**: Returns verified node identity, protocol version, active role, current model, and allocatable memory budget. (Signed when pairing is enforced; unsigned localhost allowed for doctor/tests when unpaired.)
+- **`GET /nexus/control/v1/models`**: Filename-based model catalog (`GET /cluster/models` alias).
+- **`POST /nexus/control/v1/model/load`**: Dispatches a model execution request to the target node.
   ```json
   {
+    "protocol_version": 1,
+    "requester_id": "…",
     "model_path": "qwen2.5-coder-7b.gguf",
     "context_size": 4096,
     "gpu_layers": 99,
     "rpc_workers": ["192.168.1.105:50052"]
   }
   ```
-- **`POST /cluster/model/unload`**: Gracefully terminates the running `llama-server` process on that node.
+- **`POST /nexus/control/v1/model/unload`**: Gracefully terminates the running `llama-server` process on that node.
+- **`POST /nexus/control/v1/pair`**: Ed25519 pairing (Phase 9).
 
 ---
 
@@ -115,7 +122,7 @@ When an operator selects a model in the Models view:
    - `[1] Local Machine (Host)`
    - `[2] Samsung Galaxy S23 (Termux - Vulkan, 8.5 GB allocatable)`
    - `[3] Linux PC (CUDA, 16.0 GB allocatable)`
-3. On selection, the local TUI either spawns `ProcessSupervisor` directly (if Local) or transmits `POST /cluster/model/load` to the remote peer.
+3. On selection, the local TUI either spawns `ProcessSupervisor` directly (if Local) or transmits `POST /nexus/control/v1/model/load` to the remote peer.
 
 ### Dynamic Chat Routing (`[F1: Chat]`)
 - The chat engine dynamically binds to whichever node is actively hosting the loaded model.

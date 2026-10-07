@@ -240,7 +240,11 @@ impl ProcessSupervisor {
                     match vulkan_result {
                         Ok(()) => {
                             info!("Vulkan acceleration successfully initialized.");
-                            Self::spawn_drain_tasks(stdout_reader, stderr_reader, stderr_history.clone());
+                            Self::spawn_drain_tasks(
+                                stdout_reader,
+                                stderr_reader,
+                                stderr_history.clone(),
+                            );
                             let (state_tx, _) = watch::channel(SupervisorState::Starting);
                             let mut supervisor = Self {
                                 child: Some(child),

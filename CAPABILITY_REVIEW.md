@@ -1253,11 +1253,20 @@ instead of thermally throttling mid-generation.
 
 ### Continuous
 
-- CI: fmt, clippy at zero warnings, tests, Android cross-check, AVX-opcode scan
-  (§6)
-- Fuzz and property coverage for the beacon and GGUF decoders (§3.4, §6)
-- Fake `llama-server` harness and a two-node in-process mesh test (§0, §6)
-- Documentation sweep after each phase (§6)
+> **Status (2026-10-07): Done on `cursor/continuous-ci-hygiene-d6cb`.**
+> CI workflow (fmt / clippy `-D warnings` / `cargo test --locked`), Android
+> best-effort `aarch64-linux-android` check, Penryn release-binary opcode scan,
+> `proptest` + adversarial coverage for `BeaconPacket::decode` /
+> `GgufMetadata::read` (minimal allocation bounds; not Phase 11 tensor parse),
+> fake `llama-server` harness + two-node in-process mesh test, light docs drift
+> sweep. Out of scope: Phase 10/11/12, beacon v2, SSE `/events`.
+
+- ~~CI: fmt, clippy at zero warnings, tests, Android cross-check, AVX-opcode scan
+  (§6)~~ **Done**
+- ~~Fuzz and property coverage for the beacon and GGUF decoders (§3.4, §6)~~ **Done**
+  (`proptest`; no `cargo-fuzz` CI)
+- ~~Fake `llama-server` harness and a two-node in-process mesh test (§0, §6)~~ **Done**
+- ~~Documentation sweep after each phase (§6)~~ **Done** (Continuous drift only)
 
 ---
 

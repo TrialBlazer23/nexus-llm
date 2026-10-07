@@ -115,10 +115,7 @@ impl ModelsView {
 
                     let line = Line::from(vec![
                         Span::styled(prefix, style),
-                        Span::styled(
-                            format!("{:<32}", truncate_string(&m.filename, 30)),
-                            style,
-                        ),
+                        Span::styled(format!("{:<32}", truncate_string(&m.filename, 30)), style),
                         Span::styled(
                             format!("{:>6} MB ", m.size_mb),
                             Style::default().fg(Color::Gray),
@@ -184,7 +181,10 @@ impl ModelsView {
 
             let info_lines = vec![
                 Line::from(vec![
-                    Span::styled(" Model File:        ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Model File:        ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         &m.filename,
                         Style::default()
@@ -193,14 +193,20 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Format Version:    ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Format Version:    ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("GGUF v{}", m.gguf_version),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Architecture:      ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Architecture:      ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         &m.architecture,
                         Style::default()
@@ -209,42 +215,60 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Weight Size:       ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Weight Size:       ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} MB", m.size_mb),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Transformer Layers:", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Transformer Layers:",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{}", m.block_count),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Attention Heads:   ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Attention Heads:   ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{}", m.head_count),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Embedding Length:  ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Embedding Length:  ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{}", m.embedding_length),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Context Limit:     ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Context Limit:     ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} tokens", m.context_length),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Selected Context:  ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Selected Context:  ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} tokens (+/-)", self.selected_context),
                         Style::default()
@@ -253,7 +277,10 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Exact KV Cache (4k):", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Exact KV Cache (4k):",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} MB", m.exact_kv_mb),
                         Style::default().fg(Color::White),
@@ -289,7 +316,8 @@ impl ModelsView {
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
             } else if m.lmk_compatible {
-                " [Enter] Select Device  |  [+/-] Context  |  [u] Unload  |  [R] Rescan ".to_string()
+                " [Enter] Select Device  |  [+/-] Context  |  [u] Unload  |  [R] Rescan "
+                    .to_string()
             } else {
                 " [Enter] Select Cluster Node  |  [+/-] Context  |  [u] Unload  |  [R] Rescan "
                     .to_string()

@@ -4,17 +4,17 @@
 //! remote dispatch) runs off the TUI event loop. The loop only draws, mutates
 //! state from [`HubEvent`], and enqueues [`HubCommand`].
 
+use super::{HotSwapIntent, TargetExecutionNode, TargetSelectionState};
 use crate::config::NexusConfig;
+use crate::control_plane::ControlPlaneError;
 use crate::control_plane::{
     dispatch_load_model, dispatch_load_model_signed, ModelLoadRequest, ModelLoadResponse,
     CONTROL_PLANE_VERSION,
 };
-use crate::control_plane::ControlPlaneError;
 use crate::discovery::{DiscoveryService, RpcSelectionPolicy, StatusFlags};
 use crate::node_identity::NodeIdentity;
 use crate::supervisor::{LlamaServerConfig, SupervisorManager, SupervisorState};
 use crate::sysinfo::SystemProfile;
-use super::{HotSwapIntent, TargetExecutionNode, TargetSelectionState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,9 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum HubCommand {
     /// Open target-selection modal (probe peers off the UI thread).
-    OpenTargetSelection { model_path: PathBuf },
+    OpenTargetSelection {
+        model_path: PathBuf,
+    },
     /// Load locally with optional GPU-layer override (0 = CPU safe mode).
     LoadModelLocal {
         path: PathBuf,
@@ -43,27 +45,43 @@ pub enum HubCommand {
         context_size: usize,
         gpu_layers: u32,
     },
-    Unload { active_model_name: String },
+    Unload {
+        active_model_name: String,
+    },
     RefreshCluster,
     /// Reserved for Phase 10 — WAN download.
-    StartDownload { url: String },
+    StartDownload {
+        url: String,
+    },
     /// Reserved for Phase 10 — LAN blob transfer.
-    TransferModel { peer_endpoint: String, digest: String },
+    TransferModel {
+        peer_endpoint: String,
+        digest: String,
+    },
 }
 
 /// Events applied on the UI thread.
 #[derive(Debug)]
 pub enum HubEvent {
-    Status { message: String, color: ratatui::style::Color },
-    ModelLoadProgress { phase: String },
+    Status {
+        message: String,
+        color: ratatui::style::Color,
+    },
+    ModelLoadProgress {
+        phase: String,
+    },
     ModelLoaded {
         model_name: String,
         endpoint: String,
         backend_label: String,
         notice: String,
     },
-    ModelFailed { message: String },
-    ModelUnloaded { unloaded_model: String },
+    ModelFailed {
+        message: String,
+    },
+    ModelUnloaded {
+        unloaded_model: String,
+    },
     UnloadNoop,
     TargetSelectionReady(TargetSelectionState),
     RemoteLoadSucceeded {
@@ -73,7 +91,9 @@ pub enum HubEvent {
         api_endpoint: String,
         notice: String,
     },
-    RemoteLoadFailed { message: String },
+    RemoteLoadFailed {
+        message: String,
+    },
     ClusterRefreshed,
     /// Supervisor child exited unexpectedly.
     SupervisorCrashed {
@@ -155,7 +175,10 @@ pub fn spawn_hub_worker(
     })
 }
 
-pub(crate) async fn build_target_selection(ctx: &HubWorkerCtx, model_path: PathBuf) -> TargetSelectionState {
+pub(crate) async fn build_target_selection(
+    ctx: &HubWorkerCtx,
+    model_path: PathBuf,
+) -> TargetSelectionState {
     let model_name = model_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -218,6 +241,8 @@ async fn dispatch_remote(
     }
 }
 
+// Continuous: remote-load progress needs distinct display fields; avoid drive-by struct.
+#[allow(clippy::too_many_arguments)]
 async fn run_remote_load(
     ctx: &HubWorkerCtx,
     evt_tx: &mpsc::Sender<HubEvent>,
@@ -248,12 +273,12 @@ async fn run_remote_load(
     info!("Dispatching remote model load to {endpoint}: {req:?}");
     match dispatch_remote(ctx, endpoint, req).await {
         Ok(resp) if resp.success => {
-            let target_api = if !resp.api_endpoint.is_empty() && !resp.api_endpoint.contains("0.0.0.0")
-            {
-                resp.api_endpoint
-            } else {
-                api_endpoint.to_string()
-            };
+            let target_api =
+                if !resp.api_endpoint.is_empty() && !resp.api_endpoint.contains("0.0.0.0") {
+                    resp.api_endpoint
+                } else {
+                    api_endpoint.to_string()
+                };
             let _ = evt_tx
                 .send(HubEvent::RemoteLoadSucceeded {
                     model_name: model_name.to_string(),
@@ -434,9 +459,7 @@ async fn run_local_load(
 
     let _ = evt_tx
         .send(HubEvent::ModelLoadProgress {
-            phase: format!(
-                "Spawning llama-server (-ngl {gpu_layers}, ctx {context_size})…"
-            ),
+            phase: format!("Spawning llama-server (-ngl {gpu_layers}, ctx {context_size})…"),
         })
         .await;
 
@@ -479,9 +502,7 @@ async fn run_local_load(
     match spawn_result {
         Ok(()) => {
             ctx.discovery.set_active_model(&model_name).await;
-            ctx.discovery
-                .set_status_flags(StatusFlags::READY)
-                .await;
+            ctx.discovery.set_status_flags(StatusFlags::READY).await;
             let endpoint = format!("http://127.0.0.1:{}", ctx.config.network.api_port);
             let backend_label = if gpu_layers > 0 {
                 format!("Local GPU ({gpu_layers} layers)")

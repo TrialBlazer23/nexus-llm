@@ -114,7 +114,7 @@ impl NodeIdentity {
                 .mode(0o600)
                 .open(path)?;
             file.write_all(&self.signing_key.to_bytes())?;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -133,7 +133,7 @@ pub fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &[u8; 
 }
 
 pub fn parse_public_key_hex(hex: &str) -> Result<[u8; 32], IdentityError> {
-    let bytes = hex_decode(hex.trim()).map_err(|e| IdentityError::InvalidKey(e))?;
+    let bytes = hex_decode(hex.trim()).map_err(IdentityError::InvalidKey)?;
     if bytes.len() != 32 {
         return Err(IdentityError::InvalidKey(format!(
             "public key must be 32 bytes, got {}",
@@ -167,8 +167,8 @@ pub fn pairing_code(signing_key: &SigningKey, unix_secs: u64) -> String {
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
     let window = unix_secs / PAIRING_CODE_WINDOW_SECS;
-    let mut mac = HmacSha256::new_from_slice(&signing_key.to_bytes())
-        .expect("HMAC accepts 32-byte key");
+    let mut mac =
+        HmacSha256::new_from_slice(&signing_key.to_bytes()).expect("HMAC accepts 32-byte key");
     mac.update(b"nexus-pair-v1");
     mac.update(&window.to_be_bytes());
     let digest = mac.finalize().into_bytes();
@@ -202,10 +202,7 @@ mod tests {
     fn derived_node_id_is_stable() {
         let id1 = NodeIdentity::generate();
         let id2 = id1.clone();
-        assert_eq!(
-            id1.node_id_from_public_key(),
-            id2.node_id_from_public_key()
-        );
+        assert_eq!(id1.node_id_from_public_key(), id2.node_id_from_public_key());
     }
 
     #[test]

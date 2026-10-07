@@ -56,6 +56,8 @@ pub struct ControlPlaneContext {
 }
 
 impl ControlPlaneContext {
+    // Continuous: keep flat ctor; reshaping into a builder is out of scope for hygiene.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: Uuid,
         role: NodeRole,
@@ -193,6 +195,8 @@ async fn route(
     }
 }
 
+// Err carries a ready HTTP response; boxing would add noise without shrinking the hot path.
+#[allow(clippy::result_large_err)]
 async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Bytes>>> {
     let limited = Limited::new(req.into_body(), MAX_CONTROL_RESPONSE_BYTES);
     let collected = match limited.collect().await {
@@ -237,7 +241,13 @@ async fn handle_state(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -287,7 +297,13 @@ async fn handle_load(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -356,7 +372,13 @@ async fn handle_unload(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -441,7 +463,13 @@ async fn handle_pair(
         }
     };
 
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -464,7 +492,10 @@ async fn handle_pair(
     }
 
     let unix_now = crate::trust_auth::unix_timestamp_now() as u64;
-    if !ctx.identity.verify_pairing_code_at(unix_now, &pair_req.pairing_code) {
+    if !ctx
+        .identity
+        .verify_pairing_code_at(unix_now, &pair_req.pairing_code)
+    {
         return json_response(
             StatusCode::FORBIDDEN,
             &serde_json::json!({"error": "invalid pairing code"}),

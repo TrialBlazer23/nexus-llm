@@ -56,7 +56,9 @@ pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
                 };
                 current_spans.push(Span::styled(
                     prefix.to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
 
@@ -85,7 +87,9 @@ pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
                 }
                 current_spans.push(Span::styled(
                     "  • ".to_string(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
 
@@ -156,7 +160,10 @@ pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
                             if in_blockquote {
                                 current_spans.insert(
                                     0,
-                                    Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
+                                    Span::styled(
+                                        " │ ".to_string(),
+                                        Style::default().fg(Color::DarkGray),
+                                    ),
                                 );
                             }
                             lines.push(Line::from(std::mem::take(&mut current_spans)));
@@ -168,16 +175,14 @@ pub fn render_markdown(input: &str) -> Vec<Line<'static>> {
                 }
             }
 
-            Event::SoftBreak | Event::HardBreak => {
-                if !in_code_block {
-                    if in_blockquote {
-                        current_spans.insert(
-                            0,
-                            Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
-                        );
-                    }
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+            Event::SoftBreak | Event::HardBreak if !in_code_block => {
+                if in_blockquote {
+                    current_spans.insert(
+                        0,
+                        Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray)),
+                    );
                 }
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
             }
 
             _ => {}
@@ -209,18 +214,21 @@ pub fn format_code_block(lang: &str, code: &str) -> Vec<Line<'static>> {
     let display_lang = if lang.is_empty() { "code" } else { lang };
 
     // Header bar
-    let header_text = format!("   ┌─ {} ──────────────────────────────────────────", display_lang);
+    let header_text = format!(
+        "   ┌─ {} ──────────────────────────────────────────",
+        display_lang
+    );
     lines.push(Line::from(Span::styled(
         header_text,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
 
     // Body lines with syntax highlighting
     for line in code.lines() {
         let highlighted = highlight_code_line(display_lang, line);
-        let mut spans = vec![
-            Span::styled("   │ ", Style::default().fg(Color::DarkGray)),
-        ];
+        let mut spans = vec![Span::styled("   │ ", Style::default().fg(Color::DarkGray))];
         spans.extend(highlighted);
         lines.push(Line::from(spans));
     }
@@ -240,16 +248,28 @@ fn highlight_code_line(lang: &str, line: &str) -> Vec<Span<'static>> {
     let lang_lower = lang.to_lowercase();
     let is_rust = lang_lower == "rust" || lang_lower == "rs";
     let is_python = lang_lower == "python" || lang_lower == "py";
-    let is_shell = lang_lower == "bash" || lang_lower == "sh" || lang_lower == "shell" || lang_lower == "zsh";
-    let is_c_like = lang_lower == "c" || lang_lower == "cpp" || lang_lower == "c++" || lang_lower == "java";
+    let is_shell =
+        lang_lower == "bash" || lang_lower == "sh" || lang_lower == "shell" || lang_lower == "zsh";
+    let is_c_like =
+        lang_lower == "c" || lang_lower == "cpp" || lang_lower == "c++" || lang_lower == "java";
 
     let trimmed = line.trim_start();
     // Line comments
     if (is_rust || is_c_like) && trimmed.starts_with("//") {
-        return vec![Span::styled(line.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))];
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )];
     }
     if (is_python || is_shell) && trimmed.starts_with('#') {
-        return vec![Span::styled(line.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))];
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )];
     }
 
     let mut spans = Vec::new();
@@ -261,7 +281,10 @@ fn highlight_code_line(lang: &str, line: &str) -> Vec<Span<'static>> {
         if in_string {
             current_token.push(c);
             if c == string_quote {
-                spans.push(Span::styled(std::mem::take(&mut current_token), Style::default().fg(Color::LightGreen)));
+                spans.push(Span::styled(
+                    std::mem::take(&mut current_token),
+                    Style::default().fg(Color::LightGreen),
+                ));
                 in_string = false;
             }
             continue;
@@ -286,22 +309,36 @@ fn highlight_code_line(lang: &str, line: &str) -> Vec<Span<'static>> {
                 current_token.clear();
             }
             // Syntax punctuation
-            let punct_style = if c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' {
-                Style::default().fg(Color::Yellow)
-            } else if c == ':' || c == ';' || c == ',' || c == '.' {
-                Style::default().fg(Color::DarkGray)
-            } else if c == '+' || c == '-' || c == '*' || c == '/' || c == '=' || c == '<' || c == '>' || c == '&' || c == '|' || c == '!' {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::White)
-            };
+            let punct_style =
+                if c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' {
+                    Style::default().fg(Color::Yellow)
+                } else if c == ':' || c == ';' || c == ',' || c == '.' {
+                    Style::default().fg(Color::DarkGray)
+                } else if c == '+'
+                    || c == '-'
+                    || c == '*'
+                    || c == '/'
+                    || c == '='
+                    || c == '<'
+                    || c == '>'
+                    || c == '&'
+                    || c == '|'
+                    || c == '!'
+                {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
             spans.push(Span::styled(c.to_string(), punct_style));
         }
     }
 
     if !current_token.is_empty() {
         if in_string {
-            spans.push(Span::styled(current_token, Style::default().fg(Color::LightGreen)));
+            spans.push(Span::styled(
+                current_token,
+                Style::default().fg(Color::LightGreen),
+            ));
         } else {
             spans.push(classify_word(display_token(&current_token), &lang_lower));
         }
@@ -322,17 +359,34 @@ fn classify_word(word: String, lang: &str) -> Span<'static> {
 
     // Rust keywords
     if is_rust_keyword(&word) && (lang == "rust" || lang == "rs" || lang == "code") {
-        return Span::styled(word, Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD));
+        return Span::styled(
+            word,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     // Python keywords
     if is_python_keyword(&word) && (lang == "python" || lang == "py" || lang == "code") {
-        return Span::styled(word, Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD));
+        return Span::styled(
+            word,
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     // Shell keywords
-    if is_shell_keyword(&word) && (lang == "bash" || lang == "sh" || lang == "shell" || lang == "zsh") {
-        return Span::styled(word, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    if is_shell_keyword(&word)
+        && (lang == "bash" || lang == "sh" || lang == "shell" || lang == "zsh")
+    {
+        return Span::styled(
+            word,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     // Types
@@ -347,39 +401,155 @@ fn classify_word(word: String, lang: &str) -> Span<'static> {
 fn is_rust_keyword(w: &str) -> bool {
     matches!(
         w,
-        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false"
-            | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop" | "match" | "mod" | "move"
-            | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct" | "super"
-            | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await"
-            | "dyn" | "Some" | "None" | "Ok" | "Err"
+        "as" | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "async"
+            | "await"
+            | "dyn"
+            | "Some"
+            | "None"
+            | "Ok"
+            | "Err"
     )
 }
 
 fn is_python_keyword(w: &str) -> bool {
     matches!(
         w,
-        "False" | "None" | "True" | "and" | "as" | "assert" | "async" | "await" | "break"
-            | "class" | "continue" | "def" | "del" | "elif" | "else" | "except" | "finally"
-            | "for" | "from" | "global" | "if" | "import" | "in" | "is" | "lambda" | "nonlocal"
-            | "not" | "or" | "pass" | "raise" | "return" | "try" | "while" | "with" | "yield" | "self"
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+            | "self"
     )
 }
 
 fn is_shell_keyword(w: &str) -> bool {
     matches!(
         w,
-        "if" | "then" | "else" | "elif" | "fi" | "case" | "esac" | "for" | "select" | "while"
-            | "until" | "do" | "done" | "in" | "function" | "time" | "echo" | "export" | "source"
-            | "cat" | "grep" | "awk" | "sed" | "sudo" | "cd" | "exit" | "cargo" | "nexus"
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "case"
+            | "esac"
+            | "for"
+            | "select"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "in"
+            | "function"
+            | "time"
+            | "echo"
+            | "export"
+            | "source"
+            | "cat"
+            | "grep"
+            | "awk"
+            | "sed"
+            | "sudo"
+            | "cd"
+            | "exit"
+            | "cargo"
+            | "nexus"
     )
 }
 
 fn is_common_type(w: &str) -> bool {
     matches!(
         w,
-        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
-            | "isize" | "f32" | "f64" | "bool" | "char" | "str" | "String" | "Vec" | "Option"
-            | "Result" | "Box" | "Arc" | "Rc" | "int" | "float" | "dict" | "list" | "set"
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "str"
+            | "String"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "int"
+            | "float"
+            | "dict"
+            | "list"
+            | "set"
     )
 }
-

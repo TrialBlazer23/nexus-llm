@@ -136,7 +136,11 @@ impl SystemProfile {
     }
 
     /// Parse cpuinfo string and detect backend according to hardware target specifications.
-    pub fn parse_cpuinfo_backend(arch: &str, cpuinfo: &str, has_vulkan: bool) -> AccelerationBackend {
+    pub fn parse_cpuinfo_backend(
+        arch: &str,
+        cpuinfo: &str,
+        has_vulkan: bool,
+    ) -> AccelerationBackend {
         if arch == "aarch64" || arch == "arm" {
             if has_vulkan {
                 return AccelerationBackend::Vulkan;
@@ -181,9 +185,7 @@ impl SystemProfile {
                 // Core 2 Duo P7550 has 2 cores / 2 threads
                 2.min(detected_cores)
             }
-            AccelerationBackend::GenericCpu => {
-                detected_cores.saturating_sub(1).max(1)
-            }
+            AccelerationBackend::GenericCpu => detected_cores.saturating_sub(1).max(1),
         }
     }
 
@@ -242,7 +244,11 @@ impl SystemProfile {
     }
 
     /// Android LMK Guard with exact GGUF architectural dimensions.
-    pub fn can_safely_load_gguf(&self, gguf: &crate::gguf::GgufMetadata, context_size: usize) -> bool {
+    pub fn can_safely_load_gguf(
+        &self,
+        gguf: &crate::gguf::GgufMetadata,
+        context_size: usize,
+    ) -> bool {
         self.can_safely_load_gguf_pct(gguf, context_size, 75)
     }
 
@@ -276,7 +282,10 @@ impl SystemProfile {
 pub fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains interior NUL")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains interior NUL",
+        )
     })?;
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();

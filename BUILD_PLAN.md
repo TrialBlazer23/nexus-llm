@@ -100,11 +100,12 @@ wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test --test test_cluster_rpc"
   - Display available allocatable RAM and acceleration backend for each node.
 - Implement Remote Model Dispatch in `src/ui/hub.rs` & `src/control_plane.rs`:
   - If local node selected: spawn local `ProcessSupervisor`.
-  - If remote peer selected: dispatch `POST /cluster/model/load` to target peer.
+  - If remote peer selected: dispatch `POST /nexus/control/v1/model/load` to target peer.
 - Implement Dynamic Chat Binding in `src/ui/chat.rs`:
   - Dynamically reconfigure chat client endpoint to target the active model host.
 - Maintain Unified Hub Navigation:
-  - Persistent top navigation tabs: `[F1: Chat]`, `[F2: Models]`, `[F3: Dashboard]`, `[F4: Tunnel]`, `[F5: Settings]`.
+  - Persistent top navigation tabs shipped today: `[F1: Chat]`, `[F2: Models]`, `[F3: Cluster/Dashboard]`, `[F4: Settings]` (four tabs).
+  - `[F4: Tunnel]` from earlier drafts remains deferred — `src/ui/tunnel_view.rs` exists but is not wired into hub F-keys (Continuous doc note; not a Phase 12 feature).
   - Fast keyboard shortcuts and non-blocking event multiplexing.
 
 ### Verification Command

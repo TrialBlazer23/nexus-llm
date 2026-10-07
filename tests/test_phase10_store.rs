@@ -1,9 +1,13 @@
 //! Phase 10 — model store, blob Range transfer, catalog digests.
+//!
+//! Env locks intentionally span awaits so concurrent tests cannot stomp
+//! `NEXUS_MODELS_INDEX` / `NEXUS_CONFIG` mid-request.
+#![allow(clippy::await_holding_lock)]
 
+use nexus::config::NexusConfig;
 use nexus::control_plane::{
     build_model_catalog, fetch_models, request_blob_fetch, BlobFetchRequest, CONTROL_PLANE_VERSION,
 };
-use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn_ephemeral, ControlPlaneContext};
 use nexus::discovery::NodeRole;
 use nexus::downloader::ModelDownloader;
@@ -12,9 +16,15 @@ use nexus::supervisor::SupervisorManager;
 use nexus::trust_auth::TrustBootstrap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+/// Serialize tests that mutate process-wide `NEXUS_MODELS_INDEX`.
+fn index_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn build_synthetic_gguf(arch: &str, name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -47,7 +57,10 @@ fn write_model(dir: &std::path::Path, name: &str) -> (PathBuf, String) {
     let bytes = build_synthetic_gguf("llama", "Tiny");
     std::fs::write(&path, &bytes).unwrap();
     // pad so Range tests have room
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     f.write_all(&[0u8; 256]).unwrap();
     drop(f);
     let digest = ModelDownloader::calculate_sha256(&path).unwrap();
@@ -78,6 +91,7 @@ fn test_ctx(models_dir: PathBuf) -> (Arc<ControlPlaneContext>, TempDir) {
 
 #[test]
 fn catalog_includes_digest() {
+    let _guard = index_env_lock().lock().unwrap();
     let models = TempDir::new().unwrap();
     let index = TempDir::new().unwrap();
     let index_path = index.path().join("models.json");
@@ -91,6 +105,7 @@ fn catalog_includes_digest() {
 
 #[tokio::test]
 async fn blob_range_returns_partial_content() {
+    let _guard = index_env_lock().lock().unwrap();
     let models = TempDir::new().unwrap();
     let index = TempDir::new().unwrap();
     let index_path = index.path().join("models.json");
@@ -121,6 +136,7 @@ async fn blob_range_returns_partial_content() {
 
 #[tokio::test]
 async fn blob_unknown_digest_is_404() {
+    let _guard = index_env_lock().lock().unwrap();
     let models = TempDir::new().unwrap();
     let index = TempDir::new().unwrap();
     std::env::set_var(
@@ -145,6 +161,7 @@ async fn blob_unknown_digest_is_404() {
 
 #[tokio::test]
 async fn catalog_http_exposes_digest() {
+    let _guard = index_env_lock().lock().unwrap();
     let models = TempDir::new().unwrap();
     let index = TempDir::new().unwrap();
     let index_path = index.path().join("models.json");
@@ -167,6 +184,7 @@ async fn catalog_http_exposes_digest() {
 
 #[tokio::test]
 async fn blob_fetch_accepted() {
+    let _guard = index_env_lock().lock().unwrap();
     let models = TempDir::new().unwrap();
     let index = TempDir::new().unwrap();
     std::env::set_var(
@@ -195,6 +213,7 @@ async fn blob_fetch_accepted() {
 
 #[tokio::test]
 async fn downloader_rejects_bad_sidecar_and_resumes() {
+    let _guard = index_env_lock().lock().unwrap();
     let dir = TempDir::new().unwrap();
     let dest = dir.path().join("out.bin");
     let part = PathBuf::from(format!("{}.part", dest.display()));

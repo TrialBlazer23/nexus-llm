@@ -146,7 +146,7 @@ impl ModelsView {
         }
 
         let mut catalog: Vec<CatalogRow> = by_key.into_values().collect();
-        catalog.sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
+        catalog.sort_by_key(|a| a.filename.to_lowercase());
         self.catalog = catalog;
         if self.selected_index >= self.catalog.len() && !self.catalog.is_empty() {
             self.selected_index = self.catalog.len() - 1;
@@ -194,7 +194,11 @@ impl ModelsView {
             .next()
             .and_then(|s| {
                 let s = s.split('?').next().unwrap_or(s);
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             })
             .unwrap_or("model.gguf");
         let name = if name.to_ascii_lowercase().ends_with(".gguf") {
@@ -253,10 +257,7 @@ impl ModelsView {
                     let holders = m.holders.join(",");
                     let line = Line::from(vec![
                         Span::styled(prefix, style),
-                        Span::styled(
-                            format!("{:<28}", truncate_string(&m.filename, 26)),
-                            style,
-                        ),
+                        Span::styled(format!("{:<28}", truncate_string(&m.filename, 26)), style),
                         Span::styled(
                             format!("{:>6}MB ", m.size_mb),
                             Style::default().fg(Color::Gray),
@@ -335,7 +336,10 @@ impl ModelsView {
 
             let info_lines = vec![
                 Line::from(vec![
-                    Span::styled(" Model File:        ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Model File:        ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         &row.filename,
                         Style::default()
@@ -344,11 +348,17 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Digest:            ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Digest:            ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(digest_short, Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Architecture:      ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Architecture:      ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         &row.architecture,
                         Style::default()
@@ -357,25 +367,37 @@ impl ModelsView {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Weight Size:       ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Weight Size:       ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} MB", row.size_mb),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Holders:           ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Holders:           ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(row.holders.join(", "), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Context Limit:     ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Context Limit:     ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} tokens", row.context_length),
                         Style::default().fg(Color::White),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(" Selected Context:  ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        " Selected Context:  ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
                     Span::styled(
                         format!("{} tokens (+/-)", self.selected_context),
                         Style::default()
@@ -431,10 +453,9 @@ impl ModelsView {
             );
             frame.render_widget(action_widget, right_chunks[2]);
         } else {
-            let empty_widget = Paragraph::new(
-                "No model selected — press [D] to download a GGUF URL",
-            )
-            .block(Block::default().title(" Details ").borders(Borders::ALL));
+            let empty_widget =
+                Paragraph::new("No model selected — press [D] to download a GGUF URL")
+                    .block(Block::default().title(" Details ").borders(Borders::ALL));
             frame.render_widget(empty_widget, area);
         }
     }

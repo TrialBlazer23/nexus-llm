@@ -4,12 +4,13 @@
 //! remote dispatch) runs off the TUI event loop. The loop only draws, mutates
 //! state from [`HubEvent`], and enqueues [`HubCommand`].
 
+use super::{HotSwapIntent, TargetExecutionNode, TargetSelectionState};
 use crate::config::NexusConfig;
+use crate::control_plane::ControlPlaneError;
 use crate::control_plane::{
     blob_url, dispatch_load_model, dispatch_load_model_signed, fetch_models, request_blob_fetch,
     BlobFetchRequest, ModelLoadRequest, ModelLoadResponse, CONTROL_PLANE_VERSION,
 };
-use crate::control_plane::ControlPlaneError;
 use crate::discovery::{DiscoveryService, RpcSelectionPolicy, StatusFlags};
 use crate::downloader::{DownloadAuth, ModelDownloader};
 use crate::node_identity::NodeIdentity;
@@ -17,7 +18,6 @@ use crate::store::ModelIndex;
 use crate::supervisor::{LlamaServerConfig, SupervisorManager, SupervisorState};
 use crate::sysinfo::SystemProfile;
 use crate::ui::models_view::ModelsView;
-use super::{HotSwapIntent, TargetExecutionNode, TargetSelectionState};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,9 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum HubCommand {
     /// Open target-selection modal (probe peers off the UI thread).
-    OpenTargetSelection { model_path: PathBuf },
+    OpenTargetSelection {
+        model_path: PathBuf,
+    },
     /// Load locally with optional GPU-layer override (0 = CPU safe mode).
     LoadModelLocal {
         path: PathBuf,
@@ -46,12 +48,19 @@ pub enum HubCommand {
         context_size: usize,
         gpu_layers: u32,
     },
-    Unload { active_model_name: String },
+    Unload {
+        active_model_name: String,
+    },
     RefreshCluster,
     /// WAN download into models_dir.
-    StartDownload { url: String },
+    StartDownload {
+        url: String,
+    },
     /// LAN blob pull from a peer control endpoint.
-    TransferModel { peer_endpoint: String, digest: String },
+    TransferModel {
+        peer_endpoint: String,
+        digest: String,
+    },
     /// Ask a peer to pull our blob (push convenience).
     PushModel {
         peer_endpoint: String,
@@ -65,16 +74,25 @@ pub enum HubCommand {
 /// Events applied on the UI thread.
 #[derive(Debug)]
 pub enum HubEvent {
-    Status { message: String, color: ratatui::style::Color },
-    ModelLoadProgress { phase: String },
+    Status {
+        message: String,
+        color: ratatui::style::Color,
+    },
+    ModelLoadProgress {
+        phase: String,
+    },
     ModelLoaded {
         model_name: String,
         endpoint: String,
         backend_label: String,
         notice: String,
     },
-    ModelFailed { message: String },
-    ModelUnloaded { unloaded_model: String },
+    ModelFailed {
+        message: String,
+    },
+    ModelUnloaded {
+        unloaded_model: String,
+    },
     UnloadNoop,
     TargetSelectionReady(TargetSelectionState),
     RemoteLoadSucceeded {
@@ -84,7 +102,9 @@ pub enum HubEvent {
         api_endpoint: String,
         notice: String,
     },
-    RemoteLoadFailed { message: String },
+    RemoteLoadFailed {
+        message: String,
+    },
     ClusterRefreshed,
     /// Supervisor child exited unexpectedly.
     SupervisorCrashed {
@@ -99,8 +119,12 @@ pub enum HubEvent {
         speed_bytes_per_sec: f64,
         label: String,
     },
-    DownloadFinished { message: String },
-    DownloadFailed { message: String },
+    DownloadFinished {
+        message: String,
+    },
+    DownloadFailed {
+        message: String,
+    },
     ModelCatalogUpdated {
         remotes: Vec<(String, String, crate::control_plane::ModelCatalogResponse)>,
     },
@@ -202,7 +226,10 @@ async fn run_download(
             total_bytes: None,
             percent: Some(0.0),
             speed_bytes_per_sec: 0.0,
-            label: format!("Downloading {}", dest.file_name().and_then(|s| s.to_str()).unwrap_or("model")),
+            label: format!(
+                "Downloading {}",
+                dest.file_name().and_then(|s| s.to_str()).unwrap_or("model")
+            ),
         })
         .await;
 
@@ -214,20 +241,15 @@ async fn run_download(
         .unwrap_or("model")
         .to_string();
     let result = downloader
-        .download(
-            &url,
-            &dest,
-            expected_sha.as_deref(),
-            move |p| {
-                let _ = evt.try_send(HubEvent::DownloadProgress {
-                    downloaded_bytes: p.downloaded_bytes,
-                    total_bytes: p.total_bytes,
-                    percent: p.percent,
-                    speed_bytes_per_sec: p.speed_bytes_per_sec,
-                    label: label.clone(),
-                });
-            },
-        )
+        .download(&url, &dest, expected_sha.as_deref(), move |p| {
+            let _ = evt.try_send(HubEvent::DownloadProgress {
+                downloaded_bytes: p.downloaded_bytes,
+                total_bytes: p.total_bytes,
+                percent: p.percent,
+                speed_bytes_per_sec: p.speed_bytes_per_sec,
+                label: label.clone(),
+            });
+        })
         .await;
 
     match result {
@@ -267,11 +289,7 @@ async fn run_transfer(
             return;
         }
     };
-    let dest = ctx
-        .config
-        .node
-        .models_dir
-        .join(format!("{digest}.gguf"));
+    let dest = ctx.config.node.models_dir.join(format!("{digest}.gguf"));
 
     let _ = evt_tx
         .send(HubEvent::DownloadProgress {
@@ -296,21 +314,15 @@ async fn run_transfer(
     let evt = evt_tx.clone();
     let label = digest.clone();
     let result = downloader
-        .download_authenticated(
-            &url,
-            &dest,
-            Some(&digest),
-            auth.as_ref(),
-            move |p| {
-                let _ = evt.try_send(HubEvent::DownloadProgress {
-                    downloaded_bytes: p.downloaded_bytes,
-                    total_bytes: p.total_bytes,
-                    percent: p.percent,
-                    speed_bytes_per_sec: p.speed_bytes_per_sec,
-                    label: format!("Pulling {label:.12}…"),
-                });
-            },
-        )
+        .download_authenticated(&url, &dest, Some(&digest), auth.as_ref(), move |p| {
+            let _ = evt.try_send(HubEvent::DownloadProgress {
+                downloaded_bytes: p.downloaded_bytes,
+                total_bytes: p.total_bytes,
+                percent: p.percent,
+                speed_bytes_per_sec: p.speed_bytes_per_sec,
+                label: format!("Pulling {label:.12}…"),
+            });
+        })
         .await;
 
     match result {
@@ -395,12 +407,13 @@ async fn run_refresh_catalog(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>
             }
         }
     }
-    let _ = evt_tx
-        .send(HubEvent::ModelCatalogUpdated { remotes })
-        .await;
+    let _ = evt_tx.send(HubEvent::ModelCatalogUpdated { remotes }).await;
 }
 
-pub(crate) async fn build_target_selection(ctx: &HubWorkerCtx, model_path: PathBuf) -> TargetSelectionState {
+pub(crate) async fn build_target_selection(
+    ctx: &HubWorkerCtx,
+    model_path: PathBuf,
+) -> TargetSelectionState {
     let model_name = model_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -463,6 +476,8 @@ async fn dispatch_remote(
     }
 }
 
+// Continuous: remote-load progress needs distinct display fields; avoid drive-by struct.
+#[allow(clippy::too_many_arguments)]
 async fn run_remote_load(
     ctx: &HubWorkerCtx,
     evt_tx: &mpsc::Sender<HubEvent>,
@@ -493,12 +508,12 @@ async fn run_remote_load(
     info!("Dispatching remote model load to {endpoint}: {req:?}");
     match dispatch_remote(ctx, endpoint, req).await {
         Ok(resp) if resp.success => {
-            let target_api = if !resp.api_endpoint.is_empty() && !resp.api_endpoint.contains("0.0.0.0")
-            {
-                resp.api_endpoint
-            } else {
-                api_endpoint.to_string()
-            };
+            let target_api =
+                if !resp.api_endpoint.is_empty() && !resp.api_endpoint.contains("0.0.0.0") {
+                    resp.api_endpoint
+                } else {
+                    api_endpoint.to_string()
+                };
             let _ = evt_tx
                 .send(HubEvent::RemoteLoadSucceeded {
                     model_name: model_name.to_string(),
@@ -679,9 +694,7 @@ async fn run_local_load(
 
     let _ = evt_tx
         .send(HubEvent::ModelLoadProgress {
-            phase: format!(
-                "Spawning llama-server (-ngl {gpu_layers}, ctx {context_size})…"
-            ),
+            phase: format!("Spawning llama-server (-ngl {gpu_layers}, ctx {context_size})…"),
         })
         .await;
 
@@ -724,9 +737,7 @@ async fn run_local_load(
     match spawn_result {
         Ok(()) => {
             ctx.discovery.set_active_model(&model_name).await;
-            ctx.discovery
-                .set_status_flags(StatusFlags::READY)
-                .await;
+            ctx.discovery.set_status_flags(StatusFlags::READY).await;
             let endpoint = format!("http://127.0.0.1:{}", ctx.config.network.api_port);
             let backend_label = if gpu_layers > 0 {
                 format!("Local GPU ({gpu_layers} layers)")

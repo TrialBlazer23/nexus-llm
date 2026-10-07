@@ -176,8 +176,7 @@ impl ModelIndex {
             }
         }
 
-        next.models
-            .sort_by(|a, b| a.filename.to_lowercase().cmp(&b.filename.to_lowercase()));
+        next.models.sort_by_key(|a| a.filename.to_lowercase());
         if let Err(e) = next.save(index_path) {
             warn!("Failed to persist model index {:?}: {}", index_path, e);
         }

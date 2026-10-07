@@ -6,9 +6,9 @@
 
 use crate::config::NexusConfig;
 use crate::control_plane::{
-    build_control_plane_state, build_model_catalog, handle_load_model, handle_unload_model,
-    blob_url, BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest, ModelLoadRequest,
-    ModelUnloadRequest, PairRequest, PairResponse, CONTROL_PLANE_VERSION,
+    blob_url, build_control_plane_state, build_model_catalog, handle_load_model,
+    handle_unload_model, BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest,
+    ModelLoadRequest, ModelUnloadRequest, PairRequest, PairResponse, CONTROL_PLANE_VERSION,
     MAX_CONTROL_RESPONSE_BYTES,
 };
 use crate::discovery::{DiscoveryService, NodeRole, StatusFlags};
@@ -63,6 +63,8 @@ pub struct ControlPlaneContext {
 }
 
 impl ControlPlaneContext {
+    // Continuous: keep flat ctor; reshaping into a builder is out of scope for hygiene.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: Uuid,
         role: NodeRole,
@@ -209,6 +211,8 @@ async fn route(
     }
 }
 
+// Err carries a ready HTTP response; boxing would add noise without shrinking the hot path.
+#[allow(clippy::result_large_err)]
 async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<RespBody>> {
     let limited = Limited::new(req.into_body(), MAX_CONTROL_RESPONSE_BYTES);
     let collected = match limited.collect().await {
@@ -282,7 +286,13 @@ async fn handle_blob_get(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "GET",
@@ -353,27 +363,24 @@ async fn handle_blob_get(
         );
     }
 
-    let stream = unfold(
-        (file, content_len),
-        |(mut file, remaining)| async move {
-            if remaining == 0 {
-                return None;
+    let stream = unfold((file, content_len), |(mut file, remaining)| async move {
+        if remaining == 0 {
+            return None;
+        }
+        let to_read = remaining.min(64 * 1024) as usize;
+        let mut buf = vec![0u8; to_read];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((
+                    Ok::<_, std::io::Error>(Frame::data(Bytes::from(buf))),
+                    (file, remaining - n as u64),
+                ))
             }
-            let to_read = remaining.min(64 * 1024) as usize;
-            let mut buf = vec![0u8; to_read];
-            match file.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(n) => {
-                    buf.truncate(n);
-                    Some((
-                        Ok::<_, std::io::Error>(Frame::data(Bytes::from(buf))),
-                        (file, remaining - n as u64),
-                    ))
-                }
-                Err(e) => Some((Err(e), (file, 0))),
-            }
-        },
-    );
+            Err(e) => Some((Err(e), (file, 0))),
+        }
+    });
     let body = StreamBody::new(stream).boxed_unsync();
 
     let mut builder = Response::builder()
@@ -402,7 +409,13 @@ async fn handle_blob_fetch(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -505,7 +518,13 @@ async fn handle_state(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -555,7 +574,13 @@ async fn handle_load(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -624,7 +649,13 @@ async fn handle_unload(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -709,7 +740,13 @@ async fn handle_pair(
         }
     };
 
-    let security = ctx.config.read().expect("config lock").network.security.clone();
+    let security = ctx
+        .config
+        .read()
+        .expect("config lock")
+        .network
+        .security
+        .clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -732,7 +769,10 @@ async fn handle_pair(
     }
 
     let unix_now = crate::trust_auth::unix_timestamp_now() as u64;
-    if !ctx.identity.verify_pairing_code_at(unix_now, &pair_req.pairing_code) {
+    if !ctx
+        .identity
+        .verify_pairing_code_at(unix_now, &pair_req.pairing_code)
+    {
         return json_response(
             StatusCode::FORBIDDEN,
             &serde_json::json!({"error": "invalid pairing code"}),

@@ -5,9 +5,7 @@ pub mod keymap;
 
 use crate::client::NexusClient;
 use crate::config::NexusConfig;
-use crate::control_plane::{
-    dispatch_pair, PairRequest, CONTROL_PLANE_VERSION,
-};
+use crate::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
 use crate::node_identity::NodeIdentity;
@@ -17,9 +15,7 @@ use crate::ui::chat::{ChatApp, ChatEntry, StreamMsg};
 use crate::ui::cluster_view::ClusterView;
 use crate::ui::models_view::ModelsView;
 use crate::ui::settings_view::SettingsView;
-use commands::{
-    request_load_or_hot_swap, spawn_hub_worker, HubCommand, HubEvent, HubWorkerCtx,
-};
+use commands::{request_load_or_hot_swap, spawn_hub_worker, HubCommand, HubEvent, HubWorkerCtx};
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -165,6 +161,8 @@ pub struct HubApp {
     /// Peer picker for [S] push (list of (label, endpoint)).
     pub pending_push_peers: Option<Vec<(String, String)>>,
     pub push_peer_idx: usize,
+    // (label, percent, downloaded, total, speed) — keep compact until a dedicated progress type.
+    #[allow(clippy::type_complexity)]
     pub download_progress: Option<(String, Option<f32>, u64, Option<u64>, f64)>,
 }
 
@@ -347,10 +345,8 @@ impl HubApp {
                     "Model '{}' unloaded. Local inference engine is idle.",
                     unloaded_model
                 )));
-                self.status_message = Some((
-                    format!("Unloaded model '{}'", unloaded_model),
-                    Color::Cyan,
-                ));
+                self.status_message =
+                    Some((format!("Unloaded model '{}'", unloaded_model), Color::Cyan));
             }
             HubEvent::UnloadNoop => {
                 self.status_message = Some((
@@ -375,8 +371,10 @@ impl HubApp {
                 self.chat.set_target_hardware(&name, backend);
                 self.chat.messages.clear();
                 self.chat.messages.push(ChatEntry::notice(notice));
-                self.status_message =
-                    Some((format!("Active on {}: {}", name, self.active_model_name), Color::Green));
+                self.status_message = Some((
+                    format!("Active on {}: {}", name, self.active_model_name),
+                    Color::Green,
+                ));
                 self.set_tab(HubTab::Chat);
             }
             HubEvent::RemoteLoadFailed { message } => {
@@ -387,7 +385,11 @@ impl HubApp {
                 // Actual peer snapshot refresh happens via async helper outside apply;
                 // status only — see run_hub_tui which awaits refresh when this arrives.
             }
-            HubEvent::SupervisorCrashed { model, code, stderr } => {
+            HubEvent::SupervisorCrashed {
+                model,
+                code,
+                stderr,
+            } => {
                 self.active_model_name = "None (Idle)".to_string();
                 self.chat.messages.push(ChatEntry::error(format!(
                     "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
@@ -466,7 +468,9 @@ impl HubApp {
         if let Some((label, percent, downloaded, total, speed)) = &self.download_progress {
             let modal = centered_rect(60, 20, area);
             frame.render_widget(Clear, modal);
-            let ratio = percent.map(|p| (p as f64 / 100.0).clamp(0.0, 1.0)).unwrap_or(0.0);
+            let ratio = percent
+                .map(|p| (p as f64 / 100.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -478,7 +482,9 @@ impl HubApp {
                 .split(modal);
             let title = Paragraph::new(Line::from(Span::styled(
                 format!(" {label} "),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center)
             .block(
@@ -530,7 +536,9 @@ impl HubApp {
             ))];
             for (i, (label, _)) in peers.iter().enumerate() {
                 let style = if i == self.push_peer_idx {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -552,10 +560,15 @@ impl HubApp {
             let p = Paragraph::new(vec![
                 Line::from(Span::styled(
                     " Model Load In Progress ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(Span::styled(phase.clone(), Style::default().fg(Color::White))),
+                Line::from(Span::styled(
+                    phase.clone(),
+                    Style::default().fg(Color::White),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     "(UI remains responsive — chat/stream still drain)",
@@ -611,7 +624,9 @@ impl HubApp {
         let mut spans = vec![
             Span::styled(
                 " [F1-F4] Tabs ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" | ", Style::default().fg(Color::DarkGray)),
             Span::styled(active_str, Style::default().fg(Color::White)),
@@ -622,7 +637,9 @@ impl HubApp {
             spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(
                 " [u] Unload ",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -636,11 +653,16 @@ impl HubApp {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "new model".to_string());
-        let ngl = intent.gpu_layers.map(|n| n.to_string()).unwrap_or_else(|| "default".into());
+        let ngl = intent
+            .gpu_layers
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".into());
         let lines = vec![
             Line::from(Span::styled(
                 " Model Hot-Swap Confirmation",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!("\nActive Model:   {}", self.active_model_name),
@@ -648,15 +670,22 @@ impl HubApp {
             )),
             Line::from(Span::styled(
                 format!("Target Model:   {}", target_name),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                format!("GPU layers (-ngl): {} | Context: {}", ngl, intent.context_size),
+                format!(
+                    "GPU layers (-ngl): {} | Context: {}",
+                    ngl, intent.context_size
+                ),
                 Style::default().fg(Color::Green),
             )),
             Line::from(Span::styled(
                 "\nUnload active model and launch new model? [Y / N]",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
         frame.render_widget(
@@ -681,7 +710,9 @@ impl HubApp {
         let mut lines = vec![
             Line::from(Span::styled(
                 " Select Target Execution Device ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!(
@@ -695,7 +726,9 @@ impl HubApp {
             let is_sel = i == state.selected_idx;
             let prefix = if is_sel { " > " } else { "   " };
             let style = if is_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
@@ -707,7 +740,9 @@ impl HubApp {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             " [↑ / ↓] Navigate  |  [Enter] Confirm & Launch  |  [Esc] Cancel ",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         )));
         frame.render_widget(
             Paragraph::new(lines).block(
@@ -723,10 +758,7 @@ impl HubApp {
     fn render_help_modal(&self, frame: &mut Frame, area: Rect) {
         let modal = centered_rect(60, 70, area);
         frame.render_widget(Clear, modal);
-        let lines: Vec<Line> = keymap::help_lines()
-            .into_iter()
-            .map(|s| Line::from(s))
-            .collect();
+        let lines: Vec<Line> = keymap::help_lines().into_iter().map(Line::from).collect();
         frame.render_widget(
             Paragraph::new(lines).block(
                 Block::default()
@@ -760,8 +792,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 /// Launch and execute the main unified hub event loop.
 pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Error>> {
-    hub.cluster_view
-        .set_local_identity(hub.identity.clone());
+    hub.cluster_view.set_local_identity(hub.identity.clone());
     let _registry_runtime = spawn_registry_runtime(
         hub.discovery.clone(),
         hub.identity.clone(),
@@ -1384,7 +1415,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
                                                 peer_name, ep
                                             )));
-                                            
+
                                             hub.set_tab(HubTab::Chat);
                                         } else {
                                             hub.cluster_view.status_message = Some(("No peer selected to connect".to_string(), Color::Yellow));
@@ -1455,7 +1486,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                         hub.chat.set_target_hardware("Local Host", "Local CPU/GPU");
                                         hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
                                         hub.chat.messages.push(crate::ui::chat::ChatEntry::notice(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
-                                        
+
                                     }
                                     KeyCode::Char('u') | KeyCode::Char('U') => {
                                         let _ = cmd_tx.try_send(HubCommand::Unload {

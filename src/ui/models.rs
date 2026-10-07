@@ -47,10 +47,7 @@ fn entries_from_index(index: ModelIndex, only_under: Option<&Path>) -> Vec<Model
     let mut entries = Vec::new();
     for m in index.models {
         if let Some(ref root) = only_canon {
-            let parent = m
-                .path
-                .parent()
-                .and_then(|p| p.canonicalize().ok());
+            let parent = m.path.parent().and_then(|p| p.canonicalize().ok());
             if parent.as_ref() != Some(root) {
                 continue;
             }

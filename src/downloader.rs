@@ -156,6 +156,8 @@ impl ModelDownloader {
         }
     }
 
+    // Resume/sidecar/auth fields stay explicit; a params struct would be a drive-by reshape.
+    #[allow(clippy::too_many_arguments)]
     async fn download_once<F>(
         &self,
         url: &str,
@@ -230,11 +232,9 @@ impl ModelDownloader {
         let (append, mut downloaded, total_bytes) =
             if status == reqwest::StatusCode::PARTIAL_CONTENT && existing_bytes > 0 {
                 let rem = resp.content_length();
-                let total = rem.map(|r| r + existing_bytes).or_else(|| {
-                    resume_sidecar
-                        .as_ref()
-                        .and_then(|s| s.total_size)
-                });
+                let total = rem
+                    .map(|r| r + existing_bytes)
+                    .or_else(|| resume_sidecar.as_ref().and_then(|s| s.total_size));
                 (true, existing_bytes, total)
             } else {
                 // Fresh start (server ignored Range / If-Range forced full body)
@@ -371,10 +371,10 @@ impl ModelDownloader {
 
 fn is_retryable(err: &DownloaderError) -> bool {
     match err {
-        DownloaderError::Reqwest(_)
-        | DownloaderError::Stalled(_)
-        | DownloaderError::Io(_) => true,
-        DownloaderError::HttpStatus(status) => status.is_server_error() || *status == reqwest::StatusCode::REQUEST_TIMEOUT,
+        DownloaderError::Reqwest(_) | DownloaderError::Stalled(_) | DownloaderError::Io(_) => true,
+        DownloaderError::HttpStatus(status) => {
+            status.is_server_error() || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+        }
         DownloaderError::ChecksumMismatch { .. }
         | DownloaderError::InsufficientDisk { .. }
         | DownloaderError::RetriesExhausted => false,
@@ -404,15 +404,13 @@ fn sidecar_matches(sc: &PartSidecar, url: &str, expected: Option<&str>) -> bool 
 
 async fn load_sidecar(path: &Path) -> Result<PartSidecar, DownloaderError> {
     let bytes = tokio::fs::read(path).await?;
-    Ok(serde_json::from_slice(&bytes).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?)
+    Ok(serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?)
 }
 
 async fn save_sidecar(path: &Path, sc: &PartSidecar) -> Result<(), DownloaderError> {
-    let bytes = serde_json::to_vec_pretty(sc).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let bytes = serde_json::to_vec_pretty(sc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     tokio::fs::write(path, bytes).await?;
     Ok(())
 }
@@ -470,7 +468,11 @@ mod tests {
             expected_sha256: Some("deadbeef".into()),
         };
         save_sidecar(&side, &sc).await.unwrap();
-        assert!(!sidecar_matches(&sc, "http://example/file", Some("cafebabe")));
+        assert!(!sidecar_matches(
+            &sc,
+            "http://example/file",
+            Some("cafebabe")
+        ));
         let _ = tokio::fs::remove_file(&part).await;
         let _ = tokio::fs::remove_file(&side).await;
         assert!(!part.exists());

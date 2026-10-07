@@ -20,16 +20,12 @@ pub enum PresetError {
 /// Prompt template formats supported by local models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ChatTemplate {
+    #[default]
     ChatML,
     Llama3,
     Alpaca,
-}
-
-impl Default for ChatTemplate {
-    fn default() -> Self {
-        Self::ChatML
-    }
 }
 
 /// Persona configuration holding generation hyperparameters and system prompts.
@@ -151,13 +147,19 @@ impl Preset {
         match self.template {
             ChatTemplate::ChatML => {
                 let mut out = String::new();
-                out.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", self.system_prompt.trim()));
+                out.push_str(&format!(
+                    "<|im_start|>system\n{}<|im_end|>\n",
+                    self.system_prompt.trim()
+                ));
 
                 for msg in messages {
                     if msg.role == "system" {
                         continue; // System prompt already rendered
                     }
-                    out.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+                    out.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        msg.role, msg.content
+                    ));
                 }
                 out.push_str("<|im_start|>assistant\n");
                 out
@@ -185,13 +187,19 @@ impl Preset {
 
             ChatTemplate::Alpaca => {
                 let mut out = String::new();
-                out.push_str(&format!("### Instruction:\n{}\n\n", self.system_prompt.trim()));
+                out.push_str(&format!(
+                    "### Instruction:\n{}\n\n",
+                    self.system_prompt.trim()
+                ));
 
                 for msg in messages {
                     if msg.role == "user" {
                         out.push_str(&format!("{}\n\n", msg.content));
                     } else if msg.role == "assistant" {
-                        out.push_str(&format!("### Response:\n{}\n\n### Instruction:\n", msg.content));
+                        out.push_str(&format!(
+                            "### Response:\n{}\n\n### Instruction:\n",
+                            msg.content
+                        ));
                     }
                 }
                 out.push_str("### Response:\n");

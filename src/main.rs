@@ -6,6 +6,7 @@ use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{DiscoveryService, NodeRole};
 use nexus::downloader::ModelDownloader;
+use nexus::gateway::{spawn as spawn_gateway, GatewayContext};
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
 use nexus::registry_runtime::spawn_registry_runtime;
@@ -223,15 +224,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _mdns = discovery.clone().start_mdns();
             discovery.send_probe().await;
 
-            // Order: default_host → PreferAdbTunnel USB → discovery → localhost
+            // Order: default_host → PreferAdbTunnel USB → local mesh gateway
+            // (gateway resolves model→holder) → discovery → localhost api_port.
             // Clone host-resolution inputs under the lock, then await without holding it.
-            let (default_host, prefer_adb, api_port, rpc_port) = {
+            let (default_host, prefer_adb, api_port, rpc_port, gateway_enabled, gateway_port) = {
                 let cfg = trust.config.read().unwrap();
                 (
                     cfg.network.default_host.clone(),
                     cfg.cluster.prefer_adb_tunnel,
                     cfg.network.api_port,
                     cfg.cluster.rpc_port,
+                    cfg.network.gateway_enabled,
+                    cfg.network.gateway_port,
                 )
             };
             let host = if let Some(dh) = default_host {
@@ -249,6 +253,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if let Some(usb) = usb_ep {
                     usb
+                } else if gateway_enabled {
+                    format!("http://127.0.0.1:{gateway_port}")
                 } else {
                     match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3))
                         .await
@@ -354,6 +360,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Control-plane listening on port {}",
                 config.network.control_port
             );
+
+            let _gateway_handle = if config.network.gateway_enabled {
+                let gateway_ctx = Arc::new(
+                    GatewayContext::new(
+                        supervisor.clone(),
+                        api_port,
+                        PathBuf::from(&config.node.models_dir),
+                        discovery.node_uuid(),
+                        trust.config.clone(),
+                    )
+                    .with_discovery(discovery.clone()),
+                );
+                let handle = spawn_gateway(
+                    SocketAddr::from(([0, 0, 0, 0], config.network.gateway_port)),
+                    gateway_ctx,
+                );
+                println!(
+                    "Mesh gateway listening on port {}",
+                    config.network.gateway_port
+                );
+                Some(handle)
+            } else {
+                None
+            };
 
             let server_cfg = LlamaServerConfig {
                 binary_path: binary,

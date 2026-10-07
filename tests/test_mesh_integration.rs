@@ -22,6 +22,8 @@ fn mesh_node_config(discovery_port: u16, api_port: u16, control_port: u16) -> Ne
     cfg.network.discovery_port = discovery_port;
     cfg.network.api_port = api_port;
     cfg.network.control_port = control_port;
+    // Gateway not under test here; disable to avoid ephemeral port collisions.
+    cfg.network.gateway_enabled = false;
     cfg.network.broadcast_interval_ms = 50;
     cfg.network.peer_timeout_ms = 5_000;
     cfg.network.discovery.enabled = true;

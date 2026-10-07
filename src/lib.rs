@@ -6,6 +6,7 @@ pub mod control_plane_server;
 pub mod discovery;
 pub mod doctor;
 pub mod downloader;
+pub mod gateway;
 pub mod gguf;
 pub mod kb;
 pub mod logging;

@@ -26,6 +26,8 @@ pub enum SettingType {
     DiscoveryPort,
     ApiPort,
     ControlPort,
+    GatewayPort,
+    GatewayEnabled,
     PreferAdbTunnel,
     // Hardware & Acceleration
     PreferGpu,
@@ -123,6 +125,18 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "Control Plane Port",
         description: "HTTP control-plane port for remote load/unload (default: 9998)",
         setting_type: SettingType::ControlPort,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "Mesh Gateway Port",
+        description: "OpenAI-compatible mesh front door (default: 8081)",
+        setting_type: SettingType::GatewayPort,
+    },
+    SettingItem {
+        category: "Network & Transport",
+        name: "Enable Mesh Gateway",
+        description: "Proxy /v1 chat to the active model holder on any node",
+        setting_type: SettingType::GatewayEnabled,
     },
     SettingItem {
         category: "Network & Transport",
@@ -439,6 +453,18 @@ impl SettingsView {
                         self.config.network.control_port.saturating_add(1);
                 }
             }
+            SettingType::GatewayPort => {
+                if is_left {
+                    self.config.network.gateway_port =
+                        self.config.network.gateway_port.saturating_sub(1);
+                } else if is_right {
+                    self.config.network.gateway_port =
+                        self.config.network.gateway_port.saturating_add(1);
+                }
+            }
+            SettingType::GatewayEnabled => {
+                self.config.network.gateway_enabled = !self.config.network.gateway_enabled;
+            }
             SettingType::PreferAdbTunnel => {
                 self.config.cluster.prefer_adb_tunnel = !self.config.cluster.prefer_adb_tunnel;
             }
@@ -593,6 +619,15 @@ impl SettingsView {
                     ),
                     SettingType::ApiPort => format!("[ {} ]", self.config.network.api_port),
                     SettingType::ControlPort => format!("[ {} ]", self.config.network.control_port),
+                    SettingType::GatewayPort => format!("[ {} ]", self.config.network.gateway_port),
+                    SettingType::GatewayEnabled => format!(
+                        "[ {} ]",
+                        if self.config.network.gateway_enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
                     SettingType::PreferAdbTunnel => format!(
                         "[ {} ]",
                         if self.config.cluster.prefer_adb_tunnel {

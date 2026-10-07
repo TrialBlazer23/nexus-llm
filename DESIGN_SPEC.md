@@ -36,12 +36,14 @@ flowchart TD
     CTRL <--> N3
 
     subgraph DataPlane["Inference & Offload Data Plane"]
-        HTTP["OpenAI-Compatible HTTP / SSE (/v1/chat/completions)"]
+        GW["Mesh Gateway :8081 (/health, /v1/models, /v1/chat/completions)"]
+        HTTP["llama-server OpenAI / SSE on api_port :8080"]
         RPC["llama.cpp RPC Layer Pipelining (--split-mode layer)"]
     end
 
-    N2 -. Chat Streaming .-> N1
-    N3 -. Chat Streaming .-> N1
+    N2 -. Chat via local gateway .-> GW
+    N3 -. Chat via local gateway .-> GW
+    GW -. resolve model holder .-> HTTP
     N1 == Sequential Layer Offload ==> N2
 ```
 
@@ -154,7 +156,10 @@ mlock = false
 
 [network]
 api_host = "0.0.0.0"
-api_port = 8080
+api_port = 8080                     # llama-server OpenAI surface
+control_port = 9998                 # signed control plane
+gateway_port = 8081                 # mesh OpenAI front door (Phase 12 §5.1)
+gateway_enabled = true
 discovery_port = 9999
 broadcast_interval_ms = 2000
 peer_timeout_ms = 6000

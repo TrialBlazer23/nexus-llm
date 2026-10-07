@@ -531,6 +531,11 @@ impl DiscoveryService {
         self.send_probe_to(target).await;
     }
 
+    /// Locally advertised active model name (beacon / mDNS).
+    pub async fn get_active_model(&self) -> String {
+        self.active_model.read().await.clone()
+    }
+
     pub async fn set_active_model(&self, model_name: impl Into<String>) {
         let mut model = self.active_model.write().await;
         *model = model_name.into();

@@ -79,11 +79,13 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 │   ├── trust_auth.rs      # Signed control-plane auth
 │   ├── control_plane.rs   # Remote execution & handshake protocol
 │   ├── control_plane_server.rs # HTTP control-plane listener (hyper)
+│   ├── gateway.rs         # Mesh OpenAI gateway on gateway_port (Phase 12 §5.1)
 │   ├── client.rs          # OpenAI HTTP/SSE client
+│   ├── store.rs           # Content-addressed model index (~/.nexus/models.json)
 │   ├── gguf.rs            # Allocating GGUF header/metadata parser (bounded lengths; not zero-copy)
 │   ├── downloader.rs      # HTTP Range resume engine (single connection; not multi-chunk parallel)
 │   ├── preset.rs          # YAML persona & chat template engine
-│   ├── cluster.rs         # Distributed RPC coordinator
+│   ├── cluster.rs         # Distributed RPC coordinator (+ placement submodules)
 │   ├── doctor.rs          # `nexus doctor` diagnostics
 │   ├── logging.rs         # File logging helpers
 │   ├── tunnel.rs          # ADB forward/reverse supervisor

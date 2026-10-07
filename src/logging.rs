@@ -26,8 +26,8 @@ pub fn init_file_logging(default_level: &str) -> io::Result<PathBuf> {
     let path = log_dir.join(format!("nexus-{}.log", std::process::id()));
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter)

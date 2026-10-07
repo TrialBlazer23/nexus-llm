@@ -105,7 +105,7 @@ fn test_gguf_corruption_rejection() {
 
     // 2. Corrupt version
     bytes[0] = 0x47; // Restore magic
-    bytes[4] = 99;   // Version 99
+    bytes[4] = 99; // Version 99
     let mut cursor = Cursor::new(bytes);
     match GgufMetadata::read(&mut cursor) {
         Err(GgufError::UnsupportedVersion(99)) => (),
@@ -127,7 +127,8 @@ fn test_preset_loading_from_file() {
     assert_eq!(coder.top_p, 0.95);
     assert!(coder.system_prompt.contains("systems programmer"));
 
-    let general = Preset::load_from_file("presets/general.yaml").expect("Failed to load general.yaml");
+    let general =
+        Preset::load_from_file("presets/general.yaml").expect("Failed to load general.yaml");
     assert_eq!(general.name, "general");
     assert_eq!(general.template, ChatTemplate::Llama3);
     assert_eq!(general.temperature, 0.7);
@@ -159,21 +160,21 @@ fn test_preset_chatml_formatting() {
 
     assert!(formatted.contains("<|im_start|>system\nYou are an expert systems programmer"));
     assert!(formatted.contains("<|im_start|>user\nHow do I avoid AVX on Core 2 Duo?<|im_end|>"));
-    assert!(formatted.contains("<|im_start|>assistant\nTarget SSE4.1 and disable AVX in rustflags.<|im_end|>"));
+    assert!(formatted
+        .contains("<|im_start|>assistant\nTarget SSE4.1 and disable AVX in rustflags.<|im_end|>"));
     assert!(formatted.ends_with("<|im_start|>assistant\n"));
 }
 
 #[test]
 fn test_preset_llama3_formatting() {
     let preset = Preset::general();
-    let messages = vec![
-        ChatMessage::user("What is Nexus-LLM?"),
-    ];
+    let messages = vec![ChatMessage::user("What is Nexus-LLM?")];
 
     let formatted = preset.format_prompt(&messages);
 
     assert!(formatted.contains("<|start_header_id|>system<|end_header_id|>\n\nYou are Nexus"));
-    assert!(formatted.contains("<|start_header_id|>user<|end_header_id|>\n\nWhat is Nexus-LLM?<|eot_id|>"));
+    assert!(formatted
+        .contains("<|start_header_id|>user<|end_header_id|>\n\nWhat is Nexus-LLM?<|eot_id|>"));
     assert!(formatted.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
 }
 
@@ -181,7 +182,8 @@ fn test_preset_llama3_formatting() {
 fn test_downloader_sha256_calculation() {
     let mut temp = NamedTempFile::new().expect("Failed to create tempfile");
     let content = b"Nexus-LLM SHA-256 validation test content";
-    temp.write_all(content).expect("Failed to write test content");
+    temp.write_all(content)
+        .expect("Failed to write test content");
 
     let hash = ModelDownloader::calculate_sha256(temp.path()).expect("Failed to compute SHA-256");
 
@@ -193,4 +195,74 @@ fn test_downloader_sha256_calculation() {
     let expected = format!("{:x}", expected_hasher.finalize());
 
     assert_eq!(hash, expected);
+}
+
+/// Hostile kv_count must not panic-allocate.
+#[test]
+fn test_gguf_rejects_huge_kv_count_without_allocating() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+    buf.extend_from_slice(&u64::MAX.to_le_bytes()); // kv_count
+                                                    // No KV payload — remaining bytes are zero.
+    let mut cursor = Cursor::new(buf);
+    match GgufMetadata::read(&mut cursor) {
+        Err(GgufError::InvalidLength(_)) => (),
+        other => panic!("expected InvalidLength for huge kv_count, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_gguf_rejects_huge_string_length() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes()); // one KV
+                                                // Key length claims 1 TiB but only a few trailing bytes remain.
+    buf.extend_from_slice(&(1u64 << 40).to_le_bytes());
+    buf.extend_from_slice(b"x");
+    let mut cursor = Cursor::new(buf);
+    match GgufMetadata::read(&mut cursor) {
+        Err(GgufError::InvalidLength(_)) => (),
+        other => panic!("expected InvalidLength for huge string, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_gguf_rejects_huge_array_length() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    write_gguf_string(&mut buf, "tok");
+    buf.extend_from_slice(&9u32.to_le_bytes()); // Array
+    buf.extend_from_slice(&0u32.to_le_bytes()); // elem type Uint8
+    buf.extend_from_slice(&u64::MAX.to_le_bytes());
+    let mut cursor = Cursor::new(buf);
+    match GgufMetadata::read(&mut cursor) {
+        Err(GgufError::InvalidLength(_)) => (),
+        other => panic!("expected InvalidLength for huge array, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_gguf_read_never_panics_on_random_bytes() {
+    use proptest::prelude::*;
+
+    // Cap blob size so property tests stay fast and allocation guards stay meaningful.
+    proptest!(|(bytes in prop::collection::vec(any::<u8>(), 0..512))| {
+        let mut cursor = Cursor::new(bytes);
+        let _ = GgufMetadata::read(&mut cursor);
+    });
+}
+
+#[test]
+fn test_gguf_truncated_after_header_is_error() {
+    let mut bytes = build_synthetic_gguf();
+    bytes.truncate(24); // magic+version+tensor+kv counts only
+    let mut cursor = Cursor::new(bytes);
+    assert!(GgufMetadata::read(&mut cursor).is_err());
 }

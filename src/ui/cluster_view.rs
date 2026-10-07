@@ -1,8 +1,6 @@
 use crate::discovery::{BackendHealth, DiscoveryService, PeerNode};
 use crate::node_identity::NodeIdentity;
 use crate::peer_registry::PeerLifecycle;
-use std::collections::HashMap;
-use uuid::Uuid;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -11,7 +9,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table},
     Frame,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -199,10 +199,10 @@ impl ClusterView {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(3),  // Header
-                Constraint::Length(9),  // Local telemetry
-                Constraint::Min(6),     // Discovered peers table
-                Constraint::Length(2),  // Action shortcuts & status
+                Constraint::Length(3), // Header
+                Constraint::Length(9), // Local telemetry
+                Constraint::Min(6),    // Discovered peers table
+                Constraint::Length(2), // Action shortcuts & status
             ])
             .split(area);
 
@@ -264,12 +264,16 @@ impl ClusterView {
         let lines = vec![
             Line::from(Span::styled(
                 " Pairing code (show on this device)",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 code,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!("Rotates in {}s | [Esc] close", remaining),
@@ -292,7 +296,9 @@ impl ClusterView {
             Line::from(""),
             Line::from(Span::styled(
                 format!("[ {} ]", self.pair_code_input),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
         let block = Paragraph::new(lines).alignment(Alignment::Center).block(
@@ -308,19 +314,46 @@ impl ClusterView {
         let (mdns_text, mdns_color) = self.mdns_status.display();
 
         let header_spans = vec![
-            Span::styled(" Nexus-LLM Mesh Coordinator ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({}) ", std::env::consts::ARCH), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " Nexus-LLM Mesh Coordinator ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("({}) ", std::env::consts::ARCH),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled("| ", Style::default().fg(Color::DarkGray)),
             Span::styled("● ", Style::default().fg(udp_color)),
-            Span::styled(format!("UDP: {}  ", udp_text), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("UDP: {}  ", udp_text),
+                Style::default().fg(Color::White),
+            ),
             Span::styled("● ", Style::default().fg(mdns_color)),
-            Span::styled(format!("mDNS: {}  ", mdns_text), Style::default().fg(Color::White)),
-            Span::styled("| ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("Peers: {}  ", self.peers.len()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("mDNS: {}  ", mdns_text),
+                Style::default().fg(Color::White),
+            ),
             Span::styled("| ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if self.discovery.config().network.discovery.enabled { "↻ Broadcasting" } else { "Discovery Off" },
-                Style::default().fg(if self.discovery.config().network.discovery.enabled { Color::LightGreen } else { Color::DarkGray }),
+                format!("Peers: {}  ", self.peers.len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("| ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.discovery.config().network.discovery.enabled {
+                    "↻ Broadcasting"
+                } else {
+                    "Discovery Off"
+                },
+                Style::default().fg(if self.discovery.config().network.discovery.enabled {
+                    Color::LightGreen
+                } else {
+                    Color::DarkGray
+                }),
             ),
         ];
 
@@ -361,15 +394,13 @@ impl ClusterView {
                     ))
                     .borders(Borders::ALL),
             )
-            .gauge_style(
-                if ram_percent > 85 {
-                    Style::default().fg(Color::Red)
-                } else if ram_percent > 70 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Green)
-                },
-            )
+            .gauge_style(if ram_percent > 85 {
+                Style::default().fg(Color::Red)
+            } else if ram_percent > 70 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            })
             .percent(ram_percent);
 
         frame.render_widget(mem_gauge, cols[0]);
@@ -392,21 +423,45 @@ impl ClusterView {
 
         let info_lines = vec![
             Line::from(vec![
-                Span::styled(" Acceleration Tier: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(backend_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Acceleration Tier: ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    backend_name,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
-                Span::styled(" Vulkan Runtime:    ", Style::default().fg(Color::LightBlue)),
                 Span::styled(
-                    if SystemProfile::probe_vulkan() { "Active / Initialized" } else { "Not Available" },
+                    " Vulkan Runtime:    ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    if SystemProfile::probe_vulkan() {
+                        "Active / Initialized"
+                    } else {
+                        "Not Available"
+                    },
                     Style::default().fg(Color::LightGreen),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Thermal Index:     ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{}/100", self.thermal_index), thermal_style.add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Thermal Index:     ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    format!("{}/100", self.thermal_index),
+                    thermal_style.add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  |  Threads: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{}", self.local_profile.recommended_threads), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}", self.local_profile.recommended_threads),
+                    Style::default().fg(Color::White),
+                ),
             ]),
         ];
 
@@ -430,7 +485,11 @@ impl ClusterView {
             Cell::from("Thermal"),
             Cell::from("Trust"),
         ])
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
         let mut rows = Vec::new();
 
@@ -462,7 +521,9 @@ impl ClusterView {
             let label = format!("{}{}", cursor, peer.label());
 
             let row_style = if is_selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -481,7 +542,10 @@ impl ClusterView {
             );
         }
 
-        let title = format!(" Discovered Mesh Peers (UDP 9999 + mDNS) - {} Nodes ", self.peers.len());
+        let title = format!(
+            " Discovered Mesh Peers (UDP 9999 + mDNS) - {} Nodes ",
+            self.peers.len()
+        );
         let table = Table::new(
             rows,
             [
@@ -507,13 +571,24 @@ impl ClusterView {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let status_span = if let Some((msg, color)) = &self.status_message {
-            Span::styled(format!(" Status: {}", msg), Style::default().fg(*color).add_modifier(Modifier::BOLD))
+            Span::styled(
+                format!(" Status: {}", msg),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::styled(" Ready. Select a peer to manage.", Style::default().fg(Color::DarkGray))
+            Span::styled(
+                " Ready. Select a peer to manage.",
+                Style::default().fg(Color::DarkGray),
+            )
         };
 
         let shortcuts_line = Line::from(vec![
-            Span::styled(" [Enter] Connect ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Enter] Connect ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" [L] Load Model ", Style::default().fg(Color::Yellow)),
             Span::styled(" [W] Request Worker ", Style::default().fg(Color::Magenta)),
             Span::styled(" [I] Inspect ", Style::default().fg(Color::Green)),
@@ -556,7 +631,9 @@ impl ClusterView {
         let lines = vec![
             Line::from(vec![Span::styled(
                 format!(" Node Inspection: {}", peer.uuid),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
             Line::from(vec![
@@ -566,17 +643,31 @@ impl ClusterView {
             Line::from(vec![
                 Span::styled(" RPC Endpoint:    ", Style::default().fg(Color::LightBlue)),
                 Span::styled(
-                    if peer.is_rpc_ready() { peer.rpc_endpoint() } else { "Disabled / Not Listening".to_string() },
-                    Style::default().fg(if peer.is_rpc_ready() { Color::Green } else { Color::DarkGray }),
+                    if peer.is_rpc_ready() {
+                        peer.rpc_endpoint()
+                    } else {
+                        "Disabled / Not Listening".to_string()
+                    },
+                    Style::default().fg(if peer.is_rpc_ready() {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
             ]),
             Line::from(vec![
                 Span::styled(" Operational Role:", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{:?}", peer.role), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:?}", peer.role),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" Allocatable RAM: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{} MB free", peer.free_ram_mb), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{} MB free", peer.free_ram_mb),
+                    Style::default().fg(Color::Green),
+                ),
             ]),
             Line::from(vec![
                 Span::styled(" Backend Tier:    ", Style::default().fg(Color::LightBlue)),
@@ -585,18 +676,27 @@ impl ClusterView {
             Line::from(vec![
                 Span::styled(" Active Model:    ", Style::default().fg(Color::LightBlue)),
                 Span::styled(
-                    if peer.active_model.is_empty() { "None (Idle)".to_string() } else { peer.active_model.clone() },
+                    if peer.active_model.is_empty() {
+                        "None (Idle)".to_string()
+                    } else {
+                        peer.active_model.clone()
+                    },
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
             Line::from(vec![
                 Span::styled(" Thermal Status:  ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{}/100", peer.thermal_index), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{}/100", peer.thermal_index),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![Span::styled(
                 " Press [I] or [Esc] to close inspection panel ",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             )]),
         ];
 
@@ -617,13 +717,20 @@ impl ClusterView {
         let lines = vec![
             Line::from(vec![Span::styled(
                 " Add Static Cluster Peer ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )]),
             Line::from(" Enter IP:Port address of remote node:"),
             Line::from(""),
             Line::from(vec![
                 Span::styled(" > ", Style::default().fg(Color::Yellow)),
-                Span::styled(format!("{}█", self.add_peer_input), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}█", self.add_peer_input),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![Span::styled(

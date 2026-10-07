@@ -1,11 +1,15 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use thiserror::Error;
 use tracing::debug;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian (0x47, 0x47, 0x55, 0x46)
+
+/// Absolute ceiling on metadata map/array capacity requests (bytes of length field claims).
+/// Prevents hostile headers from requesting impossible heap before EOF checks run.
+const MAX_ALLOC_ELEMENTS: usize = 1_048_576;
 
 #[derive(Error, Debug)]
 pub enum GgufError {
@@ -26,6 +30,9 @@ pub enum GgufError {
 
     #[error("Unexpected EOF while parsing GGUF metadata")]
     UnexpectedEof,
+
+    #[error("GGUF length claim exceeds remaining input or safe allocation limit ({0})")]
+    InvalidLength(String),
 }
 
 /// Metadata value types stored in GGUF key-value headers.
@@ -104,49 +111,56 @@ impl GgufMetadata {
     /// Read GGUF header and metadata dictionary from any reader supporting Read + Seek.
     pub fn read<R: Read + Seek>(reader: &mut R) -> Result<Self, GgufError> {
         let mut magic_buf = [0u8; 4];
-        reader.read_exact(&mut magic_buf)?;
+        read_exact_eof(reader, &mut magic_buf)?;
         let magic = u32::from_le_bytes(magic_buf);
         if magic != GGUF_MAGIC {
             return Err(GgufError::InvalidMagic(magic));
         }
 
         let mut u32_buf = [0u8; 4];
-        reader.read_exact(&mut u32_buf)?;
+        read_exact_eof(reader, &mut u32_buf)?;
         let version = u32::from_le_bytes(u32_buf);
         if version != 2 && version != 3 {
             return Err(GgufError::UnsupportedVersion(version));
         }
 
         let mut u64_buf = [0u8; 8];
-        reader.read_exact(&mut u64_buf)?;
+        read_exact_eof(reader, &mut u64_buf)?;
         let tensor_count = u64::from_le_bytes(u64_buf);
 
-        reader.read_exact(&mut u64_buf)?;
-        let kv_count = u64::from_le_bytes(u64_buf);
+        read_exact_eof(reader, &mut u64_buf)?;
+        let kv_count_u64 = u64::from_le_bytes(u64_buf);
 
         debug!(
             "Parsing GGUF v{}: {} tensors, {} metadata KV pairs",
-            version, tensor_count, kv_count
+            version, tensor_count, kv_count_u64
         );
 
-        let mut metadata = HashMap::with_capacity(kv_count as usize);
+        // Each KV needs at least: empty key (8) + type (4) + 1-byte value = 13 bytes.
+        const MIN_KV_BYTES: u64 = 13;
+        let remaining = remaining_bytes(reader)?;
+        let kv_count = checked_count(kv_count_u64, remaining, MIN_KV_BYTES, "kv_count")?;
+
+        let mut metadata = HashMap::with_capacity(kv_count);
 
         for _ in 0..kv_count {
-            // Read key string (u64 length followed by bytes)
             let key = read_string(reader)?;
 
-            // Read value type (u32)
-            reader.read_exact(&mut u32_buf)?;
+            read_exact_eof(reader, &mut u32_buf)?;
             let value_type = u32::from_le_bytes(u32_buf);
 
-            // Read value
             let value = read_value(reader, value_type)?;
             metadata.insert(key, value);
         }
 
-        // Extract key architectural parameters
-        let architecture = metadata.get("general.architecture").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let model_name = metadata.get("general.name").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let architecture = metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let model_name = metadata
+            .get("general.name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let arch_prefix = architecture.as_deref().unwrap_or("llama");
 
@@ -175,7 +189,7 @@ impl GgufMetadata {
         Ok(Self {
             version,
             tensor_count,
-            kv_count,
+            kv_count: kv_count_u64,
             metadata,
             architecture,
             model_name,
@@ -201,10 +215,10 @@ impl GgufMetadata {
             self.head_count_kv,
             self.embedding_length,
         ) {
-            if head_count > 0 {
-                let head_dim = embd / head_count;
+            if let Some(head_dim) = embd.checked_div(head_count) {
                 // 2 (K + V) * layers * kv_heads * head_dim * 2 bytes (f16)
-                let bytes_per_token = 2 * (layers as u64) * (head_count_kv as u64) * (head_dim as u64) * 2;
+                let bytes_per_token =
+                    2 * (layers as u64) * (head_count_kv as u64) * (head_dim as u64) * 2;
                 return bytes_per_token.saturating_mul(context_size as u64);
             }
         }
@@ -214,57 +228,112 @@ impl GgufMetadata {
     }
 }
 
-// Helpers for reading GGUF primitive types
-fn read_string<R: Read>(reader: &mut R) -> Result<String, GgufError> {
-    let mut len_buf = [0u8; 8];
-    reader.read_exact(&mut len_buf)?;
-    let len = u64::from_le_bytes(len_buf) as usize;
+fn remaining_bytes<R: Seek>(reader: &mut R) -> Result<u64, GgufError> {
+    let pos = reader.stream_position()?;
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(pos))?;
+    Ok(end.saturating_sub(pos))
+}
 
+fn checked_count(
+    claimed: u64,
+    remaining: u64,
+    min_bytes_per: u64,
+    label: &str,
+) -> Result<usize, GgufError> {
+    if claimed > MAX_ALLOC_ELEMENTS as u64 {
+        return Err(GgufError::InvalidLength(format!(
+            "{label}={claimed} exceeds max {MAX_ALLOC_ELEMENTS}"
+        )));
+    }
+    let needed = claimed.saturating_mul(min_bytes_per);
+    if needed > remaining {
+        return Err(GgufError::InvalidLength(format!(
+            "{label}={claimed} needs at least {needed} bytes, only {remaining} remain"
+        )));
+    }
+    Ok(claimed as usize)
+}
+
+fn read_exact_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), GgufError> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(GgufError::UnexpectedEof),
+        Err(e) => Err(GgufError::Io(e)),
+    }
+}
+
+fn read_string<R: Read + Seek>(reader: &mut R) -> Result<String, GgufError> {
+    let mut len_buf = [0u8; 8];
+    read_exact_eof(reader, &mut len_buf)?;
+    let len_u64 = u64::from_le_bytes(len_buf);
+    let remaining = remaining_bytes(reader)?;
+    if len_u64 > remaining {
+        return Err(GgufError::InvalidLength(format!(
+            "string len={len_u64} exceeds remaining {remaining}"
+        )));
+    }
+    if len_u64 > MAX_ALLOC_ELEMENTS as u64 {
+        return Err(GgufError::InvalidLength(format!(
+            "string len={len_u64} exceeds max {MAX_ALLOC_ELEMENTS}"
+        )));
+    }
+    let len = len_u64 as usize;
     let mut str_buf = vec![0u8; len];
-    reader.read_exact(&mut str_buf)?;
+    read_exact_eof(reader, &mut str_buf)?;
     Ok(String::from_utf8(str_buf)?)
+}
+
+fn fixed_width_size(value_type: u32) -> Option<u64> {
+    match value_type {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
+        _ => None,
+    }
 }
 
 fn read_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufValue, GgufError> {
     match value_type {
         0 => {
             let mut buf = [0u8; 1];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Uint8(buf[0]))
         }
         1 => {
             let mut buf = [0u8; 1];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Int8(buf[0] as i8))
         }
         2 => {
             let mut buf = [0u8; 2];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Uint16(u16::from_le_bytes(buf)))
         }
         3 => {
             let mut buf = [0u8; 2];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Int16(i16::from_le_bytes(buf)))
         }
         4 => {
             let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Uint32(u32::from_le_bytes(buf)))
         }
         5 => {
             let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Int32(i32::from_le_bytes(buf)))
         }
         6 => {
             let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Float32(f32::from_le_bytes(buf)))
         }
         7 => {
             let mut buf = [0u8; 1];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Bool(buf[0] != 0))
         }
         8 => {
@@ -273,12 +342,16 @@ fn read_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufVal
         }
         9 => {
             let mut u32_buf = [0u8; 4];
-            reader.read_exact(&mut u32_buf)?;
+            read_exact_eof(reader, &mut u32_buf)?;
             let elem_type = u32::from_le_bytes(u32_buf);
 
             let mut u64_buf = [0u8; 8];
-            reader.read_exact(&mut u64_buf)?;
-            let array_len = u64::from_le_bytes(u64_buf) as usize;
+            read_exact_eof(reader, &mut u64_buf)?;
+            let array_len_u64 = u64::from_le_bytes(u64_buf);
+
+            let remaining = remaining_bytes(reader)?;
+            let min_elem = fixed_width_size(elem_type).unwrap_or(1);
+            let array_len = checked_count(array_len_u64, remaining, min_elem, "array_len")?;
 
             let mut arr = Vec::with_capacity(array_len);
             for _ in 0..array_len {
@@ -288,17 +361,17 @@ fn read_value<R: Read + Seek>(reader: &mut R, value_type: u32) -> Result<GgufVal
         }
         10 => {
             let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Uint64(u64::from_le_bytes(buf)))
         }
         11 => {
             let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Int64(i64::from_le_bytes(buf)))
         }
         12 => {
             let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf)?;
+            read_exact_eof(reader, &mut buf)?;
             Ok(GgufValue::Float64(f64::from_le_bytes(buf)))
         }
         other => Err(GgufError::UnsupportedValueType(other)),

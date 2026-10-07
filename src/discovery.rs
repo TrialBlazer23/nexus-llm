@@ -1,7 +1,7 @@
 use crate::config::NexusConfig;
 use crate::peer_registry::{ObservationSource, PeerLifecycle, PeerRegistry};
-use crate::trust_auth::pairing_enforced;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
+use crate::trust_auth::pairing_enforced;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -441,13 +441,11 @@ impl DiscoveryService {
         } else {
             BackendHealth::Stopped
         }));
-        let mdns_health = Arc::new(RwLock::new(
-            if mdns_enabled_val {
-                BackendHealth::Started
-            } else {
-                BackendHealth::Stopped
-            },
-        ));
+        let mdns_health = Arc::new(RwLock::new(if mdns_enabled_val {
+            BackendHealth::Started
+        } else {
+            BackendHealth::Stopped
+        }));
 
         Self {
             config,
@@ -727,7 +725,8 @@ impl DiscoveryService {
             let initial_targets = self.broadcast_targets().await;
             info!(
                 "Discovery broadcaster active: transmitting beacons to {:?} every {} ms",
-                initial_targets, self.cfg().network.broadcast_interval_ms
+                initial_targets,
+                self.cfg().network.broadcast_interval_ms
             );
 
             let interval = Duration::from_millis(self.cfg().network.broadcast_interval_ms);
@@ -825,10 +824,7 @@ impl DiscoveryService {
                 }
             };
 
-            info!(
-                "Discovery listener active on port {}",
-                discovery_port
-            );
+            info!("Discovery listener active on port {}", discovery_port);
             *self.udp_health.write().await = BackendHealth::Healthy;
             if let Some(sender) = &events {
                 let _ = sender
@@ -859,8 +855,12 @@ impl DiscoveryService {
                                     // Beacon v1 has no control_port or display_name; preserve
                                     // mDNS-learned values, otherwise assume mesh defaults.
                                     let existing = peers.get(&beacon.uuid);
-                                    let default_control_port =
-                                        self.config.read().expect("config lock").network.control_port;
+                                    let default_control_port = self
+                                        .config
+                                        .read()
+                                        .expect("config lock")
+                                        .network
+                                        .control_port;
                                     let control_port = existing
                                         .map(|p| p.control_port)
                                         .unwrap_or(default_control_port);
@@ -918,7 +918,11 @@ impl DiscoveryService {
                                     let should_reply = {
                                         let mut replies = self.last_unicast_replies.write().await;
                                         match replies.get(&peer_addr.ip()) {
-                                            Some(last) if last.elapsed() < Duration::from_secs(5) => false,
+                                            Some(last)
+                                                if last.elapsed() < Duration::from_secs(5) =>
+                                            {
+                                                false
+                                            }
                                             _ => {
                                                 replies.insert(peer_addr.ip(), Instant::now());
                                                 true
@@ -943,7 +947,8 @@ impl DiscoveryService {
                                             active_model: self.active_model.read().await.clone(),
                                         };
                                         let reply_bytes = reply_beacon.encode();
-                                        let _ = socket.send_to(&reply_bytes, peer_discovery_addr).await;
+                                        let _ =
+                                            socket.send_to(&reply_bytes, peer_discovery_addr).await;
                                     }
                                 }
                                 Err(e) => {
@@ -1004,9 +1009,7 @@ impl DiscoveryService {
         let registry = self.registry.read().await;
         registry
             .get(peer_id)
-            .map(|record| {
-                record.verified && matches!(record.lifecycle, PeerLifecycle::Healthy)
-            })
+            .map(|record| record.verified && matches!(record.lifecycle, PeerLifecycle::Healthy))
             .unwrap_or(false)
     }
 
@@ -1087,8 +1090,7 @@ impl DiscoveryService {
                             .contains(&peer.uuid))
             })
             .map(|peer| {
-                let allocatable_mb = u64::from(peer.free_ram_mb)
-                    .min(policy.max_allocatable_mb);
+                let allocatable_mb = u64::from(peer.free_ram_mb).min(policy.max_allocatable_mb);
                 RpcCandidate {
                     rationale: format!(
                         "healthy RPC-ready peer; allocatable budget capped at {} MB",
@@ -1124,9 +1126,10 @@ impl DiscoveryService {
             return;
         }
 
-        let probe_target = endpoint.addresses.first().map(|addr| {
-            SocketAddr::new(addr.ip(), self.cfg().network.discovery_port)
-        });
+        let probe_target = endpoint
+            .addresses
+            .first()
+            .map(|addr| SocketAddr::new(addr.ip(), self.cfg().network.discovery_port));
 
         let mut peers = self.peers.write().await;
         let event = if let Some(existing) = peers.get_mut(&endpoint.node_id) {
@@ -1184,13 +1187,22 @@ impl DiscoveryService {
         };
         drop(peers);
 
-        if let Err(e) = self.registry.write().await.apply_event(event, source, Instant::now()) {
-            warn!("Rejected {} peer observation: {}", match source {
-                ObservationSource::Udp => "UDP",
-                ObservationSource::Mdns => "mDNS",
-                ObservationSource::Static => "static",
-                ObservationSource::ControlPlane => "control plane",
-            }, e);
+        if let Err(e) = self
+            .registry
+            .write()
+            .await
+            .apply_event(event, source, Instant::now())
+        {
+            warn!(
+                "Rejected {} peer observation: {}",
+                match source {
+                    ObservationSource::Udp => "UDP",
+                    ObservationSource::Mdns => "mDNS",
+                    ObservationSource::Static => "static",
+                    ObservationSource::ControlPlane => "control plane",
+                },
+                e
+            );
         }
 
         // Send a unicast UDP probe to obtain full hardware telemetry if endpoint address is reachable
@@ -1270,10 +1282,7 @@ impl DiscoveryService {
             }
 
             *this.mdns_health.write().await = BackendHealth::Healthy;
-            info!(
-                "mDNS service registered on {} ({})",
-                local_ip, service_type
-            );
+            info!("mDNS service registered on {} ({})", local_ip, service_type);
 
             let (mut events, _browse_handle) = match mdns.browse(&service_type) {
                 Ok(res) => res,
@@ -1286,9 +1295,11 @@ impl DiscoveryService {
 
             while let Some(event) = events.recv().await {
                 match event {
-                    DiscoveryEvent::ServiceFound(endpoint) | DiscoveryEvent::ServiceUpdated(endpoint) => {
+                    DiscoveryEvent::ServiceFound(endpoint)
+                    | DiscoveryEvent::ServiceUpdated(endpoint) => {
                         debug!("mDNS discovered service: {:?}", endpoint.node_id);
-                        this.record_service_endpoint(endpoint, ObservationSource::Mdns).await;
+                        this.record_service_endpoint(endpoint, ObservationSource::Mdns)
+                            .await;
                     }
                     DiscoveryEvent::ServiceRemoved { node_id } => {
                         debug!("mDNS service removed: {:?}", node_id);
@@ -1350,39 +1361,42 @@ pub fn get_broadcast_addresses() -> Vec<std::net::Ipv4Addr> {
             let is_loopback = (flags & libc::IFF_LOOPBACK) != 0;
             let is_broadcast = (flags & libc::IFF_BROADCAST) != 0;
 
-            if is_up && !is_loopback && is_broadcast && !item.ifa_addr.is_null() {
-                if (*item.ifa_addr).sa_family as i32 == libc::AF_INET {
-                    let mut bcast = None;
-                    if !item.ifa_ifu.is_null() {
-                        let bcast_in = &*(item.ifa_ifu as *const libc::sockaddr_in);
-                        let bcast_bytes = bcast_in.sin_addr.s_addr.to_ne_bytes();
-                        let addr = std::net::Ipv4Addr::from(bcast_bytes);
-                        if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
-                            bcast = Some(addr);
-                        }
+            if is_up
+                && !is_loopback
+                && is_broadcast
+                && !item.ifa_addr.is_null()
+                && (*item.ifa_addr).sa_family as i32 == libc::AF_INET
+            {
+                let mut bcast = None;
+                if !item.ifa_ifu.is_null() {
+                    let bcast_in = &*(item.ifa_ifu as *const libc::sockaddr_in);
+                    let bcast_bytes = bcast_in.sin_addr.s_addr.to_ne_bytes();
+                    let addr = std::net::Ipv4Addr::from(bcast_bytes);
+                    if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
+                        bcast = Some(addr);
                     }
+                }
 
-                    if bcast.is_none() && !item.ifa_netmask.is_null() {
-                        let sock_in = &*(item.ifa_addr as *const libc::sockaddr_in);
-                        let mask_in = &*(item.ifa_netmask as *const libc::sockaddr_in);
-                        let ip = sock_in.sin_addr.s_addr.to_ne_bytes();
-                        let mask = mask_in.sin_addr.s_addr.to_ne_bytes();
-                        let bcast_octets = [
-                            ip[0] | !mask[0],
-                            ip[1] | !mask[1],
-                            ip[2] | !mask[2],
-                            ip[3] | !mask[3],
-                        ];
-                        let addr = std::net::Ipv4Addr::from(bcast_octets);
-                        if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
-                            bcast = Some(addr);
-                        }
+                if bcast.is_none() && !item.ifa_netmask.is_null() {
+                    let sock_in = &*(item.ifa_addr as *const libc::sockaddr_in);
+                    let mask_in = &*(item.ifa_netmask as *const libc::sockaddr_in);
+                    let ip = sock_in.sin_addr.s_addr.to_ne_bytes();
+                    let mask = mask_in.sin_addr.s_addr.to_ne_bytes();
+                    let bcast_octets = [
+                        ip[0] | !mask[0],
+                        ip[1] | !mask[1],
+                        ip[2] | !mask[2],
+                        ip[3] | !mask[3],
+                    ];
+                    let addr = std::net::Ipv4Addr::from(bcast_octets);
+                    if !addr.is_unspecified() && addr != std::net::Ipv4Addr::new(127, 0, 0, 1) {
+                        bcast = Some(addr);
                     }
+                }
 
-                    if let Some(addr) = bcast {
-                        if !addrs.contains(&addr) {
-                            addrs.push(addr);
-                        }
+                if let Some(addr) = bcast {
+                    if !addrs.contains(&addr) {
+                        addrs.push(addr);
                     }
                 }
             }

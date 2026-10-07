@@ -59,7 +59,12 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 ├── AGENT_LEARNINGS.md
 ├── DESIGN_SPEC.md
 ├── BUILD_PLAN.md
+├── CAPABILITY_REVIEW.md
 ├── NETWORK_EXPANSION_FINDINGS.md
+├── scripts/
+│   ├── check_penryn_opcodes.sh   # CI: fail on AVX/AVX2/FMA/SSE4.2 in release binary
+│   └── verify_review_findings.sh
+├── .github/workflows/ci.yml      # Continuous: fmt, clippy, test, Android best-effort, Penryn scan
 ├── src/
 │   ├── main.rs            # CLI entry point & TUI router
 │   ├── daemon.rs          # Headless supervisor binary (nexusd)
@@ -69,21 +74,30 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 │   ├── discovery.rs       # UDP 9999 beacon & ARP scanner
 │   ├── mdns.rs            # mDNS-SD zero-config discovery
 │   ├── peer_registry.rs   # Dynamic peer lifecycle registry
+│   ├── registry_runtime.rs# Runtime registry wiring
+│   ├── node_identity.rs   # Ed25519 node identity
+│   ├── trust_auth.rs      # Signed control-plane auth
 │   ├── control_plane.rs   # Remote execution & handshake protocol
 │   ├── control_plane_server.rs # HTTP control-plane listener (hyper)
 │   ├── client.rs          # OpenAI HTTP/SSE client
-│   ├── gguf.rs            # Zero-copy GGUF header parser
-│   ├── downloader.rs      # Chunked HTTP resume engine
+│   ├── gguf.rs            # Allocating GGUF header/metadata parser (bounded lengths; not zero-copy)
+│   ├── downloader.rs      # HTTP Range resume engine (single connection; not multi-chunk parallel)
 │   ├── preset.rs          # YAML persona & chat template engine
 │   ├── cluster.rs         # Distributed RPC coordinator
+│   ├── doctor.rs          # `nexus doctor` diagnostics
+│   ├── logging.rs         # File logging helpers
 │   ├── tunnel.rs          # ADB forward/reverse supervisor
 │   └── ui/
 │       ├── chat.rs         # Interactive streaming TUI
 │       ├── dashboard.rs    # Cluster performance monitor
-│       ├── hub.rs          # Full unified hub with tab routing
+│       ├── cluster_view.rs # Cluster tab surface
+│       ├── hub/            # Unified hub (mod/commands/keymap)
+│       ├── markdown.rs     # Chat markdown rendering
+│       ├── models.rs       # Model list helpers
 │       ├── models_view.rs  # Model browser with target node selector
+│       ├── session_logger.rs
 │       ├── settings_view.rs# Live configuration editor
-│       └── tunnel_view.rs  # ADB USB tunnel manager
+│       └── tunnel_view.rs  # ADB USB tunnel UI (present; Tunnel hub tab deferred)
 └── presets/
     ├── coder.yaml
     └── general.yaml

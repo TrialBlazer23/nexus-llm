@@ -28,9 +28,17 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn worst(&self) -> CheckSeverity {
-        if self.checks.iter().any(|c| c.severity == CheckSeverity::Fail) {
+        if self
+            .checks
+            .iter()
+            .any(|c| c.severity == CheckSeverity::Fail)
+        {
             CheckSeverity::Fail
-        } else if self.checks.iter().any(|c| c.severity == CheckSeverity::Warn) {
+        } else if self
+            .checks
+            .iter()
+            .any(|c| c.severity == CheckSeverity::Warn)
+        {
             CheckSeverity::Warn
         } else {
             CheckSeverity::Ok
@@ -67,25 +75,19 @@ impl DoctorReport {
 
 /// Run diagnostic probes against `config`. External binaries missing → WARN (not FAIL).
 pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
-    let mut checks = Vec::new();
-
-    checks.push(check_config(config));
-    checks.push(check_binary_on_path(
-        "llama-server",
-        &config.node.llama_server_binary,
-    ));
-    checks.push(check_binary_on_path(
-        "rpc-server",
-        &config.node.rpc_server_binary,
-    ));
-    checks.push(check_models_dir(&config.node.models_dir));
-    checks.push(check_system_profile());
-    checks.push(check_port_bindable("discovery_port", config.network.discovery_port));
-    checks.push(check_port_bindable("control_port", config.network.control_port));
-    checks.push(check_port_bindable("api_port", config.network.api_port));
-    checks.push(check_adb());
-    checks.push(check_log_dir());
-    checks.push(check_display_name(config));
+    let checks = vec![
+        check_config(config),
+        check_binary_on_path("llama-server", &config.node.llama_server_binary),
+        check_binary_on_path("rpc-server", &config.node.rpc_server_binary),
+        check_models_dir(&config.node.models_dir),
+        check_system_profile(),
+        check_port_bindable("discovery_port", config.network.discovery_port),
+        check_port_bindable("control_port", config.network.control_port),
+        check_port_bindable("api_port", config.network.api_port),
+        check_adb(),
+        check_log_dir(),
+        check_display_name(config),
+    ];
 
     DoctorReport { checks }
 }

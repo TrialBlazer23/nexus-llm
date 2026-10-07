@@ -1,10 +1,10 @@
 //! Loopback HTTP integration tests for the Phase 7 control-plane server.
 
-use nexus::control_plane::{
-    dispatch_load_model, dispatch_unload_model, fetch_state, ControlPlaneRequest,
-    ModelLoadRequest, ModelUnloadRequest, CONTROL_PLANE_VERSION,
-};
 use nexus::config::NexusConfig;
+use nexus::control_plane::{
+    dispatch_load_model, dispatch_unload_model, fetch_state, ControlPlaneRequest, ModelLoadRequest,
+    ModelUnloadRequest, CONTROL_PLANE_VERSION,
+};
 use nexus::control_plane_server::{spawn_ephemeral, ControlPlaneContext};
 use nexus::discovery::NodeRole;
 use nexus::supervisor::SupervisorManager;

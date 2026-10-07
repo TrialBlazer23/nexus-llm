@@ -90,9 +90,12 @@ impl DashboardApp {
             self.transport_info
         );
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]))
+        let header = Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -124,18 +127,19 @@ impl DashboardApp {
         let mem_gauge = Gauge::default()
             .block(
                 Block::default()
-                    .title(format!(" Memory Utilization (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ", used_ram, total_ram, lmk_cap))
+                    .title(format!(
+                        " Memory Utilization (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ",
+                        used_ram, total_ram, lmk_cap
+                    ))
                     .borders(Borders::ALL),
             )
-            .gauge_style(
-                if ram_percent > 85 {
-                    Style::default().fg(Color::Red)
-                } else if ram_percent > 70 {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Green)
-                },
-            )
+            .gauge_style(if ram_percent > 85 {
+                Style::default().fg(Color::Red)
+            } else if ram_percent > 70 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            })
             .percent(ram_percent);
 
         frame.render_widget(mem_gauge, cols[0]);
@@ -158,33 +162,62 @@ impl DashboardApp {
 
         let info_lines = vec![
             Line::from(vec![
-                Span::styled(" Acceleration Tier: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(backend_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Acceleration Tier: ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    backend_name,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
-                Span::styled(" Vulkan Runtime:    ", Style::default().fg(Color::LightBlue)),
                 Span::styled(
-                    if SystemProfile::probe_vulkan() { "Active / Initialized" } else { "Not Available" },
+                    " Vulkan Runtime:    ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    if SystemProfile::probe_vulkan() {
+                        "Active / Initialized"
+                    } else {
+                        "Not Available"
+                    },
                     Style::default().fg(Color::LightGreen),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Thermal Index:     ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{}/100", self.thermal_index), thermal_style.add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " Thermal Index:     ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    format!("{}/100", self.thermal_index),
+                    thermal_style.add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
-                Span::styled(" Compute Threads:   ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{} performance threads", self.local_profile.recommended_threads), Style::default().fg(Color::White)),
+                Span::styled(
+                    " Compute Threads:   ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    format!(
+                        "{} performance threads",
+                        self.local_profile.recommended_threads
+                    ),
+                    Style::default().fg(Color::White),
+                ),
             ]),
         ];
 
-        let right_block = Paragraph::new(info_lines)
-            .block(
-                Block::default()
-                    .title(" Local Engine Capabilities ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
+        let right_block = Paragraph::new(info_lines).block(
+            Block::default()
+                .title(" Local Engine Capabilities ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
 
         frame.render_widget(right_block, cols[1]);
     }
@@ -199,7 +232,11 @@ impl DashboardApp {
             Cell::from("Thermal"),
             Cell::from("Active Model"),
         ])
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
         let mut rows = Vec::new();
 
@@ -225,7 +262,11 @@ impl DashboardApp {
             };
 
             let model_display = if peer.active_model.is_empty() {
-                if peer.is_rpc_ready() { "RPC Ready".to_string() } else { "—".to_string() }
+                if peer.is_rpc_ready() {
+                    "RPC Ready".to_string()
+                } else {
+                    "—".to_string()
+                }
             } else {
                 peer.active_model.clone()
             };
@@ -256,7 +297,10 @@ impl DashboardApp {
         .header(header)
         .block(
             Block::default()
-                .title(format!(" Discovered Cluster Peers (UDP 9999) - {} nodes ", self.peers.len()))
+                .title(format!(
+                    " Discovered Cluster Peers (UDP 9999) - {} nodes ",
+                    self.peers.len()
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::LightBlue)),
         );
@@ -265,16 +309,19 @@ impl DashboardApp {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled(" [q / Esc] Exit Monitor  |  [r] Manual Refresh ", Style::default().fg(Color::DarkGray)),
-        ]));
+        let footer = Paragraph::new(Line::from(vec![Span::styled(
+            " [q / Esc] Exit Monitor  |  [r] Manual Refresh ",
+            Style::default().fg(Color::DarkGray),
+        )]));
 
         frame.render_widget(footer, area);
     }
 }
 
 /// Run full Ratatui TUI dashboard monitor.
-pub async fn run_dashboard_tui(discovery: Arc<DiscoveryService>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_dashboard_tui(
+    discovery: Arc<DiscoveryService>,
+) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -297,19 +344,16 @@ pub async fn run_dashboard_tui(discovery: Arc<DiscoveryService>) -> Result<(), B
             }
 
             Some(event_res) = event_stream.next() => {
-                match event_res {
-                    Ok(Event::Key(key)) => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                            KeyCode::Char('r') => {
-                                app.refresh().await;
-                                terminal.draw(|f| app.render(f))?;
-                            }
-                            _ => {}
+                if let Ok(Event::Key(key)) = event_res {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('r') => {
+                            app.refresh().await;
+                            terminal.draw(|f| app.render(f))?;
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 

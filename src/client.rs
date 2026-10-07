@@ -294,9 +294,7 @@ impl NexusClient {
                 match event_result {
                     Ok(event) => {
                         let data = event.data.trim();
-                        if data == "[DONE]" {
-                            None
-                        } else if data.is_empty() {
+                        if data == "[DONE]" || data.is_empty() {
                             None
                         } else {
                             match serde_json::from_str::<ChatCompletionChunk>(data) {

@@ -80,11 +80,11 @@ async fn run_verifier(
 
     for (node_id, endpoint) in peers_to_verify {
         if security.pairing_enforced() && !security.allowed_peer_ids.contains(&node_id) {
-            discovery
-                .peer_registry()
-                .write()
-                .await
-                .reject(node_id, "unpaired peer", Instant::now());
+            discovery.peer_registry().write().await.reject(
+                node_id,
+                "unpaired peer",
+                Instant::now(),
+            );
             continue;
         }
 
@@ -103,11 +103,11 @@ async fn run_verifier(
                 Ok(state) => state,
                 Err(err) => {
                     warn!("Control-plane verify failed for {}: {}", node_id, err);
-                    discovery
-                        .peer_registry()
-                        .write()
-                        .await
-                        .reject(node_id, format!("verify failed: {err}"), Instant::now());
+                    discovery.peer_registry().write().await.reject(
+                        node_id,
+                        format!("verify failed: {err}"),
+                        Instant::now(),
+                    );
                     continue;
                 }
             }
@@ -116,11 +116,11 @@ async fn run_verifier(
                 Ok(state) => state,
                 Err(err) => {
                     warn!("Control-plane verify failed for {}: {}", node_id, err);
-                    discovery
-                        .peer_registry()
-                        .write()
-                        .await
-                        .reject(node_id, format!("verify failed: {err}"), Instant::now());
+                    discovery.peer_registry().write().await.reject(
+                        node_id,
+                        format!("verify failed: {err}"),
+                        Instant::now(),
+                    );
                     continue;
                 }
             }
@@ -128,21 +128,20 @@ async fn run_verifier(
 
         let max_alloc = discovery.config().cluster.max_rpc_ram_mb.max(16_384);
         if let Err(err) = validate_state(&state, node_id, CONTROL_PLANE_VERSION, max_alloc) {
-            discovery
-                .peer_registry()
-                .write()
-                .await
-                .reject(node_id, err.to_string(), Instant::now());
+            discovery.peer_registry().write().await.reject(
+                node_id,
+                err.to_string(),
+                Instant::now(),
+            );
             continue;
         }
 
         let verified_endpoint = endpoint_from_state(&state, &endpoint);
-        if let Err(err) = discovery
-            .peer_registry()
-            .write()
-            .await
-            .mark_verified(node_id, verified_endpoint, Instant::now())
-        {
+        if let Err(err) = discovery.peer_registry().write().await.mark_verified(
+            node_id,
+            verified_endpoint,
+            Instant::now(),
+        ) {
             warn!("Registry mark_verified failed for {}: {}", node_id, err);
         } else {
             debug!("Peer {} verified via control plane", node_id);

@@ -6,8 +6,8 @@ use ed25519_dalek::SigningKey;
 use http::HeaderMap;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -163,7 +163,8 @@ pub fn parse_auth_headers(headers: &HeaderMap) -> Result<AuthHeaders, AuthError>
     let signer_id = Uuid::parse_str(header_str(headers, HDR_SIGNER)?)
         .map_err(|_| AuthError::InvalidHeader(HDR_SIGNER.to_string()))?;
     let sig_hex = header_str(headers, HDR_SIGNATURE)?;
-    let sig_bytes = hex_decode(sig_hex).map_err(|_| AuthError::InvalidHeader(HDR_SIGNATURE.to_string()))?;
+    let sig_bytes =
+        hex_decode(sig_hex).map_err(|_| AuthError::InvalidHeader(HDR_SIGNATURE.to_string()))?;
     if sig_bytes.len() != 64 {
         return Err(AuthError::InvalidHeader(HDR_SIGNATURE.to_string()));
     }
@@ -215,6 +216,8 @@ pub fn lookup_signer_pubkey(
     Err(AuthError::SignerNotAuthorized)
 }
 
+// Continuous: signature verifies many independent inputs; keep explicit params.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_control_request(
     headers: &HeaderMap,
     method: &str,
@@ -254,15 +257,24 @@ pub fn verify_control_request(
         cache.insert(&auth.nonce)?;
     }
     let pubkey = lookup_signer_pubkey(security, auth.signer_id, body_requester_pubkey_hex)?;
-    let message =
-        canonical_signing_message(method, path, body, auth.timestamp, &auth.nonce, auth.signer_id);
+    let message = canonical_signing_message(
+        method,
+        path,
+        body,
+        auth.timestamp,
+        &auth.nonce,
+        auth.signer_id,
+    );
     if !verify_signature(&pubkey, message.as_bytes(), &auth.signature) {
         return Err(AuthError::BadSignature);
     }
     Ok(auth)
 }
 
-pub fn authorize_privileged_signer(security: &SecurityConfig, signer_id: Uuid) -> Result<(), AuthError> {
+pub fn authorize_privileged_signer(
+    security: &SecurityConfig,
+    signer_id: Uuid,
+) -> Result<(), AuthError> {
     if !pairing_enforced(security) {
         return Ok(());
     }
@@ -283,7 +295,9 @@ pub struct TrustBootstrap {
 }
 
 impl TrustBootstrap {
-    pub fn load(mut config: crate::config::NexusConfig) -> Result<Self, crate::config::ConfigError> {
+    pub fn load(
+        mut config: crate::config::NexusConfig,
+    ) -> Result<Self, crate::config::ConfigError> {
         let config_path = if let Ok(custom) = std::env::var("NEXUS_CONFIG") {
             std::path::PathBuf::from(custom)
         } else {

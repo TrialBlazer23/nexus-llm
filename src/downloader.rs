@@ -89,23 +89,22 @@ impl ModelDownloader {
             return Err(DownloaderError::HttpStatus(status));
         }
 
-        let (mut file, mut downloaded, total_bytes) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            let total = resp
-                .content_length()
-                .map(|rem| rem + existing_bytes);
+        let (mut file, mut downloaded, total_bytes) =
+            if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                let total = resp.content_length().map(|rem| rem + existing_bytes);
 
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&part_path)?;
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&part_path)?;
 
-            (file, existing_bytes, total)
-        } else {
-            // Server did not honor Range or download starting fresh
-            let total = resp.content_length();
-            let file = File::create(&part_path)?;
-            (file, 0u64, total)
-        };
+                (file, existing_bytes, total)
+            } else {
+                // Server did not honor Range or download starting fresh
+                let total = resp.content_length();
+                let file = File::create(&part_path)?;
+                (file, 0u64, total)
+            };
 
         let mut stream = resp.bytes_stream();
         let mut last_emit = Instant::now();

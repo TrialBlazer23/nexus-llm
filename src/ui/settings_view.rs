@@ -247,13 +247,18 @@ impl SettingsView {
             SettingType::PresetsDir => self.config.node.presets_dir.to_string_lossy().to_string(),
             SettingType::LlamaServerBinary => self.config.node.llama_server_binary.clone(),
             SettingType::RpcServerBinary => self.config.node.rpc_server_binary.clone(),
-            SettingType::DefaultHost => self.config.network.default_host.clone().unwrap_or_default(),
+            SettingType::DefaultHost => {
+                self.config.network.default_host.clone().unwrap_or_default()
+            }
             SettingType::StaticPeers => self.config.network.static_peers.join(", "),
             _ => String::new(),
         };
         self.text_buffer = cur_val;
         self.editing_text = true;
-        self.status_message = Some(("Editing... [Enter] Commit | [Esc] Cancel".to_string(), Color::Yellow));
+        self.status_message = Some((
+            "Editing... [Enter] Commit | [Esc] Cancel".to_string(),
+            Color::Yellow,
+        ));
     }
 
     pub fn commit_text(&mut self) {
@@ -346,44 +351,72 @@ impl SettingsView {
                 let cur = self.config.node.role.as_str();
                 let idx = VALID_ROLES.iter().position(|r| *r == cur).unwrap_or(0);
                 let new_idx = if is_left {
-                    if idx == 0 { VALID_ROLES.len() - 1 } else { idx - 1 }
+                    if idx == 0 {
+                        VALID_ROLES.len() - 1
+                    } else {
+                        idx - 1
+                    }
                 } else {
                     (idx + 1) % VALID_ROLES.len()
                 };
                 self.config.node.role = VALID_ROLES[new_idx].to_string();
             }
             SettingType::EnableMdns => {
-                self.config.network.discovery.mdns.enabled = !self.config.network.discovery.mdns.enabled;
+                self.config.network.discovery.mdns.enabled =
+                    !self.config.network.discovery.mdns.enabled;
             }
             SettingType::DiscoveryPort => {
                 if is_left {
-                    self.config.network.discovery_port = self.config.network.discovery_port.saturating_sub(1);
+                    self.config.network.discovery_port =
+                        self.config.network.discovery_port.saturating_sub(1);
                 } else if is_right {
-                    self.config.network.discovery_port = self.config.network.discovery_port.saturating_add(1);
+                    self.config.network.discovery_port =
+                        self.config.network.discovery_port.saturating_add(1);
                 }
             }
             SettingType::PreferGpu => {
-                self.config.hardware.acceleration.prefer_gpu = !self.config.hardware.acceleration.prefer_gpu;
+                self.config.hardware.acceleration.prefer_gpu =
+                    !self.config.hardware.acceleration.prefer_gpu;
             }
             SettingType::GpuLayers => {
                 if is_left {
-                    self.config.hardware.acceleration.gpu_layers = self.config.hardware.acceleration.gpu_layers.saturating_sub(10);
+                    self.config.hardware.acceleration.gpu_layers = self
+                        .config
+                        .hardware
+                        .acceleration
+                        .gpu_layers
+                        .saturating_sub(10);
                 } else if is_right {
-                    self.config.hardware.acceleration.gpu_layers = (self.config.hardware.acceleration.gpu_layers + 10).min(99);
+                    self.config.hardware.acceleration.gpu_layers =
+                        (self.config.hardware.acceleration.gpu_layers + 10).min(99);
                 }
             }
             SettingType::CpuThreads => {
                 if is_left {
-                    self.config.hardware.acceleration.cpu_threads = self.config.hardware.acceleration.cpu_threads.saturating_sub(1).max(1);
+                    self.config.hardware.acceleration.cpu_threads = self
+                        .config
+                        .hardware
+                        .acceleration
+                        .cpu_threads
+                        .saturating_sub(1)
+                        .max(1);
                 } else if is_right {
-                    self.config.hardware.acceleration.cpu_threads = (self.config.hardware.acceleration.cpu_threads + 1).min(16);
+                    self.config.hardware.acceleration.cpu_threads =
+                        (self.config.hardware.acceleration.cpu_threads + 1).min(16);
                 }
             }
             SettingType::MaxRamPercent => {
                 if is_left {
-                    self.config.hardware.safety.max_ram_usage_percent = self.config.hardware.safety.max_ram_usage_percent.saturating_sub(5).max(50);
+                    self.config.hardware.safety.max_ram_usage_percent = self
+                        .config
+                        .hardware
+                        .safety
+                        .max_ram_usage_percent
+                        .saturating_sub(5)
+                        .max(50);
                 } else if is_right {
-                    self.config.hardware.safety.max_ram_usage_percent = (self.config.hardware.safety.max_ram_usage_percent + 5).min(90);
+                    self.config.hardware.safety.max_ram_usage_percent =
+                        (self.config.hardware.safety.max_ram_usage_percent + 5).min(90);
                 }
             }
             SettingType::Mmap => {
@@ -398,9 +431,11 @@ impl SettingsView {
             }
             SettingType::ControlPort => {
                 if is_left {
-                    self.config.network.control_port = self.config.network.control_port.saturating_sub(1);
+                    self.config.network.control_port =
+                        self.config.network.control_port.saturating_sub(1);
                 } else if is_right {
-                    self.config.network.control_port = self.config.network.control_port.saturating_add(1);
+                    self.config.network.control_port =
+                        self.config.network.control_port.saturating_add(1);
                 }
             }
             SettingType::PreferAdbTunnel => {
@@ -411,9 +446,15 @@ impl SettingsView {
             }
             SettingType::MaxRpcRamMb => {
                 if is_left {
-                    self.config.cluster.max_rpc_ram_mb = self.config.cluster.max_rpc_ram_mb.saturating_sub(100).max(500);
+                    self.config.cluster.max_rpc_ram_mb = self
+                        .config
+                        .cluster
+                        .max_rpc_ram_mb
+                        .saturating_sub(100)
+                        .max(500);
                 } else if is_right {
-                    self.config.cluster.max_rpc_ram_mb = (self.config.cluster.max_rpc_ram_mb + 100).min(1800);
+                    self.config.cluster.max_rpc_ram_mb =
+                        (self.config.cluster.max_rpc_ram_mb + 100).min(1800);
                 }
             }
             SettingType::AutoOffload => {
@@ -453,7 +494,7 @@ impl SettingsView {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(16),  // Setting list
+                Constraint::Min(16),   // Setting list
                 Constraint::Length(4), // Description & Status footer
             ])
             .split(area);
@@ -464,9 +505,12 @@ impl SettingsView {
         for (i, item) in SETTING_ITEMS.iter().enumerate() {
             if item.category != current_cat {
                 current_cat = item.category;
-                lines.push(Line::from(vec![
-                    Span::styled(format!("\n [ {} ]", current_cat), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    format!("\n [ {} ]", current_cat),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]));
             }
 
             let is_selected = i == self.selected_index;
@@ -476,11 +520,26 @@ impl SettingsView {
                 match item.setting_type {
                     SettingType::NodeName => format!("[ {} ]", self.config.node.name),
                     SettingType::NodeRole => format!("[ {} ]", self.config.node.role),
-                    SettingType::ModelsDir => format!("[ {} ]", self.config.node.models_dir.display()),
-                    SettingType::PresetsDir => format!("[ {} ]", self.config.node.presets_dir.display()),
-                    SettingType::LlamaServerBinary => format!("[ {} ]", self.config.node.llama_server_binary),
-                    SettingType::RpcServerBinary => format!("[ {} ]", self.config.node.rpc_server_binary),
-                    SettingType::DefaultHost => format!("[ {} ]", self.config.network.default_host.as_deref().unwrap_or("none")),
+                    SettingType::ModelsDir => {
+                        format!("[ {} ]", self.config.node.models_dir.display())
+                    }
+                    SettingType::PresetsDir => {
+                        format!("[ {} ]", self.config.node.presets_dir.display())
+                    }
+                    SettingType::LlamaServerBinary => {
+                        format!("[ {} ]", self.config.node.llama_server_binary)
+                    }
+                    SettingType::RpcServerBinary => {
+                        format!("[ {} ]", self.config.node.rpc_server_binary)
+                    }
+                    SettingType::DefaultHost => format!(
+                        "[ {} ]",
+                        self.config
+                            .network
+                            .default_host
+                            .as_deref()
+                            .unwrap_or("none")
+                    ),
                     SettingType::StaticPeers => {
                         if self.config.network.static_peers.is_empty() {
                             "[ none ]".to_string()
@@ -488,34 +547,94 @@ impl SettingsView {
                             format!("[ {} ]", self.config.network.static_peers.join(", "))
                         }
                     }
-                    SettingType::EnableMdns => format!("[ {} ]", if self.config.network.discovery.mdns.enabled { "ON" } else { "OFF" }),
-                    SettingType::DiscoveryPort => format!("[ {} ]", self.config.network.discovery_port),
-                    SettingType::PreferGpu => format!("[ {} ]", if self.config.hardware.acceleration.prefer_gpu { "ON" } else { "OFF" }),
-                    SettingType::GpuLayers => format!("[ {} layers ]", self.config.hardware.acceleration.gpu_layers),
-                    SettingType::CpuThreads => format!("[ {} threads ]", self.config.hardware.acceleration.cpu_threads),
-                    SettingType::MaxRamPercent => format!("[ {}% ]", self.config.hardware.safety.max_ram_usage_percent),
-                    SettingType::Mmap => format!("[ {} ]", if self.config.hardware.safety.mmap { "ON" } else { "OFF" }),
+                    SettingType::EnableMdns => format!(
+                        "[ {} ]",
+                        if self.config.network.discovery.mdns.enabled {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    SettingType::DiscoveryPort => {
+                        format!("[ {} ]", self.config.network.discovery_port)
+                    }
+                    SettingType::PreferGpu => format!(
+                        "[ {} ]",
+                        if self.config.hardware.acceleration.prefer_gpu {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    SettingType::GpuLayers => format!(
+                        "[ {} layers ]",
+                        self.config.hardware.acceleration.gpu_layers
+                    ),
+                    SettingType::CpuThreads => format!(
+                        "[ {} threads ]",
+                        self.config.hardware.acceleration.cpu_threads
+                    ),
+                    SettingType::MaxRamPercent => {
+                        format!("[ {}% ]", self.config.hardware.safety.max_ram_usage_percent)
+                    }
+                    SettingType::Mmap => format!(
+                        "[ {} ]",
+                        if self.config.hardware.safety.mmap {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
                     SettingType::ApiPort => format!("[ {} ]", self.config.network.api_port),
                     SettingType::ControlPort => format!("[ {} ]", self.config.network.control_port),
-                    SettingType::PreferAdbTunnel => format!("[ {} ]", if self.config.cluster.prefer_adb_tunnel { "ON" } else { "OFF" }),
-                    SettingType::EnableRpc => format!("[ {} ]", if self.config.cluster.enable_rpc { "ON" } else { "OFF" }),
-                    SettingType::MaxRpcRamMb => format!("[ {} MB ]", self.config.cluster.max_rpc_ram_mb),
-                    SettingType::AutoOffload => format!("[ {} ]", if self.config.cluster.auto_offload { "ON" } else { "OFF" }),
+                    SettingType::PreferAdbTunnel => format!(
+                        "[ {} ]",
+                        if self.config.cluster.prefer_adb_tunnel {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    SettingType::EnableRpc => format!(
+                        "[ {} ]",
+                        if self.config.cluster.enable_rpc {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                    SettingType::MaxRpcRamMb => {
+                        format!("[ {} MB ]", self.config.cluster.max_rpc_ram_mb)
+                    }
+                    SettingType::AutoOffload => format!(
+                        "[ {} ]",
+                        if self.config.cluster.auto_offload {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
                 }
             };
 
             let prefix = if is_selected { " > " } else { "   " };
             let style = if is_selected {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
 
             let val_style = if is_selected {
                 if self.editing_text {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 }
             } else {
                 Style::default().fg(Color::Green)
@@ -539,13 +658,25 @@ impl SettingsView {
         // Description & Actions block
         let cur_item = &SETTING_ITEMS[self.selected_index];
         let status_span = if let Some((msg, color)) = &self.status_message {
-            Span::styled(format!(" Status: {}", msg), Style::default().fg(*color).add_modifier(Modifier::BOLD))
+            Span::styled(
+                format!(" Status: {}", msg),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            )
         } else if self.editing_text {
-            Span::styled(" [Enter] Commit | [Esc] Cancel | [Backspace] Delete", Style::default().fg(Color::Yellow))
+            Span::styled(
+                " [Enter] Commit | [Esc] Cancel | [Backspace] Delete",
+                Style::default().fg(Color::Yellow),
+            )
         } else if self.is_current_text() {
-            Span::styled(" [Enter] Edit Text | [S] Save | [R] Reload", Style::default().fg(Color::DarkGray))
+            Span::styled(
+                " [Enter] Edit Text | [S] Save | [R] Reload",
+                Style::default().fg(Color::DarkGray),
+            )
         } else {
-            Span::styled(" [Space/Enter] Toggle | [Left/Right] Adjust/Cycle | [S] Save", Style::default().fg(Color::DarkGray))
+            Span::styled(
+                " [Space/Enter] Toggle | [Left/Right] Adjust/Cycle | [S] Save",
+                Style::default().fg(Color::DarkGray),
+            )
         };
 
         let footer_lines = vec![

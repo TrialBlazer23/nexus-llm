@@ -2,9 +2,8 @@
 
 use nexus::config::{NexusConfig, SecurityConfig};
 use nexus::control_plane::{
-    build_control_plane_state, dispatch_load_model, dispatch_load_model_signed,
-    ModelLoadRequest, PairRequest,
-    CONTROL_PLANE_VERSION,
+    build_control_plane_state, dispatch_load_model, dispatch_load_model_signed, ModelLoadRequest,
+    PairRequest, CONTROL_PLANE_VERSION,
 };
 use nexus::control_plane_server::{spawn_ephemeral, ControlPlaneContext};
 use nexus::discovery::{DiscoveryService, NodeRole, PeerNode, StatusFlags};
@@ -12,8 +11,9 @@ use nexus::node_identity::{NodeIdentity, PAIRING_CODE_WINDOW_SECS};
 use nexus::supervisor::SupervisorManager;
 use nexus::sysinfo::AccelerationBackend;
 use nexus::trust_auth::{
-    authorize_privileged_signer, canonical_signing_message, pairing_enforced, verify_control_request,
-    AuthError, NonceCache, TrustBootstrap, HDR_NONCE, HDR_SIGNATURE, HDR_SIGNER, HDR_TIMESTAMP,
+    authorize_privileged_signer, canonical_signing_message, pairing_enforced,
+    verify_control_request, AuthError, NonceCache, TrustBootstrap, HDR_NONCE, HDR_SIGNATURE,
+    HDR_SIGNER, HDR_TIMESTAMP,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,10 +22,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
 
-fn test_ctx(
-    trust: &TrustBootstrap,
-    node_id: Uuid,
-) -> Arc<ControlPlaneContext> {
+fn test_ctx(trust: &TrustBootstrap, node_id: Uuid) -> Arc<ControlPlaneContext> {
     Arc::new(
         ControlPlaneContext::new(
             node_id,
@@ -47,7 +44,14 @@ fn canonical_signature_round_trip() {
     let id = NodeIdentity::generate();
     let signer = Uuid::new_v4();
     let body = br#"{"hello":"world"}"#;
-    let msg = canonical_signing_message("POST", "/nexus/control/v1/state", body, 1_700_000_000, "abcd1234abcd1234", signer);
+    let msg = canonical_signing_message(
+        "POST",
+        "/nexus/control/v1/state",
+        body,
+        1_700_000_000,
+        "abcd1234abcd1234",
+        signer,
+    );
     let sig = id.sign(msg.as_bytes());
     assert!(nexus::node_identity::verify_signature(
         &id.public_key_bytes(),
@@ -214,9 +218,10 @@ async fn pairing_grants_remote_load() {
         pairing_code: code,
     };
     let client = reqwest::Client::new();
-    let pair_resp = nexus::control_plane::dispatch_pair(&client, &base, &pair_req, &client_trust.identity)
-        .await
-        .expect("pair");
+    let pair_resp =
+        nexus::control_plane::dispatch_pair(&client, &base, &pair_req, &client_trust.identity)
+            .await
+            .expect("pair");
     assert!(pair_resp.success);
 
     let load_req = ModelLoadRequest {
@@ -242,10 +247,14 @@ async fn forged_beacon_does_not_enable_trusted_connect() {
     config.network.security.require_pairing = true;
     let legit_id = Uuid::new_v4();
     config.network.security.allowed_peer_ids = vec![legit_id];
-    config.network.security.paired_peers.push(nexus::config::PairedPeer {
-        node_id: legit_id,
-        public_key_hex: NodeIdentity::generate().public_key_hex(),
-    });
+    config
+        .network
+        .security
+        .paired_peers
+        .push(nexus::config::PairedPeer {
+            node_id: legit_id,
+            public_key_hex: NodeIdentity::generate().public_key_hex(),
+        });
     let discovery = DiscoveryService::new(config, Some(Uuid::new_v4()));
     let attacker_ip = "192.168.1.66".parse().unwrap();
     discovery.peers().write().await.insert(
@@ -268,18 +277,18 @@ async fn forged_beacon_does_not_enable_trusted_connect() {
         },
     );
     assert!(
-        !discovery
-            .is_peer_trusted_for_routing(legit_id)
-            .await,
+        !discovery.is_peer_trusted_for_routing(legit_id).await,
         "beacon-only peer must not be trusted without registry verification"
     );
 }
 
 #[test]
 fn authorize_privileged_requires_allowlist_when_enforced() {
-    let mut security = SecurityConfig::default();
-    security.require_pairing = true;
-    security.allowed_peer_ids = vec![Uuid::new_v4()];
+    let security = SecurityConfig {
+        require_pairing: true,
+        allowed_peer_ids: vec![Uuid::new_v4()],
+        ..Default::default()
+    };
     assert!(pairing_enforced(&security));
     assert!(authorize_privileged_signer(&security, Uuid::new_v4()).is_err());
 }

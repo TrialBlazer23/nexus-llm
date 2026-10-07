@@ -1,8 +1,9 @@
-use nexus::client::{ChatCompletionChunk, ChatMessage, ChatCompletionRequest};
+use nexus::client::{ChatCompletionChunk, ChatCompletionRequest, ChatMessage};
 use nexus::config::NexusConfig;
 use nexus::discovery::{
     BackendHealth, BeaconPacket, DiscoveryError, DiscoveryService, NodeRole, PeerNode,
-    ServiceEndpoint, StatusFlags, BEACON_MAGIC, BEACON_PACKET_SIZE, BEACON_VERSION,
+    RpcSelectionPolicy, ServiceEndpoint, StatusFlags, BEACON_MAGIC, BEACON_PACKET_SIZE,
+    BEACON_VERSION,
 };
 use nexus::peer_registry::ObservationSource;
 use nexus::sysinfo::AccelerationBackend;
@@ -33,7 +34,11 @@ fn test_beacon_packet_encoding_and_crc() {
     };
 
     let encoded = packet.encode();
-    assert_eq!(encoded.len(), BEACON_PACKET_SIZE, "Beacon must be exactly 64 bytes");
+    assert_eq!(
+        encoded.len(),
+        BEACON_PACKET_SIZE,
+        "Beacon must be exactly 64 bytes"
+    );
 
     // Verify magic signature bytes ("NXUS" = 0x4E, 0x58, 0x55, 0x53)
     assert_eq!(&encoded[0..4], &[0x4E, 0x58, 0x55, 0x53]);
@@ -125,7 +130,10 @@ fn test_beacon_corruption_rejection() {
     // 3. Packet size rejection
     let short_buf = [0u8; 32];
     match BeaconPacket::decode(&short_buf) {
-        Err(DiscoveryError::PacketSizeMismatch { expected: 64, actual: 32 }) => (),
+        Err(DiscoveryError::PacketSizeMismatch {
+            expected: 64,
+            actual: 32,
+        }) => (),
         other => panic!("Expected PacketSizeMismatch, got {:?}", other),
     }
 }
@@ -176,7 +184,7 @@ async fn test_peer_cache_expiry_and_pruning() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
-        control_port: 9998,
+                control_port: 9998,
                 rpc_port: 0,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
@@ -199,7 +207,11 @@ async fn test_peer_cache_expiry_and_pruning() {
 
     // Must be pruned after timeout
     let active_after = discovery.get_active_peers().await;
-    assert_eq!(active_after.len(), 0, "Stale peer must be pruned from active peers");
+    assert_eq!(
+        active_after.len(),
+        0,
+        "Stale peer must be pruned from active peers"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +236,7 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags::READY,
                 api_port: 8080,
-        control_port: 9998,
+                control_port: 9998,
                 rpc_port: 0,
                 total_ram_mb: 4000,
                 free_ram_mb: 2000,
@@ -245,7 +257,7 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::HOST,
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::VULKAN_ACTIVE.0),
                 api_port: 8080,
-        control_port: 9998,
+                control_port: 9998,
                 rpc_port: 0,
                 total_ram_mb: 12000,
                 free_ram_mb: 6000,
@@ -266,7 +278,7 @@ async fn test_find_best_host_scoring() {
                 role: NodeRole::CLIENT,
                 status: StatusFlags(StatusFlags::READY.0 | StatusFlags::RPC_READY.0),
                 api_port: 8080,
-        control_port: 9998,
+                control_port: 9998,
                 rpc_port: 50052,
                 total_ram_mb: 3600,
                 free_ram_mb: 1800,
@@ -280,13 +292,22 @@ async fn test_find_best_host_scoring() {
     }
 
     let best = discovery.find_best_host().await.expect("Must find a host");
-    assert_eq!(best.uuid, host2_uuid, "Host 2 (Vulkan, more RAM, cooler) must score higher");
+    assert_eq!(
+        best.uuid, host2_uuid,
+        "Host 2 (Vulkan, more RAM, cooler) must score higher"
+    );
     assert_eq!(best.api_endpoint(), "http://192.168.1.102:8080");
 
-    let rpc_peer = discovery.find_best_rpc_peer().await.expect("Must find RPC peer");
-    assert_eq!(rpc_peer.uuid, rpc_worker_uuid);
-    assert_eq!(rpc_peer.rpc_endpoint(), "192.168.1.103:50052");
-    assert!(rpc_peer.is_rpc_ready());
+    let rpc = discovery
+        .select_rpc_candidate(RpcSelectionPolicy {
+            max_allocatable_mb: u64::MAX,
+            ..RpcSelectionPolicy::default()
+        })
+        .await
+        .expect("Must find RPC peer");
+    assert_eq!(rpc.peer.uuid, rpc_worker_uuid);
+    assert_eq!(rpc.peer.rpc_endpoint(), "192.168.1.103:50052");
+    assert!(rpc.peer.is_rpc_ready());
 }
 
 #[test]
@@ -305,9 +326,13 @@ fn test_sse_chunk_deserialization() {
         ]
     }"#;
 
-    let chunk: ChatCompletionChunk = serde_json::from_str(sample_chunk).expect("Failed to deserialize chunk");
+    let chunk: ChatCompletionChunk =
+        serde_json::from_str(sample_chunk).expect("Failed to deserialize chunk");
     assert_eq!(chunk.choices.len(), 1);
-    assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello world!"));
+    assert_eq!(
+        chunk.choices[0].delta.content.as_deref(),
+        Some("Hello world!")
+    );
 }
 
 #[test]
@@ -341,15 +366,21 @@ fn test_get_broadcast_addresses_and_targets() {
     println!("Broadcast targets: {:?}", targets);
 
     // Must include 255.255.255.255
-    let limited_bcast: SocketAddr = format!("255.255.255.255:{}", config.network.discovery_port).parse().unwrap();
+    let limited_bcast: SocketAddr = format!("255.255.255.255:{}", config.network.discovery_port)
+        .parse()
+        .unwrap();
     assert!(targets.contains(&limited_bcast));
 
     // Must include 127.0.0.1
-    let loopback: SocketAddr = format!("127.0.0.1:{}", config.network.discovery_port).parse().unwrap();
+    let loopback: SocketAddr = format!("127.0.0.1:{}", config.network.discovery_port)
+        .parse()
+        .unwrap();
     assert!(targets.contains(&loopback));
 
     // Must include static peer
-    let static_peer: SocketAddr = format!("10.0.0.99:{}", config.network.discovery_port).parse().unwrap();
+    let static_peer: SocketAddr = format!("10.0.0.99:{}", config.network.discovery_port)
+        .parse()
+        .unwrap();
     assert!(targets.contains(&static_peer));
 
     // Must include detected interface broadcast addresses
@@ -490,11 +521,90 @@ async fn test_backend_health_tracking() {
     let discovery = DiscoveryService::new(config, None);
 
     assert_eq!(*discovery.udp_health().read().await, BackendHealth::Started);
-    assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Started);
+    assert_eq!(
+        *discovery.mdns_health().read().await,
+        BackendHealth::Started
+    );
 
     discovery.set_udp_health(BackendHealth::Healthy).await;
     assert_eq!(*discovery.udp_health().read().await, BackendHealth::Healthy);
 
     discovery.set_mdns_health(BackendHealth::Healthy).await;
-    assert_eq!(*discovery.mdns_health().read().await, BackendHealth::Healthy);
+    assert_eq!(
+        *discovery.mdns_health().read().await,
+        BackendHealth::Healthy
+    );
+}
+
+/// Adversarial / truncated / random 64-byte buffers must never panic.
+#[test]
+fn test_beacon_decode_never_panics_on_random_bytes() {
+    use proptest::prelude::*;
+
+    proptest!(|(bytes in prop::collection::vec(any::<u8>(), 0..128))| {
+        let _ = BeaconPacket::decode(&bytes);
+    });
+}
+
+#[test]
+fn test_beacon_decode_fixed_size_random_never_panics() {
+    use proptest::prelude::*;
+
+    proptest!(|(bytes in prop::array::uniform32(any::<u8>()), extra in prop::array::uniform32(any::<u8>()))| {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&bytes);
+        buf[32..].copy_from_slice(&extra);
+        let _ = BeaconPacket::decode(&buf);
+    });
+}
+
+#[test]
+fn test_beacon_roundtrip_property() {
+    use proptest::prelude::*;
+
+    proptest!(|(
+        role in 0u8..=7u8,
+        status in any::<u16>(),
+        api_port in any::<u16>(),
+        rpc_port in any::<u16>(),
+        total_ram_mb in any::<u32>(),
+        free_ram_mb in any::<u32>(),
+        thermal_index in any::<u8>(),
+        model in "[a-zA-Z0-9._-]{0,40}",
+    )| {
+        let packet = BeaconPacket {
+            magic: BEACON_MAGIC,
+            version: BEACON_VERSION,
+            role: NodeRole(role),
+            status: StatusFlags(status),
+            uuid: Uuid::nil(),
+            api_port,
+            rpc_port,
+            total_ram_mb,
+            free_ram_mb,
+            backend: AccelerationBackend::GenericCpu,
+            thermal_index,
+            active_model: model,
+        };
+        let encoded = packet.encode();
+        let decoded = BeaconPacket::decode(&encoded).expect("valid encode must decode");
+        assert_eq!(decoded.magic, packet.magic);
+        assert_eq!(decoded.version, packet.version);
+        assert_eq!(decoded.role, packet.role);
+        assert_eq!(decoded.status, packet.status);
+        assert_eq!(decoded.api_port, packet.api_port);
+        assert_eq!(decoded.rpc_port, packet.rpc_port);
+        assert_eq!(decoded.total_ram_mb, packet.total_ram_mb);
+        assert_eq!(decoded.free_ram_mb, packet.free_ram_mb);
+        assert_eq!(decoded.thermal_index, packet.thermal_index);
+        // Model field is 24-byte null-padded ASCII on the wire.
+        let expected_model = {
+            let bytes = packet.active_model.as_bytes();
+            let copy_len = bytes.len().min(24);
+            String::from_utf8_lossy(&bytes[..copy_len])
+                .trim_end_matches('\0')
+                .to_string()
+        };
+        assert_eq!(decoded.active_model, expected_model);
+    });
 }

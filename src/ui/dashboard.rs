@@ -24,6 +24,7 @@ pub struct DashboardApp {
     pub thermal_index: u8,
     pub peers: Vec<PeerNode>,
     pub transport_info: String,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl DashboardApp {
@@ -38,6 +39,7 @@ impl DashboardApp {
             thermal_index,
             peers: Vec::new(),
             transport_info,
+            layout_mode: crate::ui::layout::LayoutMode::Auto,
         }
     }
 
@@ -65,6 +67,7 @@ impl DashboardApp {
     }
 
     pub fn render_in_area(&self, frame: &mut Frame, area: Rect) {
+        let is_compact = self.layout_mode.is_compact(area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -77,7 +80,7 @@ impl DashboardApp {
             .split(area);
 
         self.render_header(frame, chunks[0]);
-        self.render_local_telemetry(frame, chunks[1]);
+        self.render_local_telemetry(frame, chunks[1], is_compact);
         self.render_peers_table(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
     }
@@ -105,11 +108,18 @@ impl DashboardApp {
         frame.render_widget(header, area);
     }
 
-    fn render_local_telemetry(&self, frame: &mut Frame, area: Rect) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
+    fn render_local_telemetry(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
+        let panes = if is_compact {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(4)])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area)
+        };
 
         // Column 1: RAM & LMK Memory Guard Gauge
         let total_ram = self.local_profile.total_ram_mb;
@@ -124,15 +134,17 @@ impl DashboardApp {
         let ram_percent = (ram_ratio * 100.0).clamp(0.0, 100.0) as u16;
         let lmk_cap = self.local_profile.max_allowed_memory_bytes() / (1024 * 1024);
 
-        let mem_gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .title(format!(
-                        " Memory Utilization (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ",
-                        used_ram, total_ram, lmk_cap
-                    ))
-                    .borders(Borders::ALL),
+        let mem_title = if is_compact {
+            format!(" RAM: {}/{} MB (Cap: {} MB) ", used_ram, total_ram, lmk_cap)
+        } else {
+            format!(
+                " Memory Utilization (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ",
+                used_ram, total_ram, lmk_cap
             )
+        };
+
+        let mem_gauge = Gauge::default()
+            .block(Block::default().title(mem_title).borders(Borders::ALL))
             .gauge_style(if ram_percent > 85 {
                 Style::default().fg(Color::Red)
             } else if ram_percent > 70 {
@@ -142,7 +154,7 @@ impl DashboardApp {
             })
             .percent(ram_percent);
 
-        frame.render_widget(mem_gauge, cols[0]);
+        frame.render_widget(mem_gauge, panes[0]);
 
         // Column 2: Acceleration Tier & Thermal Meter
         let backend_name = match self.local_profile.detected_backend {
@@ -219,7 +231,7 @@ impl DashboardApp {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
-        frame.render_widget(right_block, cols[1]);
+        frame.render_widget(right_block, panes[1]);
     }
 
     fn render_peers_table(&self, frame: &mut Frame, area: Rect) {

@@ -39,13 +39,7 @@ impl KnowledgeRetriever {
 
         let query_emb = self.embedder.embed(query).await.ok();
 
-        let results = rank_chunks(
-            query_emb.as_deref(),
-            query,
-            &chunks,
-            limit,
-            min_score,
-        );
+        let results = rank_chunks(query_emb.as_deref(), query, &chunks, limit, min_score);
 
         Ok(results)
     }
@@ -77,14 +71,15 @@ impl KnowledgeRetriever {
             };
 
             if score >= min_score {
-                results.push(SearchResult {
-                    item: mem,
-                    score,
-                });
+                results.push(SearchResult { item: mem, score });
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if results.len() > limit {
             results.truncate(limit);
         }
@@ -114,7 +109,9 @@ impl KnowledgeRetriever {
                 let doc_name = res.item.title.as_deref().unwrap_or(&res.item.document_id);
                 out.push_str(&format!(
                     "- **[{}]** (relevance: {:.2})\n  {}\n",
-                    doc_name, res.score, res.item.content.trim()
+                    doc_name,
+                    res.score,
+                    res.item.content.trim()
                 ));
             }
         }

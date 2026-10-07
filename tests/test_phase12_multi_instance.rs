@@ -154,12 +154,7 @@ async fn supervisor_cumulative_memory_guard_trips() {
         .unwrap();
 
     let current_binary = std::env::current_exe().unwrap();
-    let mut cfg = LlamaServerConfig::new(
-        current_binary,
-        &fake_model,
-        "127.0.0.1",
-        8080,
-    );
+    let mut cfg = LlamaServerConfig::new(current_binary, &fake_model, "127.0.0.1", 8080);
     // Setting budget percent to 0 forces memory cap error
     cfg.memory_budget_percent = 0;
 

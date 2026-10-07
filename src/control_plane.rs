@@ -568,7 +568,6 @@ pub struct KbManifestResponse {
     pub manifest: crate::kb::sync::KbSyncManifest,
 }
 
-
 pub async fn dispatch_load_model(
     client: &reqwest::Client,
     base_url: &str,
@@ -704,8 +703,8 @@ pub async fn dispatch_agent_message_signed(
     msg: &AgentTaskMessage,
     identity: &NodeIdentity,
 ) -> Result<AgentTaskResponse, ControlPlaneError> {
-    let body = serde_json::to_vec(msg)
-        .map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
+    let body =
+        serde_json::to_vec(msg).map_err(|e| ControlPlaneError::InvalidResponse(e.to_string()))?;
     let response = signed_post_bytes(
         client,
         base_url,
@@ -985,7 +984,6 @@ pub async fn dispatch_kb_push_signed(
         .map_err(|error| ControlPlaneError::InvalidResponse(error.to_string()))
 }
 
-
 pub async fn handle_load_model(
     manager: &crate::supervisor::SupervisorManager,
     request: &ModelLoadRequest,
@@ -1131,8 +1129,12 @@ pub async fn handle_agent_message(
     let target_slot = slots
         .iter()
         .find(|s| {
-            s.tags.iter().any(|t| t.eq_ignore_ascii_case(&request.to_route))
-                || s.model_name.to_lowercase().contains(&request.to_route.to_lowercase())
+            s.tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&request.to_route))
+                || s.model_name
+                    .to_lowercase()
+                    .contains(&request.to_route.to_lowercase())
         })
         .or_else(|| slots.first());
 
@@ -1419,6 +1421,3 @@ pub async fn handle_kb_push(
         }
     })
 }
-
-
-

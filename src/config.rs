@@ -35,6 +35,9 @@ pub struct NexusConfig {
 
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 impl NexusConfig {
@@ -575,7 +578,26 @@ impl Default for ClusterConfig {
     }
 }
 
+/// UI and terminal display preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiConfig {
+    #[serde(default = "default_layout_mode")]
+    pub layout_mode: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            layout_mode: default_layout_mode(),
+        }
+    }
+}
+
 // Default helper functions
+fn default_layout_mode() -> String {
+    "auto".to_string()
+}
+
 fn default_auto() -> String {
     "auto".to_string()
 }

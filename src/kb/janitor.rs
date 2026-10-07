@@ -193,7 +193,9 @@ impl JanitorAgent {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(record) = serde_json::from_str::<crate::ui::session_logger::ChatTurnRecord>(&line) {
+            if let Ok(record) =
+                serde_json::from_str::<crate::ui::session_logger::ChatTurnRecord>(&line)
+            {
                 turns.push(ChatMessage {
                     role: record.role,
                     content: record.content,
@@ -250,7 +252,10 @@ fn extract_fact(text: &str) -> Option<(String, String)> {
     for kw in &keywords {
         if let Some(pos) = lower.find(kw) {
             let start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let end = text[pos..].find('\n').map(|p| pos + p).unwrap_or(text.len());
+            let end = text[pos..]
+                .find('\n')
+                .map(|p| pos + p)
+                .unwrap_or(text.len());
             let fact = text[start..end].trim();
             if !fact.is_empty() {
                 let title = "Fact: Cluster Environment".to_string();

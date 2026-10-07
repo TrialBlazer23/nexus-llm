@@ -61,7 +61,13 @@ fn test_kb_manifest_generation_and_diff() {
         .unwrap();
 
     let _persona_a = store_a
-        .store_persona("coder", "Code Specialist", "You write Rust.", vec!["rust".into()], None)
+        .store_persona(
+            "coder",
+            "Code Specialist",
+            "You write Rust.",
+            vec!["rust".into()],
+            None,
+        )
         .unwrap();
 
     let mem_a = store_a
@@ -155,16 +161,34 @@ fn test_kb_sync_conflict_resolution() {
 
     // Persona conflict resolution: v1 vs v2
     let p_v1 = store_a
-        .store_persona("assistant", "Assistant v1", "System prompt v1", vec![], None)
+        .store_persona(
+            "assistant",
+            "Assistant v1",
+            "System prompt v1",
+            vec![],
+            None,
+        )
         .unwrap();
     assert_eq!(p_v1.version, 1);
 
     // On store B, store twice so version is 2
     let _ = store_b
-        .store_persona("assistant", "Assistant v1", "System prompt v1", vec![], None)
+        .store_persona(
+            "assistant",
+            "Assistant v1",
+            "System prompt v1",
+            vec![],
+            None,
+        )
         .unwrap();
     let p_v2 = store_b
-        .store_persona("assistant", "Assistant v2", "System prompt v2", vec![], None)
+        .store_persona(
+            "assistant",
+            "Assistant v2",
+            "System prompt v2",
+            vec![],
+            None,
+        )
         .unwrap();
     assert_eq!(p_v2.version, 2);
 
@@ -254,10 +278,13 @@ async fn test_control_plane_kb_sync_endpoints() {
     let client_identity = client_trust.identity.clone();
     let client_id = client_trust.config.read().unwrap().node_uuid().unwrap();
 
-    trust.config.write().unwrap().network.security.record_pair(
-        client_id,
-        client_identity.public_key_hex(),
-    );
+    trust
+        .config
+        .write()
+        .unwrap()
+        .network
+        .security
+        .record_pair(client_id, client_identity.public_key_hex());
 
     let server_kb_path = trust_dir.path().join("server_knowledge.redb");
     let server_kb_store = Arc::new(KnowledgeStore::open(&server_kb_path).unwrap());
@@ -383,7 +410,9 @@ async fn test_janitor_agent_distillation() {
         },
     ];
 
-    let distilled = janitor.distill_dialogue(&dialogue, Some("session_alice")).unwrap();
+    let distilled = janitor
+        .distill_dialogue(&dialogue, Some("session_alice"))
+        .unwrap();
     assert!(!distilled.is_empty());
 
     // Verify preference extracted
@@ -420,13 +449,18 @@ async fn test_janitor_agent_distillation() {
         to_route: "coder".to_string(),
         prompt: "Refactor async network handler".to_string(),
         status: TaskStatus::Completed,
-        output: Some("Successfully refactored network handler using tokio select loop.".to_string()),
+        output: Some(
+            "Successfully refactored network handler using tokio select loop.".to_string(),
+        ),
         error: None,
         created_at: 100,
         updated_at: 120,
     };
 
-    let task_mem = janitor.distill_task(&task).unwrap().expect("task distilled");
+    let task_mem = janitor
+        .distill_task(&task)
+        .unwrap()
+        .expect("task distilled");
     assert_eq!(task_mem.kind, EpisodicKind::Summary);
     assert!(task_mem.title.contains("Route coder"));
     assert!(task_mem.summary.contains("Prompt:"));
@@ -440,28 +474,38 @@ async fn test_janitor_agent_distillation() {
         .unwrap();
 
     assert!(!search_results.is_empty());
-    assert!(search_results[0].item.summary.to_lowercase().contains("rust"));
+    assert!(search_results[0]
+        .item
+        .summary
+        .to_lowercase()
+        .contains("rust"));
 }
 
 #[test]
 fn test_agents_view_and_tunnel_view_render() {
     let temp_dir = TempDir::new().unwrap();
-    let task_store = Arc::new(
-        TaskStore::load_or_create(temp_dir.path().join("tasks.json")).unwrap(),
-    );
-    let kb_store = Arc::new(
-        KnowledgeStore::open(temp_dir.path().join("knowledge.redb")).unwrap(),
-    );
+    let task_store =
+        Arc::new(TaskStore::load_or_create(temp_dir.path().join("tasks.json")).unwrap());
+    let kb_store = Arc::new(KnowledgeStore::open(temp_dir.path().join("knowledge.redb")).unwrap());
 
     // Seed tasks
     let t1 = task_store
         .create_task(Uuid::new_v4(), Uuid::new_v4(), "coder", "Write unit test")
         .unwrap();
-    task_store.update_status(t1.task_id, TaskStatus::Completed).unwrap();
-    task_store.complete_task(t1.task_id, "All tests passed").unwrap();
+    task_store
+        .update_status(t1.task_id, TaskStatus::Completed)
+        .unwrap();
+    task_store
+        .complete_task(t1.task_id, "All tests passed")
+        .unwrap();
 
     let _t2 = task_store
-        .create_task(Uuid::new_v4(), Uuid::new_v4(), "general", "Explain gossip sync")
+        .create_task(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "general",
+            "Explain gossip sync",
+        )
         .unwrap();
 
     // Seed memories

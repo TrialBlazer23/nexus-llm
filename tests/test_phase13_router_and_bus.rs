@@ -25,9 +25,24 @@ fn router_tier1_explicit_tags() {
     let node3 = Uuid::new_v4();
 
     let routes = vec![
-        RouteTarget::new(node1, "http://node1:8080", "qwen-coder", vec!["coder".into()]),
-        RouteTarget::new(node2, "http://node2:8080", "llama-3.2-3b", vec!["general".into()]),
-        RouteTarget::new(node3, "http://node3:8080", "llava-1.5", vec!["vision".into()]),
+        RouteTarget::new(
+            node1,
+            "http://node1:8080",
+            "qwen-coder",
+            vec!["coder".into()],
+        ),
+        RouteTarget::new(
+            node2,
+            "http://node2:8080",
+            "llama-3.2-3b",
+            vec!["general".into()],
+        ),
+        RouteTarget::new(
+            node3,
+            "http://node3:8080",
+            "llava-1.5",
+            vec!["vision".into()],
+        ),
     ];
 
     // Explicit @coder tag
@@ -125,11 +140,15 @@ fn router_fallback_to_general() {
 
     // Without an orchestrator client, unclassified prompt falls back to "general"
     let dec = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        router.route("Explain gravity in simple terms", &routes, None).await
+        router
+            .route("Explain gravity in simple terms", &routes, None)
+            .await
     });
 
     match dec {
-        RouteDecision::Fallback { endpoint, model, .. } => {
+        RouteDecision::Fallback {
+            endpoint, model, ..
+        } => {
             assert_eq!(endpoint, "http://node2:8080");
             assert_eq!(model, "llama-3.2-3b");
         }
@@ -151,15 +170,28 @@ fn router_code_level_veto_on_hallucinated_route() {
     let hallucinated_json = "{\"route\": \"hallucinated_agent\", \"reason\": \"fake\"}";
     let parsed_bad: OrchestratorChoice = serde_json::from_str(hallucinated_json).unwrap();
     let available_routes = [
-        RouteTarget::new(Uuid::new_v4(), "http://node1:8080", "coder", vec!["coder".into()]),
-        RouteTarget::new(Uuid::new_v4(), "http://node2:8080", "general", vec!["general".into()]),
+        RouteTarget::new(
+            Uuid::new_v4(),
+            "http://node1:8080",
+            "coder",
+            vec!["coder".into()],
+        ),
+        RouteTarget::new(
+            Uuid::new_v4(),
+            "http://node2:8080",
+            "general",
+            vec!["general".into()],
+        ),
     ];
 
     // Code-level veto check
     let valid_target = available_routes
         .iter()
         .find(|r| r.matches_tag(&parsed_bad.route));
-    assert!(valid_target.is_none(), "Hallucinated route must be vetoed by code whitelist");
+    assert!(
+        valid_target.is_none(),
+        "Hallucinated route must be vetoed by code whitelist"
+    );
 }
 
 #[test]
@@ -369,14 +401,10 @@ async fn agent_bus_signed_round_trip() {
         reply_to: None,
     };
 
-    let unauthorized_err = dispatch_agent_message_signed(
-        &client,
-        &base,
-        &untrusted_msg,
-        &untrusted_identity,
-    )
-    .await
-    .unwrap_err();
+    let unauthorized_err =
+        dispatch_agent_message_signed(&client, &base, &untrusted_msg, &untrusted_identity)
+            .await
+            .unwrap_err();
 
     let err_msg = unauthorized_err.to_string();
     assert!(

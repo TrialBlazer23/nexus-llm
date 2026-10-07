@@ -51,6 +51,7 @@ pub struct ClusterView {
     pub pair_code_input: String,
     pub local_identity: Option<std::sync::Arc<NodeIdentity>>,
     pub link_qualities: HashMap<Uuid, crate::cluster::LinkQuality>,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl ClusterView {
@@ -89,6 +90,7 @@ impl ClusterView {
             pair_code_input: String::new(),
             local_identity: None,
             link_qualities: HashMap::new(),
+            layout_mode: crate::ui::layout::LayoutMode::Auto,
         }
     }
 
@@ -213,20 +215,34 @@ impl ClusterView {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(3), // Header
-                Constraint::Length(9), // Local telemetry
-                Constraint::Min(6),    // Discovered peers table
-                Constraint::Length(2), // Action shortcuts & status
-            ])
-            .split(area);
+        let is_compact = self.layout_mode.is_compact(area);
+        let chunks = if is_compact {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(0)
+                .constraints([
+                    Constraint::Length(3), // Header
+                    Constraint::Length(5), // Local telemetry (compact)
+                    Constraint::Min(6),    // Discovered peers table
+                    Constraint::Length(2), // Action shortcuts & status
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(3), // Header
+                    Constraint::Length(9), // Local telemetry
+                    Constraint::Min(6),    // Discovered peers table
+                    Constraint::Length(2), // Action shortcuts & status
+                ])
+                .split(area)
+        };
 
         self.render_header(frame, chunks[0]);
-        self.render_local_telemetry(frame, chunks[1]);
-        self.render_peers_table(frame, chunks[2]);
+        self.render_local_telemetry(frame, chunks[1], is_compact);
+        self.render_peers_table(frame, chunks[2], is_compact);
         self.render_footer(frame, chunks[3]);
 
         if self.show_info_modal {
@@ -384,13 +400,8 @@ impl ClusterView {
         frame.render_widget(header, area);
     }
 
-    fn render_local_telemetry(&self, frame: &mut Frame, area: Rect) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
-
-        // Column 1: RAM & LMK Memory Guard Gauge
+    fn render_local_telemetry(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
+        // RAM & LMK Memory Guard Gauge
         let total_ram = self.local_profile.total_ram_mb;
         let avail_ram = self.local_profile.available_ram_mb;
         let used_ram = total_ram.saturating_sub(avail_ram);
@@ -403,15 +414,17 @@ impl ClusterView {
         let ram_percent = (ram_ratio * 100.0).clamp(0.0, 100.0) as u16;
         let lmk_cap = self.local_profile.max_allowed_memory_bytes() / (1024 * 1024);
 
-        let mem_gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .title(format!(
-                        " Local RAM (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ",
-                        used_ram, total_ram, lmk_cap
-                    ))
-                    .borders(Borders::ALL),
+        let ram_title = if is_compact {
+            format!(" RAM: {}/{}MB (Cap: {}MB) ", used_ram, total_ram, lmk_cap)
+        } else {
+            format!(
+                " Local RAM (Used: {} MB / Total: {} MB | LMK Cap: {} MB) ",
+                used_ram, total_ram, lmk_cap
             )
+        };
+
+        let mem_gauge = Gauge::default()
+            .block(Block::default().title(ram_title).borders(Borders::ALL))
             .gauge_style(if ram_percent > 85 {
                 Style::default().fg(Color::Red)
             } else if ram_percent > 70 {
@@ -421,9 +434,6 @@ impl ClusterView {
             })
             .percent(ram_percent);
 
-        frame.render_widget(mem_gauge, cols[0]);
-
-        // Column 2: Acceleration Tier & Thermal Meter
         let backend_name = match self.local_profile.detected_backend {
             AccelerationBackend::Vulkan => "Vulkan (Adreno GPU Offload)",
             AccelerationBackend::ArmCpuDotProd => "ARMv8.2-A CPU (DotProd/I8MM)",
@@ -439,76 +449,130 @@ impl ClusterView {
             Style::default().fg(Color::Green)
         };
 
-        let info_lines = vec![
-            Line::from(vec![
+        if is_compact {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Length(2)])
+                .split(area);
+
+            frame.render_widget(mem_gauge, rows[0]);
+
+            let short_backend = match self.local_profile.detected_backend {
+                AccelerationBackend::Vulkan => "Vulkan",
+                AccelerationBackend::ArmCpuDotProd => "ARM CPU",
+                AccelerationBackend::X86Baseline => "x86 Baseline",
+                AccelerationBackend::GenericCpu => "Generic",
+            };
+            let summary_line = Line::from(vec![
                 Span::styled(
-                    " Acceleration Tier: ",
-                    Style::default().fg(Color::LightBlue),
-                ),
-                Span::styled(
-                    backend_name,
+                    " [Engine] ",
                     Style::default()
-                        .fg(Color::White)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]),
-            Line::from(vec![
+                Span::styled(short_backend, Style::default().fg(Color::White)),
+                Span::styled(" | Therm: ", Style::default().fg(Color::LightBlue)),
+                Span::styled(format!("{}/100", self.thermal_index), thermal_style),
                 Span::styled(
-                    " Vulkan Runtime:    ",
-                    Style::default().fg(Color::LightBlue),
+                    format!(" | Th: {}", self.local_profile.recommended_threads),
+                    Style::default().fg(Color::Gray),
                 ),
-                Span::styled(
-                    if SystemProfile::probe_vulkan() {
-                        "Active / Initialized"
-                    } else {
-                        "Not Available"
-                    },
-                    Style::default().fg(Color::LightGreen),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    " Thermal Index:     ",
-                    Style::default().fg(Color::LightBlue),
-                ),
-                Span::styled(
-                    format!("{}/100", self.thermal_index),
-                    thermal_style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  |  Threads: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(
-                    format!("{}", self.local_profile.recommended_threads),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-        ];
+            ]);
+            let block = Paragraph::new(summary_line);
+            frame.render_widget(block, rows[1]);
+        } else {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
 
-        let right_block = Paragraph::new(info_lines).block(
-            Block::default()
-                .title(" Local Compute Engine ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
+            frame.render_widget(mem_gauge, cols[0]);
 
-        frame.render_widget(right_block, cols[1]);
+            let info_lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        " Acceleration Tier: ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
+                    Span::styled(
+                        backend_name,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        " Vulkan Runtime:    ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
+                    Span::styled(
+                        if SystemProfile::probe_vulkan() {
+                            "Active / Initialized"
+                        } else {
+                            "Not Available"
+                        },
+                        Style::default().fg(Color::LightGreen),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        " Thermal Index:     ",
+                        Style::default().fg(Color::LightBlue),
+                    ),
+                    Span::styled(
+                        format!("{}/100", self.thermal_index),
+                        thermal_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  |  Threads: ", Style::default().fg(Color::LightBlue)),
+                    Span::styled(
+                        format!("{}", self.local_profile.recommended_threads),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+            ];
+
+            let right_block = Paragraph::new(info_lines).block(
+                Block::default()
+                    .title(" Local Compute Engine ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+
+            frame.render_widget(right_block, cols[1]);
+        }
     }
 
-    fn render_peers_table(&self, frame: &mut Frame, area: Rect) {
-        let header = Row::new(vec![
-            Cell::from("  Node Name / UUID"),
-            Cell::from("Endpoint"),
-            Cell::from("Role"),
-            Cell::from("Free RAM"),
-            Cell::from("Backend"),
-            Cell::from("Link Quality"),
-            Cell::from("Thermal"),
-            Cell::from("Trust"),
-        ])
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+    fn render_peers_table(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
+        let header = if is_compact {
+            Row::new(vec![
+                Cell::from("  Node / UUID"),
+                Cell::from("Endpoint"),
+                Cell::from("Role"),
+                Cell::from("Free RAM"),
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Row::new(vec![
+                Cell::from("  Node Name / UUID"),
+                Cell::from("Endpoint"),
+                Cell::from("Role"),
+                Cell::from("Free RAM"),
+                Cell::from("Backend"),
+                Cell::from("Link Quality"),
+                Cell::from("Thermal"),
+                Cell::from("Trust"),
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
 
         let mut rows = Vec::new();
 
@@ -522,13 +586,6 @@ impl ClusterView {
                 "Host"
             } else {
                 "Client"
-            };
-
-            let backend_str = match peer.backend {
-                AccelerationBackend::Vulkan => "Vulkan",
-                AccelerationBackend::ArmCpuDotProd => "ARM CPU",
-                AccelerationBackend::X86Baseline => "x86 SSE4.1",
-                AccelerationBackend::GenericCpu => "Generic",
             };
 
             let endpoint_str = if peer.is_rpc_ready() {
@@ -547,50 +604,80 @@ impl ClusterView {
                 Style::default().fg(Color::White)
             };
 
-            let link_cell = if let Some(lq) = self.link_qualities.get(&peer.uuid) {
-                Cell::from(crate::ui::badges::format_link_quality(
-                    lq.rtt_ms,
-                    lq.throughput_bps,
-                    lq.unknown,
-                ))
+            if is_compact {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(endpoint_str),
+                        Cell::from(role_str),
+                        Cell::from(format!("{} MB", peer.free_ram_mb)),
+                    ])
+                    .style(row_style),
+                );
             } else {
-                Cell::from(crate::ui::badges::BADGE_UNPROBED.span())
-            };
+                let backend_str = match peer.backend {
+                    AccelerationBackend::Vulkan => "Vulkan",
+                    AccelerationBackend::ArmCpuDotProd => "ARM CPU",
+                    AccelerationBackend::X86Baseline => "x86 SSE4.1",
+                    AccelerationBackend::GenericCpu => "Generic",
+                };
 
-            rows.push(
-                Row::new(vec![
-                    Cell::from(label),
-                    Cell::from(endpoint_str),
-                    Cell::from(role_str),
-                    Cell::from(format!("{} MB", peer.free_ram_mb)),
-                    Cell::from(backend_str),
-                    link_cell,
-                    Cell::from(format!("{}/100", peer.thermal_index)),
-                    Cell::from(self.trust_label(peer.uuid)),
-                ])
-                .style(row_style),
-            );
+                let link_cell = if let Some(lq) = self.link_qualities.get(&peer.uuid) {
+                    Cell::from(crate::ui::badges::format_link_quality(
+                        lq.rtt_ms,
+                        lq.throughput_bps,
+                        lq.unknown,
+                    ))
+                } else {
+                    Cell::from(crate::ui::badges::BADGE_UNPROBED.span())
+                };
+
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(label),
+                        Cell::from(endpoint_str),
+                        Cell::from(role_str),
+                        Cell::from(format!("{} MB", peer.free_ram_mb)),
+                        Cell::from(backend_str),
+                        link_cell,
+                        Cell::from(format!("{}/100", peer.thermal_index)),
+                        Cell::from(self.trust_label(peer.uuid)),
+                    ])
+                    .style(row_style),
+                );
+            }
         }
 
-        let title = format!(
-            " Discovered Mesh Peers (UDP 9999 + mDNS) - {} Nodes ",
-            self.peers.len()
-        );
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(18), // Node label
-                Constraint::Length(23), // Endpoint
-                Constraint::Length(12), // Role
-                Constraint::Length(11), // Free RAM
-                Constraint::Length(11), // Backend
-                Constraint::Length(18), // Link Quality
-                Constraint::Length(8),  // Thermal
-                Constraint::Min(12),    // Trust / Active Model
-            ],
-        )
-        .header(header)
-        .block(
+        let (title, widths) = if is_compact {
+            (
+                format!(" Mesh Peers ({}) ", self.peers.len()),
+                vec![
+                    Constraint::Length(16),
+                    Constraint::Length(20),
+                    Constraint::Length(10),
+                    Constraint::Min(8),
+                ],
+            )
+        } else {
+            (
+                format!(
+                    " Discovered Mesh Peers (UDP 9999 + mDNS) - {} Nodes ",
+                    self.peers.len()
+                ),
+                vec![
+                    Constraint::Length(18), // Node label
+                    Constraint::Length(23), // Endpoint
+                    Constraint::Length(12), // Role
+                    Constraint::Length(11), // Free RAM
+                    Constraint::Length(11), // Backend
+                    Constraint::Length(18), // Link Quality
+                    Constraint::Length(8),  // Thermal
+                    Constraint::Min(12),    // Trust / Active Model
+                ],
+            )
+        };
+
+        let table = Table::new(rows, widths).header(header).block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -741,7 +828,10 @@ impl ClusterView {
                 Span::styled(" Link Telemetry:  ", Style::default().fg(Color::LightBlue)),
                 status_badge,
                 Span::styled(
-                    format!(" {:.1}ms · {:.1}MB/s (probed {}s ago)", lq.rtt_ms, mb_s, age_secs),
+                    format!(
+                        " {:.1}ms · {:.1}MB/s (probed {}s ago)",
+                        lq.rtt_ms, mb_s, age_secs
+                    ),
                     Style::default().fg(Color::White),
                 ),
             ]));
@@ -768,7 +858,10 @@ impl ClusterView {
                         format!(" [{}]", slot.tags.join(", "))
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("   Slot #{}: ", idx + 1), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("   Slot #{}: ", idx + 1),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                         Span::styled(
                             &slot.model,
                             Style::default()
@@ -843,21 +936,10 @@ impl ClusterView {
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    crate::ui::layout::responsive_centered_rect(
+        percent_x,
+        percent_y,
+        r,
+        crate::ui::layout::LayoutMode::Auto,
+    )
 }

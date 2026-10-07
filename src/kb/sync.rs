@@ -160,7 +160,10 @@ pub fn generate_manifest(store: &KnowledgeStore, node_id: Uuid) -> Result<KbSync
 }
 
 /// Compute what items in `remote_manifest` should be pulled into local store.
-pub fn compute_diff(local_manifest: &KbSyncManifest, remote_manifest: &KbSyncManifest) -> KbSyncDiff {
+pub fn compute_diff(
+    local_manifest: &KbSyncManifest,
+    remote_manifest: &KbSyncManifest,
+) -> KbSyncDiff {
     let mut local_chunks: HashMap<&str, u64> = HashMap::new();
     for c in &local_manifest.chunks {
         local_chunks.insert(&c.chunk_id, c.created_at);

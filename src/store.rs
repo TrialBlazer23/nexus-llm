@@ -113,10 +113,7 @@ impl ModelIndex {
         let mut by_filename: HashMap<String, ModelIndexEntry> = HashMap::new();
         for e in previous.models.clone() {
             let canon = e.path.canonicalize().unwrap_or_else(|_| e.path.clone());
-            let parent_ok = canon
-                .parent()
-                .map(|p| p == models_dir)
-                .unwrap_or(false)
+            let parent_ok = canon.parent().map(|p| p == models_dir).unwrap_or(false)
                 || e.path.parent().map(|p| p == models_dir).unwrap_or(false);
             if parent_ok {
                 by_filename.insert(e.filename.clone(), e.clone());

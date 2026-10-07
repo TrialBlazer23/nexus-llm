@@ -46,9 +46,7 @@ impl LogFilterLevel {
     pub fn matches(&self, line: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Info => {
-                line.contains("INFO") || line.contains("WARN") || line.contains("ERROR")
-            }
+            Self::Info => line.contains("INFO") || line.contains("WARN") || line.contains("ERROR"),
             Self::Warn => line.contains("WARN") || line.contains("ERROR"),
             Self::Error => line.contains("ERROR"),
         }
@@ -112,17 +110,13 @@ impl LogsView {
         if let Ok(entries) = std::fs::read_dir(dir) {
             let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".log")
-                })
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
                 .filter_map(|e| {
                     let m = e.metadata().ok()?.modified().ok()?;
                     Some((m, e.path()))
                 })
                 .collect();
-            logs.sort_by(|a, b| b.0.cmp(&a.0));
+            logs.sort_by_key(|a| std::cmp::Reverse(a.0));
             return logs.into_iter().next().map(|(_, p)| p);
         }
         None
@@ -142,7 +136,7 @@ impl LogsView {
                     self.lines.clear();
                 }
 
-                if let Ok(_) = file.seek(SeekFrom::Start(self.last_read_bytes)) {
+                if file.seek(SeekFrom::Start(self.last_read_bytes)).is_ok() {
                     let mut buf = String::new();
                     if file.read_to_string(&mut buf).is_ok() {
                         for line in buf.lines() {
@@ -257,7 +251,11 @@ impl LogsView {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let count_str = format!("Lines: {}/{}", self.filtered_lines().len(), self.lines.len());
+        let count_str = format!(
+            "Lines: {}/{}",
+            self.filtered_lines().len(),
+            self.lines.len()
+        );
 
         let title_line = Line::from(vec![
             Span::styled(
@@ -401,17 +399,27 @@ impl LogsView {
     }
 }
 
+impl Default for LogsView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_logs_view_filtering_and_tailing() {
         let mut temp = NamedTempFile::new().unwrap();
         writeln!(temp, "2026-10-07T12:00:00Z INFO nexus: server started").unwrap();
-        writeln!(temp, "2026-10-07T12:00:01Z WARN nexus: high memory pressure").unwrap();
+        writeln!(
+            temp,
+            "2026-10-07T12:00:01Z WARN nexus: high memory pressure"
+        )
+        .unwrap();
         writeln!(temp, "2026-10-07T12:00:02Z ERROR nexus: connection refused").unwrap();
         temp.flush().unwrap();
 

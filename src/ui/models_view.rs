@@ -38,6 +38,7 @@ pub struct ModelsView {
     pub cached_profile: SystemProfile,
     /// Context size used for local loads (Models +/-).
     pub selected_context: usize,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl ModelsView {
@@ -50,6 +51,7 @@ impl ModelsView {
             status_message: None,
             cached_profile: SystemProfile::probe(),
             selected_context: 4096,
+            layout_mode: crate::ui::layout::LayoutMode::Auto,
         };
         view.refresh();
         view
@@ -209,10 +211,18 @@ impl ModelsView {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area);
+        let is_compact = self.layout_mode.is_compact(area);
+        let chunks = if is_compact {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area)
+        };
 
         self.render_model_list(frame, chunks[0]);
         self.render_model_details(frame, chunks[1]);

@@ -186,6 +186,7 @@ pub struct ChatApp {
     pub show_preset_modal: bool,
     pub preset_candidates: Vec<String>,
     pub selected_preset_idx: usize,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl ChatApp {
@@ -228,6 +229,7 @@ impl ChatApp {
             show_preset_modal: false,
             preset_candidates: vec!["general".to_string(), "coder".to_string()],
             selected_preset_idx: 0,
+            layout_mode: crate::ui::layout::LayoutMode::Auto,
         };
         app.refresh_preset_candidates();
         app
@@ -665,21 +667,38 @@ impl ChatApp {
 
     /// Prepare and render the UI frame within a specified sub-area.
     pub fn render_in_area(&mut self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(3), // Header bar
-                Constraint::Min(8),    // Chat history area
-                Constraint::Length(3), // Input box
-                Constraint::Length(1), // Help / status footer
-            ])
-            .split(area);
+        let is_compact = self.layout_mode.is_compact(area);
+        if is_compact {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(0)
+                .constraints([
+                    Constraint::Min(6),    // Chat history area (maximized)
+                    Constraint::Length(3), // Input box
+                    Constraint::Length(1), // Help / status footer
+                ])
+                .split(area);
 
-        self.render_header(frame, chunks[0]);
-        self.render_chat_history(frame, chunks[1]);
-        self.render_input_box(frame, chunks[2]);
-        self.render_footer(frame, chunks[3]);
+            self.render_chat_history(frame, chunks[0]);
+            self.render_input_box(frame, chunks[1]);
+            self.render_footer(frame, chunks[2], is_compact);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(3), // Header bar
+                    Constraint::Min(8),    // Chat history area
+                    Constraint::Length(3), // Input box
+                    Constraint::Length(1), // Help / status footer
+                ])
+                .split(area);
+
+            self.render_header(frame, chunks[0]);
+            self.render_chat_history(frame, chunks[1]);
+            self.render_input_box(frame, chunks[2]);
+            self.render_footer(frame, chunks[3], is_compact);
+        }
 
         if self.show_preset_modal {
             self.render_preset_modal(frame, area);
@@ -1050,7 +1069,7 @@ impl ChatApp {
         frame.render_widget(input_widget, area);
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
         let (text, style) = if let Some(status) = &self.status_message {
             let color = if status.to_lowercase().contains("error") {
                 Color::LightRed
@@ -1060,6 +1079,11 @@ impl ChatApp {
             (
                 status.clone(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        } else if is_compact {
+            (
+                "[Enter] Send | [Esc] Stop | /help".to_string(),
+                Style::default().fg(Color::DarkGray),
             )
         } else {
             (
@@ -1077,7 +1101,8 @@ impl ChatApp {
     }
 
     fn render_preset_modal(&self, frame: &mut Frame, area: Rect) {
-        let modal_area = centered_rect(50, 40, area);
+        let modal_area =
+            crate::ui::layout::responsive_centered_rect(50, 40, area, self.layout_mode);
         frame.render_widget(Clear, modal_area);
 
         let mut lines = vec![
@@ -1121,26 +1146,6 @@ impl ChatApp {
 
         frame.render_widget(block, modal_area);
     }
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 fn chrono_placeholder() -> u64 {

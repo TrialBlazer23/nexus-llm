@@ -5,7 +5,7 @@
 //! Tier 2: Small orchestrator model assisted classification for ambiguous prompts.
 //!         Emits strict JSON decisions with hard code-level veto and fallback.
 
-use crate::client::{ChatMessage, ChatCompletionRequest, NexusClient};
+use crate::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -167,7 +167,11 @@ impl Router {
     }
 
     /// Tier 1: Deterministic matching based on explicit tags and keywords.
-    pub fn route_deterministic(&self, prompt: &str, routes: &[RouteTarget]) -> Option<RouteDecision> {
+    pub fn route_deterministic(
+        &self,
+        prompt: &str,
+        routes: &[RouteTarget],
+    ) -> Option<RouteDecision> {
         if routes.is_empty() {
             return None;
         }
@@ -194,11 +198,37 @@ impl Router {
 
         // Coder keywords
         const CODER_KEYWORDS: &[&str] = &[
-            "fn ", "def ", "class ", "struct ", "impl ", "enum ", "import ",
-            "function", "async ", "await ", "rust", "python", "javascript",
-            "typescript", "compile", "compiler", "debug", "refactor", "bug",
-            "syntax", "algorithm", "quicksort", "binary search", "sql", "select ",
-            "git ", "bash", "regex", "unit test", "panic", "error[e",
+            "fn ",
+            "def ",
+            "class ",
+            "struct ",
+            "impl ",
+            "enum ",
+            "import ",
+            "function",
+            "async ",
+            "await ",
+            "rust",
+            "python",
+            "javascript",
+            "typescript",
+            "compile",
+            "compiler",
+            "debug",
+            "refactor",
+            "bug",
+            "syntax",
+            "algorithm",
+            "quicksort",
+            "binary search",
+            "sql",
+            "select ",
+            "git ",
+            "bash",
+            "regex",
+            "unit test",
+            "panic",
+            "error[e",
         ];
 
         if routes.iter().any(|r| r.matches_tag("coder")) {
@@ -219,7 +249,13 @@ impl Router {
 
         // Vision keywords
         const VISION_KEYWORDS: &[&str] = &[
-            "image", "photo", "picture", "look at", "visual", "ocr", "screenshot",
+            "image",
+            "photo",
+            "picture",
+            "look at",
+            "visual",
+            "ocr",
+            "screenshot",
         ];
         if routes.iter().any(|r| r.matches_tag("vision")) {
             for kw in VISION_KEYWORDS {
@@ -367,7 +403,10 @@ impl Router {
             match self.route_orchestrated(prompt, routes, client).await {
                 Ok(decision) => return decision,
                 Err(err) => {
-                    warn!("Tier 2 orchestrator routing skipped/vetoed: {}. Falling back to default.", err);
+                    warn!(
+                        "Tier 2 orchestrator routing skipped/vetoed: {}. Falling back to default.",
+                        err
+                    );
                 }
             }
         }
@@ -381,7 +420,8 @@ impl Router {
         RouteDecision::Fallback {
             endpoint: fallback_target.endpoint.clone(),
             model: fallback_target.model.clone(),
-            reason: "no specific keyword matched and orchestrator unavailable or vetoed".to_string(),
+            reason: "no specific keyword matched and orchestrator unavailable or vetoed"
+                .to_string(),
         }
     }
 
@@ -398,15 +438,16 @@ impl Router {
         retriever: Option<&crate::kb::KnowledgeRetriever>,
         limit: usize,
     ) -> (RouteDecision, String) {
-        let (is_explicit_rag, clean_prompt) = if let Some((tag, remainder)) = Self::extract_explicit_tag(prompt) {
-            if tag.eq_ignore_ascii_case("rag") {
-                (true, remainder)
+        let (is_explicit_rag, clean_prompt) =
+            if let Some((tag, remainder)) = Self::extract_explicit_tag(prompt) {
+                if tag.eq_ignore_ascii_case("rag") {
+                    (true, remainder)
+                } else {
+                    (false, prompt)
+                }
             } else {
                 (false, prompt)
-            }
-        } else {
-            (false, prompt)
-        };
+            };
 
         let augmented_prompt = if let Some(ret) = retriever {
             let min_score = if is_explicit_rag { 0.4 } else { 0.7 };
@@ -422,4 +463,3 @@ impl Router {
         (decision, augmented_prompt)
     }
 }
-

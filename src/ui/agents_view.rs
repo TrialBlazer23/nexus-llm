@@ -22,6 +22,7 @@ pub struct AgentsView {
     pub memories: Vec<EpisodicMemory>,
     pub selected_task_idx: usize,
     pub status_message: Option<(String, Color)>,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl AgentsView {
@@ -36,6 +37,7 @@ impl AgentsView {
             memories,
             selected_task_idx: 0,
             status_message: None,
+            layout_mode: crate::ui::layout::LayoutMode::Auto,
         }
     }
 
@@ -73,6 +75,7 @@ impl AgentsView {
 
     /// Render the Agents View into the specified terminal frame area.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let is_compact = self.layout_mode.is_compact(area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -85,7 +88,7 @@ impl AgentsView {
 
         self.render_header(frame, chunks[0]);
         self.render_tasks_table(frame, chunks[1]);
-        self.render_memories_and_routes(frame, chunks[2]);
+        self.render_memories_and_routes(frame, chunks[2], is_compact);
         self.render_footer(frame, chunks[3]);
     }
 
@@ -119,9 +122,15 @@ impl AgentsView {
                 Style::default().fg(Color::White),
             ),
             Span::styled(" (", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{completed} done"), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{completed} done"),
+                Style::default().fg(Color::Green),
+            ),
             Span::styled(", ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{running} active"), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{running} active"),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled(", ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{failed} failed"), Style::default().fg(Color::Red)),
             Span::styled(") | ", Style::default().fg(Color::DarkGray)),
@@ -215,23 +224,28 @@ impl AgentsView {
             Constraint::Percentage(35),
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(
-                Block::default()
-                    .title(" Agent Bus Tasks ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::White)),
-            );
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .title(" Agent Bus Tasks ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White)),
+        );
 
         frame.render_widget(table, area);
     }
 
-    fn render_memories_and_routes(&self, frame: &mut Frame, area: Rect) {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(area);
+    fn render_memories_and_routes(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
+        let cols = if is_compact {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(area)
+        };
 
         // Memories table
         let mem_rows = self.memories.iter().rev().take(8).map(|m| {

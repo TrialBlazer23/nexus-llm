@@ -288,8 +288,8 @@ impl ProcessSupervisor {
         // Pre-flight check: Android LMK memory ceiling guard (for standalone mode)
         if !config.is_distributed() {
             let sys_profile = SystemProfile::probe();
-            let max_allowed = sys_profile
-                .max_allowed_memory_bytes_pct(config.memory_budget_percent);
+            let max_allowed =
+                sys_profile.max_allowed_memory_bytes_pct(config.memory_budget_percent);
 
             if total_required > max_allowed {
                 return Err(SupervisorError::MemoryCapExceeded {
@@ -873,7 +873,10 @@ impl SupervisorManager {
 
     /// Spawn a model supervisor in an available or requested slot, checking the cumulative
     /// memory footprint across all active instances. Returns the allocated SlotId (port).
-    pub async fn spawn_slot(&self, mut config: LlamaServerConfig) -> Result<SlotId, SupervisorError> {
+    pub async fn spawn_slot(
+        &self,
+        mut config: LlamaServerConfig,
+    ) -> Result<SlotId, SupervisorError> {
         let existing_footprint: u64 = {
             let lock = self.inner.lock().await;
             lock.values().map(|s| s.estimated_memory_bytes()).sum()

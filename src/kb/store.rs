@@ -92,10 +92,7 @@ impl KnowledgeStore {
             cache.insert(path.clone(), db_arc.clone());
         }
 
-        Ok(Self {
-            path,
-            db: db_arc,
-        })
+        Ok(Self { path, db: db_arc })
     }
 
     pub fn path(&self) -> &Path {
@@ -206,9 +203,7 @@ impl KnowledgeStore {
             .map_err(|e| KbError::Database(e.to_string()))?;
 
         let mut chunks = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|e| KbError::Database(e.to_string()))?;
+        let iter = table.iter().map_err(|e| KbError::Database(e.to_string()))?;
 
         for item in iter {
             let (_key, val) = item.map_err(|e| KbError::Database(e.to_string()))?;
@@ -274,7 +269,10 @@ impl KnowledgeStore {
             .open_table(TABLE_PERSONAS)
             .map_err(|e| KbError::Database(e.to_string()))?;
 
-        if let Some(val) = table.get(id).map_err(|e| KbError::Database(e.to_string()))? {
+        if let Some(val) = table
+            .get(id)
+            .map_err(|e| KbError::Database(e.to_string()))?
+        {
             let persona: Persona = serde_json::from_slice(val.value())?;
             Ok(Some(persona))
         } else {
@@ -293,9 +291,7 @@ impl KnowledgeStore {
             .map_err(|e| KbError::Database(e.to_string()))?;
 
         let mut personas = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|e| KbError::Database(e.to_string()))?;
+        let iter = table.iter().map_err(|e| KbError::Database(e.to_string()))?;
 
         for item in iter {
             let (_key, val) = item.map_err(|e| KbError::Database(e.to_string()))?;
@@ -392,9 +388,7 @@ impl KnowledgeStore {
             .map_err(|e| KbError::Database(e.to_string()))?;
 
         let mut memories = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|e| KbError::Database(e.to_string()))?;
+        let iter = table.iter().map_err(|e| KbError::Database(e.to_string()))?;
 
         for item in iter {
             let (_key, val) = item.map_err(|e| KbError::Database(e.to_string()))?;
@@ -515,7 +509,8 @@ impl KnowledgeStore {
     pub fn upsert_raw_persona(&self, persona: &Persona) -> Result<bool, KbError> {
         if let Some(existing) = self.get_persona(&persona.id)? {
             if persona.version < existing.version
-                || (persona.version == existing.version && persona.updated_at <= existing.updated_at)
+                || (persona.version == existing.version
+                    && persona.updated_at <= existing.updated_at)
             {
                 return Ok(false);
             }
@@ -573,4 +568,3 @@ impl KnowledgeStore {
         Ok(true)
     }
 }
-

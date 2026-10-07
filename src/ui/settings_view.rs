@@ -40,6 +40,8 @@ pub enum SettingType {
     EnableRpc,
     MaxRpcRamMb,
     AutoOffload,
+    // UI & Display
+    UiLayoutMode,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +197,13 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "Automatic Layer Offload Planning",
         description: "Auto-calculate tensor-byte layer split when model exceeds host LMK budget",
         setting_type: SettingType::AutoOffload,
+    },
+    // UI & Display Preferences
+    SettingItem {
+        category: "UI & Display Preferences",
+        name: "Adaptive Layout Mode",
+        description: "Adaptive screen layout (auto: mobile <85 cols or <24 rows; compact: forced single-column; wide: desktop multi-column)",
+        setting_type: SettingType::UiLayoutMode,
     },
 ];
 
@@ -492,6 +501,19 @@ impl SettingsView {
             SettingType::AutoOffload => {
                 self.config.cluster.auto_offload = !self.config.cluster.auto_offload;
             }
+            SettingType::UiLayoutMode => {
+                let current = self.config.ui.layout_mode.as_str();
+                let next = match (current, is_left) {
+                    ("auto", true) => "wide",
+                    ("auto", false) => "compact",
+                    ("compact", true) => "auto",
+                    ("compact", false) => "wide",
+                    ("wide", true) => "compact",
+                    ("wide", false) => "auto",
+                    _ => "auto",
+                };
+                self.config.ui.layout_mode = next.to_string();
+            }
         }
         self.status_message = Some(("Modified (Press 'S' to save)".to_string(), Color::Yellow));
     }
@@ -655,6 +677,9 @@ impl SettingsView {
                             "OFF"
                         }
                     ),
+                    SettingType::UiLayoutMode => {
+                        format!("[ {} ]", self.config.ui.layout_mode)
+                    }
                 }
             };
 

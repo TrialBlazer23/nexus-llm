@@ -4,6 +4,7 @@ pub mod chat;
 pub mod cluster_view;
 pub mod dashboard;
 pub mod hub;
+pub mod layout;
 pub mod logs_view;
 pub mod markdown;
 pub mod models;

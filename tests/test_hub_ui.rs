@@ -206,15 +206,25 @@ fn test_models_view_apply_remote_catalogs_in_memory() {
     )];
 
     view.apply_remote_catalogs(&remotes);
-    assert_eq!(view.catalog.len(), 2, "Should contain both local and remote models");
+    assert_eq!(
+        view.catalog.len(),
+        2,
+        "Should contain both local and remote models"
+    );
 
     // Local model is still present and valid
-    let local = view.catalog.iter().find(|r| r.filename == "local-model.gguf");
+    let local = view
+        .catalog
+        .iter()
+        .find(|r| r.filename == "local-model.gguf");
     assert!(local.is_some());
     assert!(local.unwrap().local.is_some());
 
     // Remote model is present
-    let remote = view.catalog.iter().find(|r| r.filename == "remote-mac-model.gguf");
+    let remote = view
+        .catalog
+        .iter()
+        .find(|r| r.filename == "remote-mac-model.gguf");
     assert!(remote.is_some());
     assert!(remote.unwrap().local.is_none());
     assert_eq!(remote.unwrap().holders, vec!["MacBook-Host"]);
@@ -738,7 +748,10 @@ async fn test_command_palette_filtering_and_actions() {
     let mut hub = test_hub(config, client, discovery);
 
     let items = hub.build_palette_items();
-    assert!(items.len() >= 10, "Palette should index navigation, actions, and commands");
+    assert!(
+        items.len() >= 10,
+        "Palette should index navigation, actions, and commands"
+    );
 
     // Exact prefix match
     let filtered_logs = hub.filter_palette_items(&items, "logs");
@@ -783,14 +796,29 @@ async fn test_persistent_dock_telemetry_and_gauge() {
     let content = format!("{:?}", terminal.backend().buffer());
 
     // Verify Row 1: Telemetry
-    assert!(content.contains("qwen2.5-coder-7b.gguf"), "Must display active model in persistent bar");
-    assert!(content.contains("28.5 t/s"), "Must display active live tokens/sec");
+    assert!(
+        content.contains("qwen2.5-coder-7b.gguf"),
+        "Must display active model in persistent bar"
+    );
+    assert!(
+        content.contains("28.5 t/s"),
+        "Must display active live tokens/sec"
+    );
     assert!(content.contains("Context:"), "Must display context label");
-    assert!(content.contains("[STREAM]"), "Must display streaming status badge");
+    assert!(
+        content.contains("[STREAM]"),
+        "Must display streaming status badge"
+    );
 
     // Verify Row 2: Controls & Shortcuts
-    assert!(content.contains("[F1-F7] Tabs"), "Must display tab range shortcut");
-    assert!(content.contains("[Ctrl+P] Palette"), "Must display Palette hotkey");
+    assert!(
+        content.contains("[F1-F7] Tabs"),
+        "Must display tab range shortcut"
+    );
+    assert!(
+        content.contains("[Ctrl+P] Palette"),
+        "Must display Palette hotkey"
+    );
     assert!(content.contains("[?] Help"), "Must display Help hotkey");
 }
 
@@ -838,15 +866,27 @@ async fn test_cluster_view_link_quality_visuals() {
     // Render table
     terminal.draw(|f| cluster.render(f, f.area())).unwrap();
     let content = format!("{:?}", terminal.backend().buffer());
-    assert!(content.contains("Link Quality"), "Must render Link Quality column header");
-    assert!(content.contains("3.0ms"), "Must render measured RTT in table");
+    assert!(
+        content.contains("Link Quality"),
+        "Must render Link Quality column header"
+    );
+    assert!(
+        content.contains("3.0ms"),
+        "Must render measured RTT in table"
+    );
 
     // Render inspect modal
     cluster.show_info_modal = true;
     terminal.draw(|f| cluster.render(f, f.area())).unwrap();
     let modal_content = format!("{:?}", terminal.backend().buffer());
-    assert!(modal_content.contains("Link Telemetry:"), "Must display Link Telemetry row in inspector modal");
-    assert!(modal_content.contains("probed"), "Must show probe details in modal");
+    assert!(
+        modal_content.contains("Link Telemetry:"),
+        "Must display Link Telemetry row in inspector modal"
+    );
+    assert!(
+        modal_content.contains("probed"),
+        "Must show probe details in modal"
+    );
 }
 
 #[test]
@@ -895,3 +935,99 @@ fn test_logs_view_streaming_and_filters() {
     assert_eq!(logs.lines.len(), 0);
 }
 
+#[tokio::test]
+async fn test_mobile_responsive_rendering() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://127.0.0.1:8080");
+    let mut hub = test_hub(config, client, discovery.clone());
+
+    hub.active_model_name = "phi-4-mini-q4_k_m.gguf".to_string();
+    hub.chat.tokens_per_sec = 18.2;
+
+    // Simulate mobile screen dimensions: 75 columns x 22 rows
+    let backend = TestBackend::new(75, 22);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    // 1. Chat tab mobile render
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let content = format!("{:?}", terminal.backend().buffer());
+
+    // Top tab bar should be condensed
+    assert!(
+        content.contains("1:Chat"),
+        "Must render compact 1:Chat tab badge"
+    );
+    assert!(
+        content.contains("2:Mod"),
+        "Must render compact 2:Mod tab badge"
+    );
+    assert!(
+        !content.contains("Nexus-LLM Unified Hub"),
+        "Must omit long title on mobile"
+    );
+
+    // Bottom dock should be condensed
+    assert!(
+        content.contains("phi-4-mini"),
+        "Must render model in compact dock"
+    );
+    assert!(
+        content.contains("18.2 t/s"),
+        "Must render speed in compact dock"
+    );
+    assert!(
+        content.contains("[Tab] Next"),
+        "Must render mobile-friendly shortcuts"
+    );
+
+    // 2. Cluster tab mobile render
+    hub.set_tab(HubTab::Cluster);
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let cluster_content = format!("{:?}", terminal.backend().buffer());
+
+    assert!(
+        cluster_content.contains("RAM:"),
+        "Must render compact RAM title"
+    );
+    assert!(
+        cluster_content.contains("[Engine]"),
+        "Must render compact engine summary"
+    );
+    assert!(
+        cluster_content.contains("Node / UUID"),
+        "Must render 4-column compact header"
+    );
+    assert!(
+        !cluster_content.contains("Link Quality"),
+        "Must omit wide columns on mobile"
+    );
+
+    // 3. Models tab mobile render
+    hub.set_tab(HubTab::Models);
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let models_content = format!("{:?}", terminal.backend().buffer());
+    assert!(models_content.contains("No models") || models_content.contains("Model"));
+
+    // 4. Test explicit override: Wide mode forces desktop layout on small screen
+    hub.settings_view.config.ui.layout_mode = "wide".to_string();
+    hub.sync_layout_mode();
+    assert_eq!(hub.layout_mode, nexus::ui::layout::LayoutMode::Wide);
+
+    hub.set_tab(HubTab::Cluster);
+    terminal.draw(|f| hub.render(f)).unwrap();
+    let wide_content = format!("{:?}", terminal.backend().buffer());
+    // In wide mode, it renders the desktop title and full telemetry dock
+    assert!(
+        wide_content.contains("Discovered Mesh Peers"),
+        "Wide override must render wide mesh peers title"
+    );
+    assert!(
+        wide_content.contains("[F1-F7] Tabs"),
+        "Wide override must render desktop F1-F7 tabs shortcut"
+    );
+    assert!(
+        wide_content.contains("Host:"),
+        "Wide override must render Host endpoint in dock"
+    );
+}

@@ -233,6 +233,7 @@ pub struct HubApp {
     // (label, percent, downloaded, total, speed) — keep compact until a dedicated progress type.
     #[allow(clippy::type_complexity)]
     pub download_progress: Option<(String, Option<f32>, u64, Option<u64>, f64)>,
+    pub layout_mode: crate::ui::layout::LayoutMode,
 }
 
 impl HubApp {
@@ -244,10 +245,14 @@ impl HubApp {
         shared_config: Arc<std::sync::RwLock<NexusConfig>>,
         config_path: std::path::PathBuf,
     ) -> Self {
-        let models_view = ModelsView::new(config.node.models_dir.clone());
-        let cluster_view = ClusterView::new(discovery.clone());
+        let layout_mode = crate::ui::layout::LayoutMode::from_str_mode(&config.ui.layout_mode);
+        let mut models_view = ModelsView::new(config.node.models_dir.clone());
+        models_view.layout_mode = layout_mode;
+        let mut cluster_view = ClusterView::new(discovery.clone());
+        cluster_view.layout_mode = layout_mode;
         let settings_view = SettingsView::new(config.clone());
-        let chat = ChatApp::new(client, "default", None);
+        let mut chat = ChatApp::new(client, "default", None);
+        chat.layout_mode = layout_mode;
         let tunnel_view = crate::ui::tunnel_view::TunnelView::new(
             config.network.api_port,
             crate::tunnel::DEFAULT_RPC_PORT,
@@ -269,8 +274,9 @@ impl HubApp {
                 })
                 .expect("fallback kb store"),
         );
-        let agents_view =
+        let mut agents_view =
             crate::ui::agents_view::AgentsView::new(task_store.clone(), kb_store.clone());
+        agents_view.layout_mode = layout_mode;
         let logs_view = crate::ui::logs_view::LogsView::new();
 
         Self {
@@ -303,7 +309,18 @@ impl HubApp {
             pending_push_peers: None,
             push_peer_idx: 0,
             download_progress: None,
+            layout_mode,
         }
+    }
+
+    pub fn sync_layout_mode(&mut self) {
+        let mode =
+            crate::ui::layout::LayoutMode::from_str_mode(&self.settings_view.config.ui.layout_mode);
+        self.layout_mode = mode;
+        self.chat.layout_mode = mode;
+        self.models_view.layout_mode = mode;
+        self.cluster_view.layout_mode = mode;
+        self.agents_view.layout_mode = mode;
     }
 
     pub fn sync_shared_config(&mut self) {
@@ -544,7 +561,9 @@ impl HubApp {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        self.sync_layout_mode();
         let area = frame.area();
+        let is_compact = self.layout_mode.is_compact(area);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -555,7 +574,7 @@ impl HubApp {
             ])
             .split(area);
 
-        self.render_top_tabs(frame, chunks[0]);
+        self.render_top_tabs(frame, chunks[0], is_compact);
 
         match self.active_tab {
             HubTab::Chat => self.chat.render_in_area(frame, chunks[1]),
@@ -567,7 +586,7 @@ impl HubApp {
             HubTab::Logs => self.logs_view.render(frame, chunks[1]),
         }
 
-        self.render_footer(frame, chunks[2]);
+        self.render_footer(frame, chunks[2], is_compact);
 
         if let Some(intent) = &self.pending_hot_swap {
             self.render_hot_swap_modal(frame, area, intent);
@@ -706,25 +725,36 @@ impl HubApp {
         }
     }
 
-    fn render_top_tabs(&self, frame: &mut Frame, area: Rect) {
-        let titles = vec![
-            HubTab::Chat.title(),
-            HubTab::Models.title(),
-            HubTab::Cluster.title(),
-            HubTab::Settings.title(),
-            HubTab::Tunnel.title(),
-            HubTab::Agents.title(),
-            HubTab::Logs.title(),
-        ];
+    fn render_top_tabs(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
+        let titles = if is_compact {
+            vec![
+                "1:Chat", "2:Mod", "3:Clus", "4:Set", "5:Tun", "6:Agnt", "7:Log",
+            ]
+        } else {
+            vec![
+                HubTab::Chat.title(),
+                HubTab::Models.title(),
+                HubTab::Cluster.title(),
+                HubTab::Settings.title(),
+                HubTab::Tunnel.title(),
+                HubTab::Agents.title(),
+                HubTab::Logs.title(),
+            ]
+        };
         let selected = self.active_tab as usize;
+        let block = if is_compact {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+        } else {
+            Block::default()
+                .title(" Nexus-LLM Unified Hub ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+        };
         let tabs = Tabs::new(titles)
             .select(selected)
-            .block(
-                Block::default()
-                    .title(" Nexus-LLM Unified Hub ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
+            .block(block)
             .style(Style::default().fg(Color::Gray))
             .highlight_style(
                 Style::default()
@@ -735,7 +765,7 @@ impl HubApp {
         frame.render_widget(tabs, area);
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&self, frame: &mut Frame, area: Rect, is_compact: bool) {
         // Line 1: Rich Telemetry Dock (ORCHESTRATOR_PLAN.md §3.2)
         let prompt_tokens: usize = self
             .chat
@@ -771,71 +801,130 @@ impl HubApp {
             crate::ui::badges::BADGE_OK.span()
         };
 
-        let model_label = if self.active_model_name.is_empty()
-            || self.active_model_name == "None (Idle)"
-        {
-            "None (Idle)".to_string()
+        let model_label =
+            if self.active_model_name.is_empty() || self.active_model_name == "None (Idle)" {
+                "None (Idle)".to_string()
+            } else {
+                self.active_model_name.clone()
+            };
+
+        let line1 = if is_compact {
+            let short_model = if model_label.len() > 16 {
+                format!("{}…", &model_label[..15])
+            } else {
+                model_label
+            };
+            Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    short_model,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    speed_str,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | Ctx: ", Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    format!("{}%", pct),
+                    Style::default()
+                        .fg(if pct > 85 {
+                            Color::Red
+                        } else if pct > 65 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                status_badge,
+            ])
         } else {
-            self.active_model_name.clone()
+            Line::from(vec![
+                Span::styled(
+                    " Model: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    model_label,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Host: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    self.chat.client.endpoint(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    speed_str,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Context: ", Style::default().fg(Color::LightBlue)),
+                Span::styled(
+                    gauge_str,
+                    Style::default()
+                        .fg(if pct > 85 {
+                            Color::Red
+                        } else if pct > 65 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+                status_badge,
+            ])
         };
 
-        let line1 = Line::from(vec![
-            Span::styled(
-                " Model: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                model_label,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Host: ", Style::default().fg(Color::Cyan)),
-            Span::styled(self.chat.client.endpoint(), Style::default().fg(Color::White)),
-            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                speed_str,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Context: ", Style::default().fg(Color::LightBlue)),
-            Span::styled(
-                gauge_str,
-                Style::default()
-                    .fg(if pct > 85 {
-                        Color::Red
-                    } else if pct > 65 {
-                        Color::Yellow
-                    } else {
-                        Color::Green
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-            status_badge,
-        ]);
-
         // Line 2: Global Navigation, Hotkeys & Transient Alerts
-        let mut spans2 = vec![
-            Span::styled(
-                " [F1-F7] Tabs ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " [Ctrl+P] Palette ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" [?] Help ", Style::default().fg(Color::White)),
-        ];
+        let mut spans2 = if is_compact {
+            vec![
+                Span::styled(
+                    " [Tab] Next ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " [^P] Cmd ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" [?] Help ", Style::default().fg(Color::White)),
+            ]
+        } else {
+            vec![
+                Span::styled(
+                    " [F1-F7] Tabs ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " [Ctrl+P] Palette ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" [?] Help ", Style::default().fg(Color::White)),
+            ]
+        };
 
         if self.supervisor.is_running_blocking() {
             spans2.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
@@ -978,11 +1067,7 @@ impl HubApp {
         for m in &self.models_view.models {
             items.push(PaletteItem {
                 label: format!("Load Model: {}", m.filename),
-                description: format!(
-                    "Target select and load {} ({} MB)",
-                    m.filename,
-                    m.size_mb
-                ),
+                description: format!("Target select and load {} ({} MB)", m.filename, m.size_mb),
                 category: "Model",
                 action: PaletteAction::SelectModel(m.path.clone()),
             });
@@ -1045,7 +1130,7 @@ impl HubApp {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
         scored.into_iter().map(|(_, item)| item).collect()
     }
 
@@ -1100,8 +1185,7 @@ impl HubApp {
                 self.chat
                     .set_target_hardware(&label, "Remote RPC".to_string());
                 self.set_tab(HubTab::Chat);
-                self.status_message =
-                    Some((format!("Connected to peer at {}", ep), Color::Green));
+                self.status_message = Some((format!("Connected to peer at {}", ep), Color::Green));
             }
         }
     }
@@ -1347,22 +1431,12 @@ impl HubApp {
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    crate::ui::layout::responsive_centered_rect(
+        percent_x,
+        percent_y,
+        r,
+        crate::ui::layout::LayoutMode::Auto,
+    )
 }
 
 fn is_subsequence(needle: &str, haystack: &str) -> bool {

@@ -87,7 +87,9 @@ impl TaskStore {
             return PathBuf::from(p);
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".nexus").join(TASK_STORE_FILE_NAME)
+        PathBuf::from(home)
+            .join(".nexus")
+            .join(TASK_STORE_FILE_NAME)
     }
 
     /// Load or initialize a task store at `path`.
@@ -184,7 +186,11 @@ impl TaskStore {
     }
 
     /// Mark task as completed with output.
-    pub fn complete_task(&self, task_id: Uuid, output: impl Into<String>) -> Result<bool, TaskError> {
+    pub fn complete_task(
+        &self,
+        task_id: Uuid,
+        output: impl Into<String>,
+    ) -> Result<bool, TaskError> {
         let updated = {
             let mut data = self.data.lock().expect("task store lock");
             if let Some(task) = data.tasks.iter_mut().find(|t| t.task_id == task_id) {

@@ -81,8 +81,10 @@ impl ControlPlaneContext {
         let task_store = Arc::new(
             crate::task::TaskStore::load_or_create(crate::task::TaskStore::default_path())
                 .unwrap_or_else(|_| {
-                    crate::task::TaskStore::load_or_create(std::env::temp_dir().join("nexus_tasks.json"))
-                        .expect("fallback task store")
+                    crate::task::TaskStore::load_or_create(
+                        std::env::temp_dir().join("nexus_tasks.json"),
+                    )
+                    .expect("fallback task store")
                 }),
         );
         let kb_store = Arc::new(
@@ -234,12 +236,20 @@ async fn route(
         (Method::POST, "/nexus/control/v1/state") => handle_state(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/load") => handle_load(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/model/unload") => handle_unload(req, ctx, peer).await,
-        (Method::POST, "/nexus/control/v1/agent/message") => handle_agent_message_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/agent/message") => {
+            handle_agent_message_route(req, ctx, peer).await
+        }
         (Method::POST, "/nexus/control/v1/kb/store") => handle_kb_store_route(req, ctx, peer).await,
         (Method::POST, "/nexus/control/v1/kb/query") => handle_kb_query_route(req, ctx, peer).await,
-        (Method::POST, "/nexus/control/v1/kb/sync/manifest") => handle_kb_manifest_route(req, ctx, peer).await,
-        (Method::POST, "/nexus/control/v1/kb/sync/pull") => handle_kb_pull_route(req, ctx, peer).await,
-        (Method::POST, "/nexus/control/v1/kb/sync/push") => handle_kb_push_route(req, ctx, peer).await,
+        (Method::POST, "/nexus/control/v1/kb/sync/manifest") => {
+            handle_kb_manifest_route(req, ctx, peer).await
+        }
+        (Method::POST, "/nexus/control/v1/kb/sync/pull") => {
+            handle_kb_pull_route(req, ctx, peer).await
+        }
+        (Method::POST, "/nexus/control/v1/kb/sync/push") => {
+            handle_kb_push_route(req, ctx, peer).await
+        }
         (Method::POST, "/nexus/control/v1/pair") => handle_pair(req, ctx, peer).await,
         _ => json_response(
             StatusCode::NOT_FOUND,
@@ -1039,7 +1049,6 @@ async fn handle_kb_push_route(
     let response = crate::control_plane::handle_kb_push(&ctx.kb_store, &request).await;
     json_response(StatusCode::OK, &response)
 }
-
 
 fn allow_pair_attempt(ctx: &ControlPlaneContext, peer: SocketAddr) -> bool {
     let mut map = ctx.pair_attempts.lock().expect("pair attempts lock");

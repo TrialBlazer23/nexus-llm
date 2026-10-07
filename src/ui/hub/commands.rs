@@ -402,7 +402,11 @@ async fn run_push(
 async fn run_refresh_catalog(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>) {
     let peers = ctx.discovery.get_active_peers().await;
     if peers.is_empty() {
-        let _ = evt_tx.send(HubEvent::ModelCatalogUpdated { remotes: Vec::new() }).await;
+        let _ = evt_tx
+            .send(HubEvent::ModelCatalogUpdated {
+                remotes: Vec::new(),
+            })
+            .await;
         return;
     }
     let client = reqwest::Client::builder()

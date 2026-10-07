@@ -33,7 +33,13 @@ fn test_redb_chunk_storage_and_content_addressing() {
     meta.insert("source".to_string(), "security.md".to_string());
 
     let chunk = store
-        .store_chunk("security.md", Some("Security Overview"), content, meta, None)
+        .store_chunk(
+            "security.md",
+            Some("Security Overview"),
+            content,
+            meta,
+            None,
+        )
         .expect("store chunk");
 
     // Content-addressing verification
@@ -48,7 +54,10 @@ fn test_redb_chunk_storage_and_content_addressing() {
         .expect("chunk exists");
     assert_eq!(retrieved.content, content);
     assert_eq!(retrieved.title.as_deref(), Some("Security Overview"));
-    assert_eq!(retrieved.metadata.get("source").map(String::as_str), Some("security.md"));
+    assert_eq!(
+        retrieved.metadata.get("source").map(String::as_str),
+        Some("security.md")
+    );
 
     // Listing
     let all = store.list_chunks().expect("list chunks");
@@ -68,14 +77,26 @@ fn test_persona_versioning() {
     let store = KnowledgeStore::open(&db_path).expect("open store");
 
     let p1 = store
-        .store_persona("coder", "Code Specialist", "You are an expert Rust programmer.", vec!["coder".into()], None)
+        .store_persona(
+            "coder",
+            "Code Specialist",
+            "You are an expert Rust programmer.",
+            vec!["coder".into()],
+            None,
+        )
         .expect("store persona v1");
     assert_eq!(p1.id, "coder");
     assert_eq!(p1.version, 1);
 
     // Update persona increments version
     let p2 = store
-        .store_persona("coder", "Senior Code Specialist", "You write idiomatic, safe Rust.", vec!["coder".into()], None)
+        .store_persona(
+            "coder",
+            "Senior Code Specialist",
+            "You write idiomatic, safe Rust.",
+            vec!["coder".into()],
+            None,
+        )
         .expect("store persona v2");
     assert_eq!(p2.version, 2);
     assert_eq!(p2.system_prompt, "You write idiomatic, safe Rust.");
@@ -119,12 +140,16 @@ fn test_episodic_memory_kinds() {
         .expect("store fact");
 
     // Filter by kind
-    let prefs = store.list_memories(Some(EpisodicKind::Preference)).expect("list prefs");
+    let prefs = store
+        .list_memories(Some(EpisodicKind::Preference))
+        .expect("list prefs");
     assert_eq!(prefs.len(), 1);
     assert_eq!(prefs[0].id, mem1.id);
     assert_eq!(prefs[0].title, "Response Tone");
 
-    let facts = store.list_memories(Some(EpisodicKind::Fact)).expect("list facts");
+    let facts = store
+        .list_memories(Some(EpisodicKind::Fact))
+        .expect("list facts");
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].title, "Cluster Topo");
 
@@ -184,20 +209,42 @@ async fn test_vector_retrieval_and_hybrid_search() {
     let emb_net = pseudo.embed(doc_net);
 
     store
-        .store_chunk("rust.md", Some("Rust Safety"), doc_rust, HashMap::new(), Some(emb_rust))
+        .store_chunk(
+            "rust.md",
+            Some("Rust Safety"),
+            doc_rust,
+            HashMap::new(),
+            Some(emb_rust),
+        )
         .unwrap();
     store
-        .store_chunk("bread.md", Some("Bread Guide"), doc_bread, HashMap::new(), Some(emb_bread))
+        .store_chunk(
+            "bread.md",
+            Some("Bread Guide"),
+            doc_bread,
+            HashMap::new(),
+            Some(emb_bread),
+        )
         .unwrap();
     store
-        .store_chunk("net.md", Some("Raft Consensus"), doc_net, HashMap::new(), Some(emb_net))
+        .store_chunk(
+            "net.md",
+            Some("Raft Consensus"),
+            doc_net,
+            HashMap::new(),
+            Some(emb_net),
+        )
         .unwrap();
 
     let retriever = KnowledgeRetriever::new(store, Embedder::Pseudo(pseudo));
 
     // Query for Rust memory safety
     let results = retriever
-        .retrieve_chunks("How does Rust guarantee memory safety without garbage collection?", 2, 0.2)
+        .retrieve_chunks(
+            "How does Rust guarantee memory safety without garbage collection?",
+            2,
+            0.2,
+        )
         .await
         .expect("retrieve chunks");
 
@@ -216,15 +263,31 @@ async fn test_rag_prompt_augmentation_and_router() {
     let content = "The Nexus orchestrator model runs as a constrained classifier on port 8080.";
     let emb = pseudo.embed(content);
     store
-        .store_chunk("arch.md", Some("Nexus Architecture"), content, HashMap::new(), Some(emb))
+        .store_chunk(
+            "arch.md",
+            Some("Nexus Architecture"),
+            content,
+            HashMap::new(),
+            Some(emb),
+        )
         .unwrap();
 
     let retriever = KnowledgeRetriever::new(store, Embedder::Pseudo(pseudo));
     let router = Router::new();
 
     let routes = vec![
-        RouteTarget::new(Uuid::new_v4(), "http://node1:8080", "coder", vec!["coder".into()]),
-        RouteTarget::new(Uuid::new_v4(), "http://node2:8080", "general", vec!["general".into()]),
+        RouteTarget::new(
+            Uuid::new_v4(),
+            "http://node1:8080",
+            "coder",
+            vec!["coder".into()],
+        ),
+        RouteTarget::new(
+            Uuid::new_v4(),
+            "http://node2:8080",
+            "general",
+            vec!["general".into()],
+        ),
     ];
 
     // Explicit @rag directive
@@ -348,14 +411,10 @@ async fn test_kb_control_plane_http_signed() {
         limit: 5,
     };
 
-    let unauthorized_err = dispatch_kb_query_signed(
-        &client,
-        &base,
-        &untrusted_query_req,
-        &untrusted_identity,
-    )
-    .await
-    .unwrap_err();
+    let unauthorized_err =
+        dispatch_kb_query_signed(&client, &base, &untrusted_query_req, &untrusted_identity)
+            .await
+            .unwrap_err();
 
     let err_str = unauthorized_err.to_string();
     assert!(

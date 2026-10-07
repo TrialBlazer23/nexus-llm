@@ -55,8 +55,7 @@ fn compute_kv_cache_bytes(
             } else {
                 head_count
             };
-            let elems_per_token =
-                2.0 * (block_count as f64) * (n_kv as f64) * (head_dim as f64);
+            let elems_per_token = 2.0 * (block_count as f64) * (n_kv as f64) * (head_dim as f64);
             // 2.0 bytes per element for F16 dtype
             let bytes = elems_per_token * 2.0 * (context_size as f64);
             return bytes.round() as u64;
@@ -77,29 +76,30 @@ fn entries_from_index(index: ModelIndex, only_under: Option<&Path>) -> Vec<Model
             }
         }
         let ctx = m.context_length.min(4096);
-        let (exact_kv_mb, lmk_compatible) = if m.block_count > 0 && m.head_count > 0 && m.embedding_length > 0 {
-            let kv_bytes = compute_kv_cache_bytes(
-                m.block_count,
-                m.head_count,
-                m.head_count_kv,
-                m.embedding_length,
-                ctx,
-            );
-            let kv_mb = kv_bytes / (1024 * 1024);
-            let total_required = m.size_bytes.saturating_add(kv_bytes);
-            let compatible = total_required <= profile.max_allowed_memory_bytes();
-            (kv_mb, compatible)
-        } else {
-            // Fallback for models without cached geometry in the index
-            match GgufMetadata::open(&m.path) {
-                Ok(meta) => {
-                    let exact_kv_mb = meta.exact_kv_cache_bytes(ctx) / (1024 * 1024);
-                    let lmk_compatible = profile.can_safely_load_gguf(&meta, ctx);
-                    (exact_kv_mb, lmk_compatible)
+        let (exact_kv_mb, lmk_compatible) =
+            if m.block_count > 0 && m.head_count > 0 && m.embedding_length > 0 {
+                let kv_bytes = compute_kv_cache_bytes(
+                    m.block_count,
+                    m.head_count,
+                    m.head_count_kv,
+                    m.embedding_length,
+                    ctx,
+                );
+                let kv_mb = kv_bytes / (1024 * 1024);
+                let total_required = m.size_bytes.saturating_add(kv_bytes);
+                let compatible = total_required <= profile.max_allowed_memory_bytes();
+                (kv_mb, compatible)
+            } else {
+                // Fallback for models without cached geometry in the index
+                match GgufMetadata::open(&m.path) {
+                    Ok(meta) => {
+                        let exact_kv_mb = meta.exact_kv_cache_bytes(ctx) / (1024 * 1024);
+                        let lmk_compatible = profile.can_safely_load_gguf(&meta, ctx);
+                        (exact_kv_mb, lmk_compatible)
+                    }
+                    Err(_) => (0, false),
                 }
-                Err(_) => (0, false),
-            }
-        };
+            };
         entries.push(ModelEntry {
             path: m.path,
             filename: m.filename,

@@ -378,4 +378,3 @@ pub struct EmbeddingData {
     #[serde(default)]
     pub index: usize,
 }
-

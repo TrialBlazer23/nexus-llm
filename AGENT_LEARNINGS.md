@@ -25,6 +25,17 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-07 — Mobile Responsive TUI Layout & Ratatui Sub-Area Sizing Gotcha
+- Category: design-decision | bug
+- Context: Responsive TUI redesign for mobile screens (Termux ARM64 / narrow terminal emulators) where width < 85 or height < 24 caused horizontal and vertical clipping.
+- Finding:
+  1. Horizontal split screens (Models view 50/50, Agent view 50/50) clip critically on screens < 85 columns; vertical stacking ensures both list and details fit comfortably.
+  2. Tables with 8 columns (Cluster view) clip on mobile; reducing to 4 primary columns (Node/UUID, Endpoint, Role, Free RAM) preserves usability.
+  3. Redundant multi-line headers (Chat view header) consume ~15% of vertical real estate on small displays (24 rows); hiding headers and compacting tab labels & footers frees up space for conversation and telemetry.
+  4. **Ratatui sub-area vs root window gotcha**: When parent views subdivide their root area vertically (e.g. `chunks[0]` for tabs with height 3, `chunks[2]` for footer with height 2), each sub-chunk has `area.height < 24`. If a sub-component checks `self.layout_mode.is_compact(sub_area)`, it erroneously evaluates to compact mode even on full desktop windows (140x35+).
+- Action: Implemented `src/ui/layout.rs` with `LayoutMode` (`Auto`, `Compact`, `Wide`), `ui.layout_mode` config setting, responsive popup centering, and passed root-evaluated `is_compact` down from parent render routines into sub-widgets.
+- Verification: `cargo test --locked`, `cargo clippy --locked -- -D warnings`, `cargo fmt --check`, and added `test_mobile_responsive_rendering` in `tests/test_hub_ui.rs`.
+
 ## 2026-10-07 — Phase 12 §5.5 bench store feeding placement ranker
 - Category: design-decision
 - Context: CAPABILITY_REVIEW §5.5 on `cursor/phase12-bench-telemetry-5f3d` from `origin/main` (rebased after gateway #16).

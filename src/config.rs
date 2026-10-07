@@ -301,6 +301,15 @@ pub struct NetworkConfig {
     #[serde(default = "default_control_port")]
     pub control_port: u16,
 
+    /// Mesh OpenAI gateway port (Phase 12 §5.1). Reverse-proxies `/v1/*` to the
+    /// active model holder. Distinct from `api_port` / `control_port` / `discovery_port`.
+    #[serde(default = "default_gateway_port")]
+    pub gateway_port: u16,
+
+    /// When true, hub/nexusd/host spawn the mesh gateway on `gateway_port`.
+    #[serde(default = "default_true")]
+    pub gateway_enabled: bool,
+
     #[serde(default = "default_discovery_port")]
     pub discovery_port: u16,
 
@@ -332,6 +341,8 @@ impl Default for NetworkConfig {
             api_host: default_api_host(),
             api_port: default_api_port(),
             control_port: default_control_port(),
+            gateway_port: default_gateway_port(),
+            gateway_enabled: true,
             discovery_port: default_discovery_port(),
             broadcast_interval_ms: default_broadcast_interval_ms(),
             peer_timeout_ms: default_peer_timeout_ms(),
@@ -355,6 +366,17 @@ impl NetworkConfig {
         {
             return Err(ConfigError::Invalid(
                 "network API, control, and discovery ports must be non-zero and pairwise distinct"
+                    .to_string(),
+            ));
+        }
+        if self.gateway_enabled
+            && (self.gateway_port == 0
+                || self.gateway_port == self.api_port
+                || self.gateway_port == self.control_port
+                || self.gateway_port == self.discovery_port)
+        {
+            return Err(ConfigError::Invalid(
+                "network.gateway_port must be non-zero and distinct from api, control, and discovery ports"
                     .to_string(),
             ));
         }
@@ -612,6 +634,10 @@ fn default_api_port() -> u16 {
 
 fn default_control_port() -> u16 {
     9998
+}
+
+fn default_gateway_port() -> u16 {
+    8090
 }
 
 fn default_discovery_port() -> u16 {

@@ -25,6 +25,17 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-07 — Phase 12 §5.1 mesh gateway on dedicated gateway_port
+- Category: design-decision
+- Context: CAPABILITY_REVIEW §5.1 / Phase 12 MVP on `cursor/phase12-mesh-gateway-5f3d` from `origin/main` @ `038eaa4`.
+- Finding:
+  1. Do not multiplex the mesh OpenAI front door onto `api_port` (llama-server owns 8080) or `control_port` (signed trust domain on 9998). Use `network.gateway_port` default 8090 + `gateway_enabled`.
+  2. Inbound `/v1/*` stays unauthenticated so unmodified OpenAI clients work; when pairing is enforced, resolution only considers verified/trusted peers.
+  3. Prefer byte-stream reverse proxy for `/v1/chat/completions` over re-tokenizing via `NexusClient::stream_chat` (that API yields text tokens only and would break OpenAI chunk shape).
+  4. `PeerRegistry` has no model fields — resolve via local `SupervisorManager`/`DiscoveryService` `active_model` plus peer beacon `active_model`. Auto-load on miss and full hub rebind collapse are follow-ons.
+- Action: Added `src/gateway.rs`, config/Settings/doctor wiring, hub bootstrap prefers local gateway, `tests/test_gateway.rs` with multi-holder `fake_llama`.
+- Verification: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (incl. gateway suite). Live multi-node LAN soak still required.
+
 ## 2026-10-07 — Continuous: CI, Penryn opcode scan, decoder property tests, fake llama
 - Category: design-decision | environment
 - Context: CAPABILITY_REVIEW §6 / §7 Continuous on `cursor/continuous-ci-hygiene-d6cb` from `origin/main` @ `2e9003f`. Not Phase 10/11/12.

@@ -84,6 +84,7 @@ pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
         check_port_bindable("discovery_port", config.network.discovery_port),
         check_port_bindable("control_port", config.network.control_port),
         check_port_bindable("api_port", config.network.api_port),
+        check_gateway_port(config),
         check_adb(),
         check_log_dir(),
         check_display_name(config),
@@ -213,6 +214,17 @@ fn check_port_bindable(label: &'static str, port: u16) -> DoctorCheck {
             detail: format!("cannot bind port {}: {}", port, e),
         },
     }
+}
+
+fn check_gateway_port(config: &NexusConfig) -> DoctorCheck {
+    if !config.network.gateway_enabled {
+        return DoctorCheck {
+            name: "gateway_port",
+            severity: CheckSeverity::Ok,
+            detail: "disabled (network.gateway_enabled=false)".to_string(),
+        };
+    }
+    check_port_bindable("gateway_port", config.network.gateway_port)
 }
 
 fn check_adb() -> DoctorCheck {

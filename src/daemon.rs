@@ -2,6 +2,7 @@ use clap::Parser;
 use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{NodeRole, StatusFlags};
+use nexus::gateway::{spawn as spawn_gateway, GatewayContext};
 use nexus::registry_runtime::spawn_registry_runtime;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
@@ -135,6 +136,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Control-plane HTTP server listening on port {}",
         config.network.control_port
     );
+
+    let _gateway_handle = if config.network.gateway_enabled {
+        let gateway_ctx = Arc::new(
+            GatewayContext::new(
+                supervisor.clone(),
+                args.port,
+                PathBuf::from(&config.node.models_dir),
+                discovery.node_uuid(),
+                trust.config.clone(),
+            )
+            .with_discovery(discovery.clone()),
+        );
+        let gateway_addr = SocketAddr::from(([0, 0, 0, 0], config.network.gateway_port));
+        let handle = spawn_gateway(gateway_addr, gateway_ctx);
+        info!(
+            "Mesh gateway listening on port {}",
+            config.network.gateway_port
+        );
+        Some(handle)
+    } else {
+        None
+    };
 
     // 5. Optional Model Launch
     if let Some(model_path) = args.model {

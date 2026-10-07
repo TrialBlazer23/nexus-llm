@@ -5,18 +5,13 @@
 **Baseline reviewed:** commit `213ee12` ("feat: Enhance chat functionality and markdown support")
 **Verification baseline at time of review:** `cargo test` — 73 tests passing across 7 suites; `cargo clippy --all-targets` — 19 lib warnings, 0 errors; no CI workflows present (`.github/` contains only `agents/*.md`).
 
-**Implementation status (2026-10-06):** Phase 7 mesh work is **shipped** on
-`cursor/phase7-control-plane-server-e680` (PR #9) + `cursor/phase7-mesh-remainder-7787`
-(PR #10). Phase 9 trust is **shipped** on `cursor/phase9-trust-4865` (Ed25519
-identity, signed control plane, TOFU pairing, registry verification at runtime).
-Historical findings below are preserved; status markers call out what is done vs
-still open. **Recommended next phase: Phase 10 (model store / LAN transfer) then
-Phase 11 (placement) on `cursor/phase11-placement-intelligence-d6cb`.** Phase 8 TUI is Done.
-Phase 11 placement intelligence is implemented on that branch (MemoryPlan, tensor
-GGUF parse, multi-worker ranking, supervisor harden); still needs live llama.cpp
-validation on target hardware.
-still open. **Phase 10 (model store / LAN transfer) is Done.** Recommended next:
-Phase 11 (placement intelligence). Phase 8 TUI is Done.
+**Implementation status (2026-10-07):** Phases 7–9 (mesh + trust), Phase 8 TUI,
+Phase 10 (model store), Phase 11 (placement), and Continuous (CI / Penryn /
+fake llama) are **Done** on `main`. **Phase 12 §5.1 mesh gateway MVP** ships on
+`cursor/phase12-mesh-gateway-5f3d` (`network.gateway_port` 8090,
+`src/gateway.rs`). Remaining Phase 12 items (§5.2–§5.6) and hub rebind collapse
+are follow-ons. Historical findings below are preserved; status markers call out
+what is done vs still open.
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -41,7 +36,7 @@ inert — are mechanically reproducible:
 | Human-readable node name (`name=` TXT + `PeerNode.display_name`) | **Done** | mDNS + UI `label()`; beacon still has no name field |
 | Zero-config host resolution (`find_best_host` fallback + hub discovery) | **Done** | `src/client.rs`, hub bootstrap in `src/main.rs` |
 | File logging + `nexus doctor` | **Done** | `src/logging.rs`, `src/doctor.rs` |
-| Settings displayed ⇒ consumed | **Done** for Settings UI | wired ram%/mmap/enable_rpc/prefer_adb/rpc binary/name; hid FallbackCpu; added control_port |
+| Settings displayed ⇒ consumed | **Done** for Settings UI | wired ram%/mmap/enable_rpc/prefer_adb/rpc binary/name; hid FallbackCpu; added control_port + gateway_port/enabled |
 | `GET /models` (filename catalog) | **Done** (restored on main merge) | `control_plane_server` GET `/nexus/control/v1/models` |
 | SSE `/events` | **Deferred** | later |
 | `POST /pair`, Ed25519, signed control plane | **Done** | `src/node_identity.rs`, `src/trust_auth.rs`, `src/control_plane*.rs` |
@@ -50,6 +45,8 @@ inert — are mechanically reproducible:
 | Model store / LAN transfer | **Open — Phase 10** (PR #13 draft) | §4 |
 | Placement intelligence | **Done on branch** — Phase 11 | `src/cluster/{memory,split,rank}.rs`, `gguf.rs`, `supervisor.rs` |
 | Model store / LAN transfer | **Done — Phase 10** | `src/store.rs`, blob routes, hardened `downloader.rs`, Models `[D]`/`[T]`/`[S]` |
+| Placement intelligence | **Done — Phase 11** | `src/cluster/{memory,split,rank}.rs` |
+| Mesh OpenAI gateway (`gateway_port` 8090) | **MVP Done — Phase 12 §5.1** | `src/gateway.rs`; hub/nexusd/host; Settings + doctor |
 
 ---
 
@@ -1023,6 +1020,15 @@ the program can do. Roughly ordered by value per unit of work.
 
 ### 5.1 A mesh gateway: one endpoint, any node, any client
 
+> **Status (2026-10-07): MVP Done on `cursor/phase12-mesh-gateway-5f3d`.**
+> Dedicated `network.gateway_port` (default 8090) + `gateway_enabled` serves
+> OpenAI `/health`, `/v1/models`, and byte-stream proxied `/v1/chat/completions`.
+> Resolves `model` → local supervisor/discovery `active_model` or trusted peer
+> holder; inbound `/v1` stays unauthenticated (LAN posture); pairing restricts
+> which peers are eligible. Hub/nexusd/host spawn the gateway; hub bootstrap
+> prefers `http://127.0.0.1:{gateway_port}`. Full chat-rebind collapse, auto-load
+> on miss, and §5.2–§5.6 remain follow-ons.
+
 Expose an OpenAI-compatible endpoint on every node that proxies to whichever node
 currently holds the requested model, resolving through the peer registry. Any
 OpenAI-compatible client — an editor extension, a phone app, a script, another
@@ -1256,17 +1262,26 @@ options with predicted tokens per second; a 32 GB worker can advertise more than
 
 ### Phase 12 — Capability expansion
 
-- Mesh gateway: one OpenAI-compatible endpoint fronting the whole mesh (§5.1)
-- Prompt cache reuse and session restore (§5.2, §2.8)
-- Speculative decoding with a draft model (§5.3)
-- Thermal, power, and battery-aware scheduling (§5.4)
-- `nexus bench` feeding the planner (§5.5)
-- Optional: embeddings and local retrieval (§5.6)
+> **Status (2026-10-07): §5.1 MVP in progress/shipped on
+> `cursor/phase12-mesh-gateway-5f3d`.** Mesh OpenAI gateway on `gateway_port`
+> 8090 (`src/gateway.rs`). Remaining backlog (§5.2–§5.6) and hub rebind
+> collapse are follow-on PRs. Out of scope for this track: beacon v2 `ctrl`/
+> display name, control-plane SSE `/events`, Tunnel hub tab, closing stale
+> draft PRs #9–#12.
+
+- ~~Mesh gateway: one OpenAI-compatible endpoint fronting the whole mesh (§5.1)~~
+  **MVP Done** (`gateway_port` 8090; fake-llama multi-holder CI coverage)
+- Prompt cache reuse and session restore (§5.2, §2.8) — follow-on
+- Speculative decoding with a draft model (§5.3) — follow-on
+- Thermal, power, and battery-aware scheduling (§5.4) — follow-on
+- `nexus bench` feeding the planner (§5.5) — follow-on
+- Optional: embeddings and local retrieval (§5.6) — follow-on
 
 *Invasiveness:* mostly additive, built on Phases 7–11.
 *Acceptance:* an unmodified OpenAI client reaches the active model through any
-node; a resumed session skips prompt reprocessing; a hot phone declines a load
-instead of thermally throttling mid-generation.
+node (**§5.1 MVP: covered by fake llama harness; live multi-node LAN soak
+remaining**); a resumed session skips prompt reprocessing; a hot phone declines
+a load instead of thermally throttling mid-generation.
 
 ### Continuous
 

@@ -8,6 +8,7 @@ use crate::config::NexusConfig;
 use crate::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
+use crate::gateway::{spawn as spawn_gateway, GatewayContext};
 use crate::node_identity::NodeIdentity;
 use crate::registry_runtime::spawn_registry_runtime;
 use crate::supervisor::SupervisorManager;
@@ -1408,6 +1409,28 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         hub.config.network.control_port
     );
 
+    let gateway_handle = if hub.config.network.gateway_enabled {
+        let gateway_addr = SocketAddr::from(([0, 0, 0, 0], hub.config.network.gateway_port));
+        let gateway_ctx = Arc::new(
+            GatewayContext::new(
+                hub.supervisor.clone(),
+                hub.config.network.api_port,
+                PathBuf::from(&hub.config.node.models_dir),
+                hub.discovery.node_uuid(),
+                hub.shared_config.clone(),
+            )
+            .with_discovery(hub.discovery.clone()),
+        );
+        let handle = spawn_gateway(gateway_addr, gateway_ctx);
+        info!(
+            "Hub mesh gateway listening on port {}",
+            hub.config.network.gateway_port
+        );
+        Some(handle)
+    } else {
+        None
+    };
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(32);
     let (evt_tx, mut evt_rx) = mpsc::channel::<HubEvent>(64);
     let worker_ctx = HubWorkerCtx {
@@ -2382,6 +2405,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
     terminal.show_cursor()?;
 
     control_handle.abort();
+    if let Some(handle) = gateway_handle {
+        handle.abort();
+    }
     worker.abort();
     if hub.supervisor.is_running().await {
         info!("Stopping active supervisor process on hub exit...");

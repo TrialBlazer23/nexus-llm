@@ -36,7 +36,10 @@ impl TunnelView {
             Ok(status) => {
                 self.status = Some(status);
                 self.status_message = Some((
-                    format!("Tunnels active: Forward {} -> {}, Reverse {} -> {}", self.api_port, self.api_port, self.rpc_port, self.rpc_port),
+                    format!(
+                        "Tunnels active: Forward {} -> {}, Reverse {} -> {}",
+                        self.api_port, self.api_port, self.rpc_port, self.rpc_port
+                    ),
                     Color::Green,
                 ));
             }
@@ -56,18 +59,24 @@ impl TunnelView {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),  // USB Status & Connected Devices
-                Constraint::Min(8),     // Active Port Mappings & Latency
-                Constraint::Length(4),  // Actions & Shortcuts
+                Constraint::Length(8), // USB Status & Connected Devices
+                Constraint::Min(8),    // Active Port Mappings & Latency
+                Constraint::Length(4), // Actions & Shortcuts
             ])
             .split(area);
 
         // 1. Device list / ADB status block
         let is_adb = AdbTunnelSupervisor::is_adb_available();
         let adb_status_span = if is_adb {
-            Span::styled("Available (android-tools-adb ready)", Style::default().fg(Color::Green))
+            Span::styled(
+                "Available (android-tools-adb ready)",
+                Style::default().fg(Color::Green),
+            )
         } else {
-            Span::styled("Not Found in PATH", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "Not Found in PATH",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
         };
 
         let mut device_lines = vec![
@@ -77,16 +86,33 @@ impl TunnelView {
             ]),
             Line::from(vec![
                 Span::styled(" USB Target Nodes: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(format!("{} device(s) connected", self.devices.len()), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{} device(s) connected", self.devices.len()),
+                    Style::default().fg(Color::White),
+                ),
             ]),
         ];
 
         for d in &self.devices {
-            let auth_str = if d.authorized { "Authorized" } else { "Unauthorized (Check Phone Prompt)" };
-            let auth_color = if d.authorized { Color::Green } else { Color::Yellow };
+            let auth_str = if d.authorized {
+                "Authorized"
+            } else {
+                "Unauthorized (Check Phone Prompt)"
+            };
+            let auth_color = if d.authorized {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
             device_lines.push(Line::from(vec![
-                Span::styled(format!("   - Serial: {:<16}", d.serial), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("Model: {:<18}", d.model.as_deref().unwrap_or("unknown")), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("   - Serial: {:<16}", d.serial),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("Model: {:<18}", d.model.as_deref().unwrap_or("unknown")),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled(format!("[{}]", auth_str), Style::default().fg(auth_color)),
             ]));
         }
@@ -100,14 +126,17 @@ impl TunnelView {
         frame.render_widget(dev_block, chunks[0]);
 
         // 2. Port Mappings & Tunnel Status block
-        let (api_fwd_str, api_color) = if self.status.as_ref().map_or(false, |s| s.api_forwarded) {
+        let (api_fwd_str, api_color) = if self.status.as_ref().is_some_and(|s| s.api_forwarded) {
             ("ACTIVE: 127.0.0.1:8080 -> Target Phone 8080", Color::Green)
         } else {
             ("INACTIVE (Press 'F' to activate)", Color::DarkGray)
         };
 
-        let (rpc_rev_str, rpc_color) = if self.status.as_ref().map_or(false, |s| s.rpc_reversed) {
-            ("ACTIVE: Target Phone 50052 -> 127.0.0.1:50052", Color::Green)
+        let (rpc_rev_str, rpc_color) = if self.status.as_ref().is_some_and(|s| s.rpc_reversed) {
+            (
+                "ACTIVE: Target Phone 50052 -> 127.0.0.1:50052",
+                Color::Green,
+            )
         } else {
             ("INACTIVE (Press 'F' to activate)", Color::DarkGray)
         };
@@ -142,9 +171,15 @@ impl TunnelView {
 
         // 3. Actions / Footer block
         let status_span = if let Some((msg, color)) = &self.status_message {
-            Span::styled(format!(" Status: {}", msg), Style::default().fg(*color).add_modifier(Modifier::BOLD))
+            Span::styled(
+                format!(" Status: {}", msg),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::styled(" [F] Setup All Tunnels  |  [T] Teardown Tunnels  |  [R] Rescan Devices", Style::default().fg(Color::White))
+            Span::styled(
+                " [F] Setup All Tunnels  |  [T] Teardown Tunnels  |  [R] Rescan Devices",
+                Style::default().fg(Color::White),
+            )
         };
 
         let footer_block = Paragraph::new(Line::from(vec![status_span])).block(

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::memory::{MemoryPlan, MemoryPolicy, Verdict};
 use super::split::{plan_tensor_byte_split, MultiWorkerSplit, SplitError};
-use super::{NodeBudget, ModelFit};
+use super::{ModelFit, NodeBudget};
 
 /// Cached link measurement for a peer.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,13 +126,11 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
 
     // --- Local GPU ---
     if req.local_gpu_layers > 0 {
-        let mem = MemoryPlan::from_gguf(
-            req.gguf,
-            &req.local_profile,
-            &req.policy,
-            offload_available,
-        );
-        if !matches!(mem.verdict, Verdict::Exceeds) || matches!(mem.verdict, Verdict::FitsWithOffload) {
+        let mem =
+            MemoryPlan::from_gguf(req.gguf, &req.local_profile, &req.policy, offload_available);
+        if !matches!(mem.verdict, Verdict::Exceeds)
+            || matches!(mem.verdict, Verdict::FitsWithOffload)
+        {
             // Pure local only if Fits or FitsIfQuantizedKv
             if matches!(mem.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv) {
                 let tok = predict_local_tok_s(
@@ -167,7 +165,12 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
         };
         let mem = MemoryPlan::from_gguf(req.gguf, &cpu_profile, &req.policy, offload_available);
         if matches!(mem.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv) {
-            let tok = predict_local_tok_s(cpu_profile.detected_backend, req.gguf.quant_label.as_deref(), 1.0, 0);
+            let tok = predict_local_tok_s(
+                cpu_profile.detected_backend,
+                req.gguf.quant_label.as_deref(),
+                1.0,
+                0,
+            );
             plans.push(ExecutionPlan {
                 target: PlanTarget::LocalCpu,
                 memory: mem,
@@ -192,7 +195,12 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
         );
         if matches!(mem.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv) {
             let mut notes = vec![format!("remote {}", c.name)];
-            let mut tok = predict_local_tok_s(c.backend, req.gguf.quant_label.as_deref(), 1.0, c.thermal_index);
+            let mut tok = predict_local_tok_s(
+                c.backend,
+                req.gguf.quant_label.as_deref(),
+                1.0,
+                c.thermal_index,
+            );
             if c.link.unknown {
                 tok *= 0.85;
                 notes.push("link quality unknown — demoted".into());
@@ -229,12 +237,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
             compute,
         ) {
             Ok(split) if split.is_distributed() => {
-                let mem = MemoryPlan::from_gguf(
-                    req.gguf,
-                    &req.local_profile,
-                    &req.policy,
-                    true,
-                );
+                let mem = MemoryPlan::from_gguf(req.gguf, &req.local_profile, &req.policy, true);
                 let host_frac = split.host_layers as f32 / split.total_layers.max(1) as f32;
                 let boundaries = split.remote_endpoints.len().max(1) as f32;
                 let embd = req.gguf.embedding_length.unwrap_or(4096) as f64;
@@ -378,7 +381,11 @@ pub fn classify_fit(required_mb: u64, host_cap_mb: u64, cluster_cap_mb: u64) -> 
 }
 
 /// Probe helper: time a fixed-size round-trip. Callers supply the bytes transferred.
-pub fn link_quality_from_timings(rtt: Duration, payload_bytes: u64, transfer: Duration) -> LinkQuality {
+pub fn link_quality_from_timings(
+    rtt: Duration,
+    payload_bytes: u64,
+    transfer: Duration,
+) -> LinkQuality {
     LinkQuality::from_probe(rtt, payload_bytes, transfer)
 }
 
@@ -454,7 +461,11 @@ mod tests {
     #[test]
     fn unknown_link_demotes_net_bound() {
         let unknown = LinkQuality::unknown();
-        let known = LinkQuality::from_probe(Duration::from_millis(5), 10_000_000, Duration::from_millis(10));
+        let known = LinkQuality::from_probe(
+            Duration::from_millis(5),
+            10_000_000,
+            Duration::from_millis(10),
+        );
         let u = network_bound_tok_s(&unknown, 8192.0, 1.0);
         let k = network_bound_tok_s(&known, 8192.0, 1.0);
         assert!(k > u);

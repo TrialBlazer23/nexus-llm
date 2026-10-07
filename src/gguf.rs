@@ -95,7 +95,10 @@ pub enum GgufValue {
     Int64(i64),
     Float64(f64),
     /// Array payload was seek-skipped (not materialized).
-    SkippedArray { elem_type: u32, len: u64 },
+    SkippedArray {
+        elem_type: u32,
+        len: u64,
+    },
 }
 
 impl GgufValue {
@@ -293,9 +296,9 @@ impl GgufMetadata {
                 )));
             }
             let mut dims = [0u64; 4];
-            for i in 0..n_dims as usize {
+            for dim in dims.iter_mut().take(n_dims as usize) {
                 read_exact_bounded(reader, &mut u64_buf)?;
-                dims[i] = u64::from_le_bytes(u64_buf);
+                *dim = u64::from_le_bytes(u64_buf);
             }
             read_exact_bounded(reader, &mut u32_buf)?;
             let ggml_type = u32::from_le_bytes(u32_buf);
@@ -383,12 +386,10 @@ impl GgufMetadata {
             self.head_count_kv,
             self.embedding_length,
         ) {
-            if head_count > 0 {
-                let head_dim = embd / head_count;
+            if let Some(head_dim) = embd.checked_div(head_count) {
                 let elems_per_token =
                     2.0 * (layers as f64) * (head_count_kv as f64) * (head_dim as f64);
-                let bytes =
-                    elems_per_token * dtype.bytes_per_elem() * (context_size as f64);
+                let bytes = elems_per_token * dtype.bytes_per_elem() * (context_size as f64);
                 return bytes.round() as u64;
             }
         }
@@ -461,12 +462,13 @@ fn fixed_value_size(value_type: u32) -> Option<u64> {
     match value_type {
         0 | 1 | 7 => Some(1),
         2 | 3 => Some(2),
-        4 | 5 | 6 => Some(4),
-        10 | 11 | 12 => Some(8),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
         _ => None,
     }
 }
 
+#[allow(clippy::only_used_in_recursion)] // remaining_hint reserved for nested array caps
 fn skip_value<R: Read + Seek>(
     reader: &mut R,
     value_type: u32,
@@ -709,7 +711,7 @@ pub fn tensor_nbytes(ggml_type: u32, dims: &[u64]) -> Result<u64, GgufError> {
         other => return Err(GgufError::UnsupportedTensorType(other)),
     };
 
-    if ne % block_size != 0 {
+    if !ne.is_multiple_of(block_size) {
         // Pad up to next block for sizing (GGUF tensors are block-aligned).
         let blocks = ne.div_ceil(block_size);
         return Ok(blocks.saturating_mul(type_size));

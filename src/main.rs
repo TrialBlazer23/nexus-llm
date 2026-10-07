@@ -5,13 +5,13 @@ use nexus::config::NexusConfig;
 use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{DiscoveryService, NodeRole};
-use nexus::registry_runtime::spawn_registry_runtime;
-use nexus::trust_auth::TrustBootstrap;
 use nexus::downloader::ModelDownloader;
 use nexus::gguf::GgufMetadata;
 use nexus::preset::Preset;
-use nexus::sysinfo::SystemProfile;
+use nexus::registry_runtime::spawn_registry_runtime;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
+use nexus::sysinfo::SystemProfile;
+use nexus::trust_auth::TrustBootstrap;
 use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
 use nexus::ui::chat::{run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
@@ -224,31 +224,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discovery.send_probe().await;
 
             // Order: default_host → PreferAdbTunnel USB → discovery → localhost
-            let host = if let Some(dh) = &trust.config.read().unwrap().network.default_host {
-                dh.clone()
-            } else {
+            // Clone host-resolution inputs under the lock, then await without holding it.
+            let (default_host, prefer_adb, api_port, rpc_port) = {
                 let cfg = trust.config.read().unwrap();
-                let usb_ep = if cfg.cluster.prefer_adb_tunnel {
+                (
+                    cfg.network.default_host.clone(),
+                    cfg.cluster.prefer_adb_tunnel,
+                    cfg.network.api_port,
+                    cfg.cluster.rpc_port,
+                )
+            };
+            let host = if let Some(dh) = default_host {
+                dh
+            } else {
+                let usb_ep = if prefer_adb {
                     AdbTunnelSupervisor::resolve_transport_endpoint(
                         TransportMode::Auto,
-                        cfg.network.api_port,
-                        cfg.cluster.rpc_port,
+                        api_port,
+                        rpc_port,
                     )
                     .0
                 } else {
                     None
                 };
-                drop(cfg);
                 if let Some(usb) = usb_ep {
                     usb
                 } else {
-                    match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3)).await
+                    match NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(3))
+                        .await
                     {
                         Ok(client) => client.endpoint().to_string(),
-                        Err(_) => {
-                            let port = trust.config.read().unwrap().network.api_port;
-                            format!("http://127.0.0.1:{port}")
-                        }
+                        Err(_) => format!("http://127.0.0.1:{api_port}"),
                     }
                 }
             };
@@ -295,7 +301,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Paired with node {} ({})", resp.node_id, host);
         }
 
-        Commands::Host { model, host, port, ctx, binary } => {
+        Commands::Host {
+            model,
+            host,
+            port,
+            ctx,
+            binary,
+        } => {
             let config = NexusConfig::load()?;
             let trust = TrustBootstrap::load(config.clone())?;
             let profile = SystemProfile::probe();
@@ -327,12 +339,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trust.config.clone(),
                     trust.config_path.clone(),
                 )
-        .with_discovery(discovery.clone())
-        .with_capabilities(vec!["inference".to_string(), "host".to_string()])
-        .with_memory_policy(
-            config.hardware.safety.mmap,
-            config.hardware.safety.max_ram_usage_percent,
-        ),
+                .with_discovery(discovery.clone())
+                .with_capabilities(vec!["inference".to_string(), "host".to_string()])
+                .with_memory_policy(
+                    config.hardware.safety.mmap,
+                    config.hardware.safety.max_ram_usage_percent,
+                ),
             );
             let control_handle = spawn_control_plane(
                 SocketAddr::from(([0, 0, 0, 0], config.network.control_port)),
@@ -390,7 +402,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Available Memory:      {} MB", profile.available_ram_mb);
             println!("LMK Safety Cap (75%):  {} MB", max_allowed_mb);
             println!("Acceleration Backend:  {}", profile.detected_backend);
-            println!("Vulkan Runtime:        {}", if SystemProfile::probe_vulkan() { "Detected" } else { "Not Found" });
+            println!(
+                "Vulkan Runtime:        {}",
+                if SystemProfile::probe_vulkan() {
+                    "Detected"
+                } else {
+                    "Not Found"
+                }
+            );
             println!("Recommended Threads:   {}", profile.recommended_threads);
         }
 
@@ -415,10 +434,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if profile.can_safely_load(file_size_bytes, ctx) {
                 let headroom = max_allowed_mb.saturating_sub(total_required_mb);
-                println!("Result:                PASSED [OK] (Headroom: {} MB)", headroom);
+                println!(
+                    "Result:                PASSED [OK] (Headroom: {} MB)",
+                    headroom
+                );
             } else {
                 let deficit = total_required_mb.saturating_sub(max_allowed_mb);
-                eprintln!("Result:                REJECTED [FAIL] (Exceeds ceiling by {} MB)", deficit);
+                eprintln!(
+                    "Result:                REJECTED [FAIL] (Exceeds ceiling by {} MB)",
+                    deficit
+                );
                 std::process::exit(1);
             }
         }
@@ -435,22 +460,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Format Version:        GGUF v{}", gguf.version);
             println!("Tensor Count:          {}", gguf.tensor_count);
             println!("Metadata KV Pairs:     {}", gguf.kv_count);
-            println!("Architecture:          {}", gguf.architecture.as_deref().unwrap_or("unknown"));
-            println!("Model Name:            {}", gguf.model_name.as_deref().unwrap_or("unnamed"));
-            println!("Max Context Length:    {}", gguf.context_length.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string()));
-            println!("Transformer Layers:    {}", gguf.block_count.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string()));
-            println!("Attention Heads:       {}", gguf.head_count.map(|h| h.to_string()).unwrap_or_else(|| "unknown".to_string()));
-            println!("KV Attention Heads:    {}", gguf.head_count_kv.map(|h| h.to_string()).unwrap_or_else(|| "unknown".to_string()));
-            println!("Embedding Length:      {}", gguf.embedding_length.map(|e| e.to_string()).unwrap_or_else(|| "unknown".to_string()));
+            println!(
+                "Architecture:          {}",
+                gguf.architecture.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "Model Name:            {}",
+                gguf.model_name.as_deref().unwrap_or("unnamed")
+            );
+            println!(
+                "Max Context Length:    {}",
+                gguf.context_length
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "Transformer Layers:    {}",
+                gguf.block_count
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "Attention Heads:       {}",
+                gguf.head_count
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "KV Attention Heads:    {}",
+                gguf.head_count_kv
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+            println!(
+                "Embedding Length:      {}",
+                gguf.embedding_length
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
             println!("Model File Size:       {} MB", file_mb);
             println!("Exact KV Cache ({} t): {} MB", ctx, exact_kv_mb);
 
             let profile = SystemProfile::probe();
             let safe = profile.can_safely_load_gguf(&gguf, ctx);
-            println!("Android LMK Guard:     {}", if safe { "PASSED [OK]" } else { "BLOCKED [INSUFFICIENT RAM]" });
+            println!(
+                "Android LMK Guard:     {}",
+                if safe {
+                    "PASSED [OK]"
+                } else {
+                    "BLOCKED [INSUFFICIENT RAM]"
+                }
+            );
         }
 
-        Commands::Download { url, output, sha256 } => {
+        Commands::Download {
+            url,
+            output,
+            sha256,
+        } => {
             println!("=== Resumable Model Downloader ===");
             println!("Source URL:            {}", url);
             println!("Destination Path:      {:?}", output);
@@ -459,17 +526,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let downloader = ModelDownloader::new();
-            downloader.download(&url, &output, sha256.as_deref(), |prog| {
-                let speed_mb = prog.speed_bytes_per_sec / (1024.0 * 1024.0);
-                let down_mb = prog.downloaded_bytes / (1024 * 1024);
-                if let Some(pct) = prog.percent {
-                    let total_mb = prog.total_bytes.unwrap_or(0) / (1024 * 1024);
-                    print!("\rDownloading: {:.1}% ({}/{} MB) - {:.2} MB/s   ", pct, down_mb, total_mb, speed_mb);
-                } else {
-                    print!("\rDownloading: {} MB - {:.2} MB/s   ", down_mb, speed_mb);
-                }
-                let _ = std::io::stdout().flush();
-            }).await?;
+            downloader
+                .download(&url, &output, sha256.as_deref(), |prog| {
+                    let speed_mb = prog.speed_bytes_per_sec / (1024.0 * 1024.0);
+                    let down_mb = prog.downloaded_bytes / (1024 * 1024);
+                    if let Some(pct) = prog.percent {
+                        let total_mb = prog.total_bytes.unwrap_or(0) / (1024 * 1024);
+                        print!(
+                            "\rDownloading: {:.1}% ({}/{} MB) - {:.2} MB/s   ",
+                            pct, down_mb, total_mb, speed_mb
+                        );
+                    } else {
+                        print!("\rDownloading: {} MB - {:.2} MB/s   ", down_mb, speed_mb);
+                    }
+                    let _ = std::io::stdout().flush();
+                })
+                .await?;
 
             println!("\nDownload finished.");
         }
@@ -490,7 +562,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _mdns = discovery.clone().start_mdns();
             discovery.send_probe().await;
 
-            println!("Listening for discovery beacons on UDP 9999 & mDNS for {}s...", timeout);
+            println!(
+                "Listening for discovery beacons on UDP 9999 & mDNS for {}s...",
+                timeout
+            );
             tokio::time::sleep(Duration::from_secs(timeout)).await;
 
             let peers = discovery.get_active_peers().await;
@@ -498,7 +573,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("No active cluster nodes discovered.");
             } else {
                 println!("\nDiscovered Cluster Nodes ({}):", peers.len());
-                println!("{:<38} {:<22} {:<10} {:<10} {:<10}", "Node UUID", "Endpoint", "Role", "Free RAM", "Backend");
+                println!(
+                    "{:<38} {:<22} {:<10} {:<10} {:<10}",
+                    "Node UUID", "Endpoint", "Role", "Free RAM", "Backend"
+                );
                 println!("{}", "-".repeat(95));
                 for p in peers {
                     let role = if p.role.is_host() { "Host" } else { "Client" };
@@ -533,10 +611,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("No .gguf models found in {:?}", models_dir);
             } else {
                 println!("\nDiscovered Local Models ({}):", models.len());
-                println!("{:<30} {:<12} {:<10} {:<8} {:<12} {:<10}", "Filename", "Size", "Arch", "Context", "KV (4k)", "LMK Guard");
+                println!(
+                    "{:<30} {:<12} {:<10} {:<8} {:<12} {:<10}",
+                    "Filename", "Size", "Arch", "Context", "KV (4k)", "LMK Guard"
+                );
                 println!("{}", "-".repeat(88));
                 for m in models {
-                    let lmk_status = if m.lmk_compatible { "Compatible" } else { "Exceeds RAM" };
+                    let lmk_status = if m.lmk_compatible {
+                        "Compatible"
+                    } else {
+                        "Exceeds RAM"
+                    };
                     println!(
                         "{:<30} {:<12} {:<10} {:<8} {:<12} {:<10}",
                         m.filename,
@@ -560,7 +645,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mem, safe
                 );
             }
-            println!("Binding rpc-server on port {} with max memory {} MB...", port, mem);
+            println!(
+                "Binding rpc-server on port {} with max memory {} MB...",
+                port, mem
+            );
 
             let mut config = NexusConfig::load().unwrap_or_default();
             config.node.role = "client".to_string();
@@ -568,7 +656,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let api_host = config.network.api_host.clone();
             let api_port = config.network.api_port;
             let llama_binary = PathBuf::from(&config.node.llama_server_binary);
-            let rpc_binary = binary.unwrap_or_else(|| PathBuf::from(&config.node.rpc_server_binary));
+            let rpc_binary =
+                binary.unwrap_or_else(|| PathBuf::from(&config.node.rpc_server_binary));
             let use_mmap = config.hardware.safety.mmap;
             let memory_budget_percent = config.hardware.safety.max_ram_usage_percent;
 
@@ -608,10 +697,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_capabilities(vec!["rpc".to_string(), "worker".to_string()])
                 .with_memory_policy(use_mmap, memory_budget_percent),
             );
-            let control_handle = spawn_control_plane(
-                SocketAddr::from(([0, 0, 0, 0], control_port)),
-                control_ctx,
-            );
+            let control_handle =
+                spawn_control_plane(SocketAddr::from(([0, 0, 0, 0], control_port)), control_ctx);
             println!(
                 "Broadcasting RPC worker beacon on UDP 9999 (Port: {}, Status: RPC_READY)",
                 port
@@ -619,7 +706,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Control-plane listening on port {}", control_port);
 
             let child = tokio::process::Command::new(&rpc_binary)
-                .args(["-H", "0.0.0.0", "-p", &port.to_string(), "-m", &mem.to_string()])
+                .args([
+                    "-H",
+                    "0.0.0.0",
+                    "-p",
+                    &port.to_string(),
+                    "-m",
+                    &mem.to_string(),
+                ])
                 .spawn();
 
             match child {
@@ -647,17 +741,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Tunnel { action, api_port, rpc_port } => {
+        Commands::Tunnel {
+            action,
+            api_port,
+            rpc_port,
+        } => {
             println!("=== ADB USB Tunnel Supervisor ===");
             match action.to_lowercase().as_str() {
                 "setup" | "start" => {
                     match AdbTunnelSupervisor::setup_tunnel(api_port, rpc_port, None) {
                         Ok(status) => {
                             println!("ADB Tunnel established successfully!");
-                            println!("  API Forward:  127.0.0.1:{} -> Device:{}", status.api_port, status.api_port);
-                            println!("  RPC Reverse:  Device:{} -> 127.0.0.1:{}", status.rpc_port, status.rpc_port);
+                            println!(
+                                "  API Forward:  127.0.0.1:{} -> Device:{}",
+                                status.api_port, status.api_port
+                            );
+                            println!(
+                                "  RPC Reverse:  Device:{} -> 127.0.0.1:{}",
+                                status.rpc_port, status.rpc_port
+                            );
                             if let Some(dev) = status.device {
-                                println!("  Device:       {} ({:?})", dev.serial, dev.model.unwrap_or_default());
+                                println!(
+                                    "  Device:       {} ({:?})",
+                                    dev.serial,
+                                    dev.model.unwrap_or_default()
+                                );
                             }
                         }
                         Err(e) => eprintln!("Tunnel setup failed: {}", e),
@@ -676,7 +784,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(devices) => {
                                 println!("Connected USB Devices ({}):", devices.len());
                                 for d in devices {
-                                    println!("  - Serial: {}, State: {}, Model: {:?}", d.serial, if d.authorized { "Authorized" } else { "Unauthorized" }, d.model);
+                                    println!(
+                                        "  - Serial: {}, State: {}, Model: {:?}",
+                                        d.serial,
+                                        if d.authorized {
+                                            "Authorized"
+                                        } else {
+                                            "Unauthorized"
+                                        },
+                                        d.model
+                                    );
                                 }
                             }
                             Err(e) => eprintln!("Failed to list devices: {}", e),
@@ -686,9 +803,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Client { host, node, transport, prompt, model, preset } => {
+        Commands::Client {
+            host,
+            node,
+            transport,
+            prompt,
+            model,
+            preset,
+        } => {
             let config = NexusConfig::load()?;
-            let trans_mode = transport.parse::<TransportMode>().unwrap_or(TransportMode::Auto);
+            let trans_mode = transport
+                .parse::<TransportMode>()
+                .unwrap_or(TransportMode::Auto);
 
             let (usb_endpoint, is_usb) = if host.is_none() && config.cluster.prefer_adb_tunnel {
                 AdbTunnelSupervisor::resolve_transport_endpoint(
@@ -700,7 +826,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (None, false)
             };
 
-            let client = match host.or(config.network.default_host.clone()).or(usb_endpoint) {
+            let client = match host
+                .or(config.network.default_host.clone())
+                .or(usb_endpoint)
+            {
                 Some(h) => {
                     if is_usb {
                         println!("Connected via low-latency USB Cable (ADB Tunnel localhost:8080)");
@@ -720,9 +849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .get_active_peers()
                             .await
                             .into_iter()
-                            .find(|peer| {
-                                peer.uuid.to_string().to_lowercase() == selector
-                            })
+                            .find(|peer| peer.uuid.to_string().to_lowercase() == selector)
                             .ok_or_else(|| {
                                 std::io::Error::new(
                                     std::io::ErrorKind::NotFound,
@@ -731,7 +858,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })?;
                         NexusClient::new(peer.api_endpoint())
                     } else {
-                        NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10)).await?
+                        NexusClient::resolve_from_discovery(&discovery, Duration::from_secs(10))
+                            .await?
                     }
                 }
             };

@@ -36,7 +36,10 @@ impl std::str::FromStr for TransportMode {
             "auto" => Ok(Self::Auto),
             "usb" | "adb" => Ok(Self::Usb),
             "wifi" | "network" => Ok(Self::Wifi),
-            other => Err(format!("Unknown transport mode '{}'. Valid: auto, usb, wifi", other)),
+            other => Err(format!(
+                "Unknown transport mode '{}'. Valid: auto, usb, wifi",
+                other
+            )),
         }
     }
 }
@@ -87,7 +90,9 @@ impl AdbTunnelSupervisor {
     pub fn list_devices() -> Result<Vec<AdbDeviceInfo>, TunnelError> {
         let output = match Command::new("adb").arg("devices").arg("-l").output() {
             Ok(o) => o,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(TunnelError::AdbNotFound),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TunnelError::AdbNotFound)
+            }
             Err(e) => return Err(TunnelError::Io(e)),
         };
 
@@ -157,21 +162,33 @@ impl AdbTunnelSupervisor {
         // 1. Forward API port: adb -s <serial> forward tcp:<port> tcp:<port>
         let forward_arg = format!("tcp:{}", api_port);
         let mut fwd_cmd = Command::new("adb");
-        fwd_cmd.args(serial_args).args(["forward", &forward_arg, &forward_arg]);
+        fwd_cmd
+            .args(serial_args)
+            .args(["forward", &forward_arg, &forward_arg]);
         let fwd_out = fwd_cmd.output().map_err(TunnelError::Io)?;
         let api_forwarded = fwd_out.status.success();
         if !api_forwarded {
-            warn!("Failed to forward ADB port {}: {}", api_port, String::from_utf8_lossy(&fwd_out.stderr));
+            warn!(
+                "Failed to forward ADB port {}: {}",
+                api_port,
+                String::from_utf8_lossy(&fwd_out.stderr)
+            );
         }
 
         // 2. Reverse RPC port: adb -s <serial> reverse tcp:<port> tcp:<port>
         let reverse_arg = format!("tcp:{}", rpc_port);
         let mut rev_cmd = Command::new("adb");
-        rev_cmd.args(serial_args).args(["reverse", &reverse_arg, &reverse_arg]);
+        rev_cmd
+            .args(serial_args)
+            .args(["reverse", &reverse_arg, &reverse_arg]);
         let rev_out = rev_cmd.output().map_err(TunnelError::Io)?;
         let rpc_reversed = rev_out.status.success();
         if !rpc_reversed {
-            warn!("Failed to reverse ADB port {}: {}", rpc_port, String::from_utf8_lossy(&rev_out.stderr));
+            warn!(
+                "Failed to reverse ADB port {}: {}",
+                rpc_port,
+                String::from_utf8_lossy(&rev_out.stderr)
+            );
         }
 
         info!(
@@ -208,10 +225,14 @@ impl AdbTunnelSupervisor {
     /// Teardown ADB port forwarding and reverse tunnels.
     pub fn teardown_tunnel(api_port: u16, rpc_port: u16) -> Result<(), TunnelError> {
         let forward_arg = format!("tcp:{}", api_port);
-        let _ = Command::new("adb").args(["forward", "--remove", &forward_arg]).output();
+        let _ = Command::new("adb")
+            .args(["forward", "--remove", &forward_arg])
+            .output();
 
         let reverse_arg = format!("tcp:{}", rpc_port);
-        let _ = Command::new("adb").args(["reverse", "--remove", &reverse_arg]).output();
+        let _ = Command::new("adb")
+            .args(["reverse", "--remove", &reverse_arg])
+            .output();
 
         debug!("ADB tunnels removed for ports {}, {}", api_port, rpc_port);
         Ok(())
@@ -228,7 +249,9 @@ impl AdbTunnelSupervisor {
         match mode {
             TransportMode::Wifi => (None, false),
             TransportMode::Usb => match Self::setup_tunnel(api_port, rpc_port, None) {
-                Ok(status) if status.is_active => (Some(format!("http://127.0.0.1:{}", api_port)), true),
+                Ok(status) if status.is_active => {
+                    (Some(format!("http://127.0.0.1:{}", api_port)), true)
+                }
                 _ => (None, false),
             },
             TransportMode::Auto => {

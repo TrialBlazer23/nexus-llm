@@ -302,7 +302,11 @@ impl ProcessSupervisor {
                     match vulkan_result {
                         Ok(()) => {
                             info!("Vulkan acceleration successfully initialized.");
-                            Self::spawn_drain_tasks(stdout_reader, stderr_reader, stderr_history.clone());
+                            Self::spawn_drain_tasks(
+                                stdout_reader,
+                                stderr_reader,
+                                stderr_history.clone(),
+                            );
                             let (state_tx, _) = watch::channel(SupervisorState::Starting);
                             let mut supervisor = Self {
                                 child: Some(child),
@@ -767,10 +771,7 @@ impl SupervisorManager {
             .vulkan_fail_count
             .load(std::sync::atomic::Ordering::Relaxed);
         if vulkan_fails >= self.policy.demote_gpu_after_n_vulkan_fails {
-            warn!(
-                "Demoting to CPU after {} Vulkan failures",
-                vulkan_fails
-            );
+            warn!("Demoting to CPU after {} Vulkan failures", vulkan_fails);
             config.gpu_layers = 0;
         }
 

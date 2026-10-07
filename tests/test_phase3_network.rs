@@ -1,4 +1,4 @@
- use nexus::config::NexusConfig;
+use nexus::config::NexusConfig;
 use nexus::control_plane::{validate_state, ControlPlaneState, CONTROL_PLANE_VERSION};
 use nexus::discovery::{
     DiscoveryEvent, DiscoveryService, NodeRole, RpcSelectionPolicy, ServiceEndpoint, StatusFlags,
@@ -206,7 +206,7 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             role: NodeRole::HOST,
             status: StatusFlags::READY,
             api_port: 8080,
-        control_port: 9998,
+            control_port: 9998,
             rpc_port: 0,
             total_ram_mb: 16000,
             free_ram_mb: 12000,
@@ -242,7 +242,8 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
 
     // Serialize and deserialize round-trip
     let json = serde_json::to_string(&load_req).expect("Serialization failed");
-    let deserialized: ModelLoadRequest = serde_json::from_str(&json).expect("Deserialization failed");
+    let deserialized: ModelLoadRequest =
+        serde_json::from_str(&json).expect("Deserialization failed");
     assert_eq!(load_req, deserialized);
 
     // Test server handler with SupervisorManager (expect model not found error for non-existent model)

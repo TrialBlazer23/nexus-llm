@@ -105,7 +105,7 @@ fn test_gguf_corruption_rejection() {
 
     // 2. Corrupt version
     bytes[0] = 0x47; // Restore magic
-    bytes[4] = 99;   // Version 99
+    bytes[4] = 99; // Version 99
     let mut cursor = Cursor::new(bytes);
     match GgufMetadata::read(&mut cursor) {
         Err(GgufError::UnsupportedVersion(99)) => (),
@@ -127,7 +127,8 @@ fn test_preset_loading_from_file() {
     assert_eq!(coder.top_p, 0.95);
     assert!(coder.system_prompt.contains("systems programmer"));
 
-    let general = Preset::load_from_file("presets/general.yaml").expect("Failed to load general.yaml");
+    let general =
+        Preset::load_from_file("presets/general.yaml").expect("Failed to load general.yaml");
     assert_eq!(general.name, "general");
     assert_eq!(general.template, ChatTemplate::Llama3);
     assert_eq!(general.temperature, 0.7);
@@ -159,21 +160,21 @@ fn test_preset_chatml_formatting() {
 
     assert!(formatted.contains("<|im_start|>system\nYou are an expert systems programmer"));
     assert!(formatted.contains("<|im_start|>user\nHow do I avoid AVX on Core 2 Duo?<|im_end|>"));
-    assert!(formatted.contains("<|im_start|>assistant\nTarget SSE4.1 and disable AVX in rustflags.<|im_end|>"));
+    assert!(formatted
+        .contains("<|im_start|>assistant\nTarget SSE4.1 and disable AVX in rustflags.<|im_end|>"));
     assert!(formatted.ends_with("<|im_start|>assistant\n"));
 }
 
 #[test]
 fn test_preset_llama3_formatting() {
     let preset = Preset::general();
-    let messages = vec![
-        ChatMessage::user("What is Nexus-LLM?"),
-    ];
+    let messages = vec![ChatMessage::user("What is Nexus-LLM?")];
 
     let formatted = preset.format_prompt(&messages);
 
     assert!(formatted.contains("<|start_header_id|>system<|end_header_id|>\n\nYou are Nexus"));
-    assert!(formatted.contains("<|start_header_id|>user<|end_header_id|>\n\nWhat is Nexus-LLM?<|eot_id|>"));
+    assert!(formatted
+        .contains("<|start_header_id|>user<|end_header_id|>\n\nWhat is Nexus-LLM?<|eot_id|>"));
     assert!(formatted.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
 }
 
@@ -181,7 +182,8 @@ fn test_preset_llama3_formatting() {
 fn test_downloader_sha256_calculation() {
     let mut temp = NamedTempFile::new().expect("Failed to create tempfile");
     let content = b"Nexus-LLM SHA-256 validation test content";
-    temp.write_all(content).expect("Failed to write test content");
+    temp.write_all(content)
+        .expect("Failed to write test content");
 
     let hash = ModelDownloader::calculate_sha256(temp.path()).expect("Failed to compute SHA-256");
 

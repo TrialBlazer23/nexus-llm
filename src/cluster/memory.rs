@@ -92,10 +92,15 @@ impl MemoryPlan {
         policy: &MemoryPolicy,
         cluster_offload_available: bool,
     ) -> Self {
-        let budget_mb = profile
-            .max_allowed_memory_bytes_pct(policy.max_ram_usage_percent)
-            / (1024 * 1024);
-        Self::from_gguf_budget(gguf, budget_mb, profile.detected_backend, policy, cluster_offload_available)
+        let budget_mb =
+            profile.max_allowed_memory_bytes_pct(policy.max_ram_usage_percent) / (1024 * 1024);
+        Self::from_gguf_budget(
+            gguf,
+            budget_mb,
+            profile.detected_backend,
+            policy,
+            cluster_offload_available,
+        )
     }
 
     /// Build a plan against an explicit budget (MB).
@@ -338,10 +343,12 @@ mod tests {
             detected_backend: AccelerationBackend::X86Baseline,
             recommended_threads: 2,
         };
-        let mut policy = MemoryPolicy::default();
-        policy.context_size = 4096;
-        policy.mmap = true;
-        policy.max_ram_usage_percent = 50;
+        let mut policy = MemoryPolicy {
+            context_size: 4096,
+            mmap: true,
+            max_ram_usage_percent: 50,
+            ..Default::default()
+        };
         let p50 = MemoryPlan::from_gguf(&gguf, &profile, &policy, false);
         policy.max_ram_usage_percent = 90;
         let p90 = MemoryPlan::from_gguf(&gguf, &profile, &policy, false);

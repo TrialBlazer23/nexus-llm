@@ -123,7 +123,7 @@ pub fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .iter()
         .map(|line| {
             let lw = line.width().max(1);
-            (lw + w - 1) / w
+            lw.div_ceil(w)
         })
         .sum()
 }
@@ -175,7 +175,11 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
-    pub fn new(client: NexusClient, model_name: impl Into<String>, system_prompt: Option<String>) -> Self {
+    pub fn new(
+        client: NexusClient,
+        model_name: impl Into<String>,
+        system_prompt: Option<String>,
+    ) -> Self {
         let model_str = model_name.into();
         let session_logger = SessionLogger::new(&model_str, client.endpoint());
 
@@ -272,7 +276,8 @@ impl ChatApp {
         }
         if self.is_streaming {
             if !self.streaming_response.is_empty() {
-                self.streaming_response.push_str("\n\n*[Generation stopped by operator]*");
+                self.streaming_response
+                    .push_str("\n\n*[Generation stopped by operator]*");
             }
             self.finalize_stream();
             self.status_message = Some("Generation stopped by operator".to_string());
@@ -318,7 +323,10 @@ impl ChatApp {
                 if parts.len() < 2 {
                     self.status_message = Some(format!(
                         "Active preset: {}. Available: {}",
-                        self.active_preset.as_ref().map(|p| p.name.as_str()).unwrap_or("none"),
+                        self.active_preset
+                            .as_ref()
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("none"),
                         self.preset_candidates.join(", ")
                     ));
                 } else {
@@ -336,12 +344,15 @@ impl ChatApp {
                 if let Some(val_str) = parts.get(1) {
                     if let Ok(val) = val_str.parse::<f32>() {
                         self.temperature = val.clamp(0.0, 2.0);
-                        self.status_message = Some(format!("Temperature set to {:.2}", self.temperature));
+                        self.status_message =
+                            Some(format!("Temperature set to {:.2}", self.temperature));
                     } else {
-                        self.status_message = Some("Invalid float for /temp (e.g. /temp 0.7)".to_string());
+                        self.status_message =
+                            Some("Invalid float for /temp (e.g. /temp 0.7)".to_string());
                     }
                 } else {
-                    self.status_message = Some(format!("Current temperature: {:.2}", self.temperature));
+                    self.status_message =
+                        Some(format!("Current temperature: {:.2}", self.temperature));
                 }
             }
 
@@ -351,7 +362,8 @@ impl ChatApp {
                         self.top_p = val.clamp(0.0, 1.0);
                         self.status_message = Some(format!("Top-p set to {:.2}", self.top_p));
                     } else {
-                        self.status_message = Some("Invalid float for /top_p (e.g. /top_p 0.9)".to_string());
+                        self.status_message =
+                            Some("Invalid float for /top_p (e.g. /top_p 0.9)".to_string());
                     }
                 } else {
                     self.status_message = Some(format!("Current top_p: {:.2}", self.top_p));
@@ -362,9 +374,12 @@ impl ChatApp {
                 if let Some(val_str) = parts.get(1) {
                     if let Ok(val) = val_str.parse::<usize>() {
                         self.max_tokens = val;
-                        self.status_message = Some(format!("Max tokens set to {}", self.max_tokens));
+                        self.status_message =
+                            Some(format!("Max tokens set to {}", self.max_tokens));
                     } else {
-                        self.status_message = Some("Invalid number for /max_tokens (e.g. /max_tokens 2048)".to_string());
+                        self.status_message = Some(
+                            "Invalid number for /max_tokens (e.g. /max_tokens 2048)".to_string(),
+                        );
                     }
                 } else {
                     self.status_message = Some(format!("Current max_tokens: {}", self.max_tokens));
@@ -387,11 +402,8 @@ impl ChatApp {
             "/export" => {
                 let default_name = format!("chats/export-{}.md", chrono_placeholder());
                 let path = parts.get(1).copied().unwrap_or(&default_name);
-                let export_msgs: Vec<ChatMessage> = self
-                    .messages
-                    .iter()
-                    .map(|e| e.message.clone())
-                    .collect();
+                let export_msgs: Vec<ChatMessage> =
+                    self.messages.iter().map(|e| e.message.clone()).collect();
                 match SessionLogger::export_to_markdown(
                     &export_msgs,
                     &self.model_name,
@@ -441,7 +453,9 @@ impl ChatApp {
             lines.push(Line::from(vec![
                 Span::styled(
                     " [System] ",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(sys.clone(), Style::default().fg(Color::DarkGray)),
             ]));
@@ -495,7 +509,9 @@ impl ChatApp {
             lines.push(Line::from(vec![
                 Span::styled(
                     " [Nexus] ",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("(generating...)", Style::default().fg(Color::Yellow)),
             ]));
@@ -635,7 +651,11 @@ impl ChatApp {
     }
 
     /// Handle key event for input buffering, scrolling, or dispatching streaming requests.
-    pub fn handle_key_input(&mut self, key: crossterm::event::KeyEvent, tx: &mpsc::Sender<StreamMsg>) {
+    pub fn handle_key_input(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        tx: &mpsc::Sender<StreamMsg>,
+    ) {
         // Preset modal interaction
         if self.show_preset_modal {
             match key.code {
@@ -655,7 +675,11 @@ impl ChatApp {
                     return;
                 }
                 KeyCode::Enter => {
-                    if let Some(target) = self.preset_candidates.get(self.selected_preset_idx).cloned() {
+                    if let Some(target) = self
+                        .preset_candidates
+                        .get(self.selected_preset_idx)
+                        .cloned()
+                    {
                         let _ = self.load_preset_by_name(&target);
                     }
                     self.show_preset_modal = false;
@@ -670,7 +694,8 @@ impl ChatApp {
         }
 
         // Preset Modal hotkey: Alt+P or F5
-        if (key.modifiers.contains(KeyModifiers::ALT) && (key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P')))
+        if (key.modifiers.contains(KeyModifiers::ALT)
+            && (key.code == KeyCode::Char('p') || key.code == KeyCode::Char('P')))
             || key.code == KeyCode::F(5)
         {
             self.refresh_preset_candidates();
@@ -724,7 +749,11 @@ impl ChatApp {
             }
             KeyCode::Up => {
                 let max = self.total_lines();
-                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                let current = if self.auto_scroll {
+                    max
+                } else {
+                    self.scroll_offset
+                };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(1);
             }
@@ -736,7 +765,11 @@ impl ChatApp {
             }
             KeyCode::PageUp => {
                 let max = self.total_lines();
-                let current = if self.auto_scroll { max } else { self.scroll_offset };
+                let current = if self.auto_scroll {
+                    max
+                } else {
+                    self.scroll_offset
+                };
                 self.auto_scroll = false;
                 self.scroll_offset = current.saturating_sub(10);
             }
@@ -745,7 +778,9 @@ impl ChatApp {
             }
             KeyCode::Enter => {
                 // Multi-line continuation with Shift or Alt, or trailing '\'
-                if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
                     let mut chars: Vec<char> = self.input_buffer.chars().collect();
                     chars.insert(self.cursor_idx, '\n');
                     self.input_buffer = chars.into_iter().collect();
@@ -877,9 +912,12 @@ impl ChatApp {
             stream_info
         );
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]))
+        let header = Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -926,12 +964,14 @@ impl ChatApp {
                 width: 1,
                 height: area.height.saturating_sub(2),
             };
-            let mut state = ratatui::widgets::ScrollbarState::new(max_scroll.max(1))
-                .position(scroll_y);
+            let mut state =
+                ratatui::widgets::ScrollbarState::new(max_scroll.max(1)).position(scroll_y);
             frame.render_stateful_widget(
-                ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("↑"))
-                    .end_symbol(Some("↓")),
+                ratatui::widgets::Scrollbar::new(
+                    ratatui::widgets::ScrollbarOrientation::VerticalRight,
+                )
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓")),
                 scrollbar_area,
                 &mut state,
             );
@@ -981,7 +1021,10 @@ impl ChatApp {
             } else {
                 Color::Yellow
             };
-            (status.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD))
+            (
+                status.clone(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
         } else {
             (
                 format!(
@@ -992,9 +1035,7 @@ impl ChatApp {
             )
         };
 
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled(text, style),
-        ]));
+        let footer = Paragraph::new(Line::from(vec![Span::styled(text, style)]));
 
         frame.render_widget(footer, area);
     }
@@ -1006,7 +1047,9 @@ impl ChatApp {
         let mut lines = vec![
             Line::from(vec![Span::styled(
                 " Select Persona Preset ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
         ];
@@ -1015,7 +1058,9 @@ impl ChatApp {
             let is_sel = i == self.selected_preset_idx;
             let prefix = if is_sel { " > " } else { "   " };
             let style = if is_sel {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -1101,22 +1146,19 @@ async fn event_loop<B: ratatui::backend::Backend>(
         tokio::select! {
             // Crossterm keyboard events
             Some(event_res) = event_stream.next() => {
-                match event_res {
-                    Ok(Event::Key(key)) => {
-                        // Global quit on Ctrl+C when NOT streaming
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                            if app.is_streaming {
-                                app.abort_generation();
-                            } else {
-                                break;
-                            }
-                        } else if key.code == KeyCode::Esc && !app.is_streaming && !app.show_preset_modal {
-                            break;
+                if let Ok(Event::Key(key)) = event_res {
+                    // Global quit on Ctrl+C when NOT streaming
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                        if app.is_streaming {
+                            app.abort_generation();
                         } else {
-                            app.handle_key_input(key, &tx);
+                            break;
                         }
+                    } else if key.code == KeyCode::Esc && !app.is_streaming && !app.show_preset_modal {
+                        break;
+                    } else {
+                        app.handle_key_input(key, &tx);
                     }
-                    _ => {}
                 }
                 terminal.draw(|f| app.render(f))?;
             }

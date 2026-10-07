@@ -28,6 +28,8 @@ impl MdnsBackend {
         })
     }
 
+    // Continuous: mDNS TXT fields are intentionally positional; no builder yet.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         service_type: &str,
@@ -60,7 +62,7 @@ impl MdnsBackend {
             service_type,
             instance_name,
             host_name,
-            &address.to_string(),
+            address.to_string(),
             api_port,
             properties,
         )?;
@@ -105,11 +107,9 @@ impl MdnsBackend {
                             Err(_) => None,
                         }
                     }
-                    ServiceEvent::ServiceRemoved(_, fullname) => {
-                        node_id_from_fullname(&fullname)
-                            .ok()
-                            .map(|node_id| DiscoveryEvent::ServiceRemoved { node_id })
-                    }
+                    ServiceEvent::ServiceRemoved(_, fullname) => node_id_from_fullname(&fullname)
+                        .ok()
+                        .map(|node_id| DiscoveryEvent::ServiceRemoved { node_id }),
                     _ => None,
                 };
                 if let Some(event) = converted {
@@ -131,17 +131,22 @@ impl MdnsBackend {
 fn endpoint_from_resolved(
     service: &mdns_sd::ResolvedService,
 ) -> Result<ServiceEndpoint, MdnsError> {
-    let properties: HashMap<String, String> = service.txt_properties.clone().into_property_map_str();
+    let properties: HashMap<String, String> =
+        service.txt_properties.clone().into_property_map_str();
     let node_id = properties
         .get("id")
         .ok_or_else(|| MdnsError::InvalidIdentity("missing id TXT property".to_string()))
-        .and_then(|id| Uuid::parse_str(id).map_err(|e| MdnsError::InvalidIdentity(e.to_string())))?;
+        .and_then(|id| {
+            Uuid::parse_str(id).map_err(|e| MdnsError::InvalidIdentity(e.to_string()))
+        })?;
     let role = properties
         .get("role")
         .and_then(|value| value.parse::<u8>().ok())
         .map(NodeRole)
         .unwrap_or(NodeRole::STANDALONE);
-    let cluster_id = properties.get("cluster").and_then(|id| Uuid::parse_str(id).ok());
+    let cluster_id = properties
+        .get("cluster")
+        .and_then(|id| Uuid::parse_str(id).ok());
     let addresses = (service.host.as_str(), service.port)
         .to_socket_addrs()
         .map_err(|e| MdnsError::Resolve(e.to_string()))?
@@ -150,14 +155,22 @@ fn endpoint_from_resolved(
         .get("api")
         .and_then(|port| port.parse().ok())
         .unwrap_or(service.port);
-    let rpc_port = properties.get("rpc").and_then(|port| port.parse().ok()).unwrap_or(0);
+    let rpc_port = properties
+        .get("rpc")
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(0);
     let control_port = properties
         .get("ctrl")
         .and_then(|port| port.parse().ok())
         .unwrap_or(9998);
     let capabilities = properties
         .get("caps")
-        .map(|caps| caps.split(',').filter(|cap| !cap.is_empty()).map(str::to_string).collect())
+        .map(|caps| {
+            caps.split(',')
+                .filter(|cap| !cap.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let display_name = properties
         .get("name")
@@ -168,7 +181,10 @@ fn endpoint_from_resolved(
     Ok(ServiceEndpoint {
         node_id,
         cluster_id,
-        protocol_version: properties.get("proto").and_then(|v| v.parse().ok()).unwrap_or(0),
+        protocol_version: properties
+            .get("proto")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         role,
         capabilities,
         addresses,

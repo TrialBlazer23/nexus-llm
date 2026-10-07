@@ -15,6 +15,8 @@ Phase 11 (placement) on `cursor/phase11-placement-intelligence-d6cb`.** Phase 8 
 Phase 11 placement intelligence is implemented on that branch (MemoryPlan, tensor
 GGUF parse, multi-worker ranking, supervisor harden); still needs live llama.cpp
 validation on target hardware.
+still open. **Phase 10 (model store / LAN transfer) is Done.** Recommended next:
+Phase 11 (placement intelligence). Phase 8 TUI is Done.
 
 This document is a design review, not a change set. Every claim below cites the
 file it came from so it can be checked independently. Findings are separated from
@@ -47,6 +49,7 @@ inert — are mechanically reproducible:
 | TUI responsiveness / hub split | **Done — Phase 8** | `src/ui/hub/` command/event + ChatEntry |
 | Model store / LAN transfer | **Open — Phase 10** (PR #13 draft) | §4 |
 | Placement intelligence | **Done on branch** — Phase 11 | `src/cluster/{memory,split,rank}.rs`, `gguf.rs`, `supervisor.rs` |
+| Model store / LAN transfer | **Done — Phase 10** | `src/store.rs`, blob routes, hardened `downloader.rs`, Models `[D]`/`[T]`/`[S]` |
 
 ---
 
@@ -1211,6 +1214,13 @@ extended network/control-plane tests.
 
 ### Phase 10 — Model store and LAN transfer
 
+> **Status (2026-10-06): Done.** Content-addressed `~/.nexus/models.json` index
+> (`src/store.rs`); catalog digests on `GET /models`; privileged
+> `GET /nexus/control/v1/blob/{digest}` Range streaming + `POST /blob/fetch`;
+> hardened downloader (async I/O, `.part.json`, retry, incremental hash, disk
+> preflight); Models mesh catalog with `[D]`/`[T]`/`[S]`. Covered by
+> `tests/test_phase10_store.rs`.
+
 - Content-addressed index with cached digests and GGUF metadata (§4.9)
 - Catalog endpoint and a mesh-wide model view in the TUI (§4.9)
 - Blob transfer with ranged resume and digest verification (§4.9)
@@ -1260,11 +1270,20 @@ instead of thermally throttling mid-generation.
 
 ### Continuous
 
-- CI: fmt, clippy at zero warnings, tests, Android cross-check, AVX-opcode scan
-  (§6)
-- Fuzz and property coverage for the beacon and GGUF decoders (§3.4, §6)
-- Fake `llama-server` harness and a two-node in-process mesh test (§0, §6)
-- Documentation sweep after each phase (§6)
+> **Status (2026-10-07): Done on `cursor/continuous-ci-hygiene-d6cb`.**
+> CI workflow (fmt / clippy `-D warnings` / `cargo test --locked`), Android
+> best-effort `aarch64-linux-android` check, Penryn release-binary opcode scan,
+> `proptest` + adversarial coverage for `BeaconPacket::decode` /
+> `GgufMetadata::read` (minimal allocation bounds; not Phase 11 tensor parse),
+> fake `llama-server` harness + two-node in-process mesh test, light docs drift
+> sweep. Out of scope: Phase 10/11/12, beacon v2, SSE `/events`.
+
+- ~~CI: fmt, clippy at zero warnings, tests, Android cross-check, AVX-opcode scan
+  (§6)~~ **Done**
+- ~~Fuzz and property coverage for the beacon and GGUF decoders (§3.4, §6)~~ **Done**
+  (`proptest`; no `cargo-fuzz` CI)
+- ~~Fake `llama-server` harness and a two-node in-process mesh test (§0, §6)~~ **Done**
+- ~~Documentation sweep after each phase (§6)~~ **Done** (Continuous drift only)
 
 ---
 

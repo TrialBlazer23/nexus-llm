@@ -3,9 +3,9 @@ use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{NodeRole, StatusFlags};
 use nexus::registry_runtime::spawn_registry_runtime;
-use nexus::trust_auth::TrustBootstrap;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
+use nexus::trust_auth::TrustBootstrap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -171,7 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let rpc_endpoint = if let Some(ep) = args.rpc {
                 Some(ep)
-            } else if !args.no_rpc_auto && config.cluster.enable_rpc && config.cluster.auto_offload {
+            } else if !args.no_rpc_auto && config.cluster.enable_rpc && config.cluster.auto_offload
+            {
                 info!("Probing subnet for available RPC worker peer...");
                 discovery.send_probe().await;
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;

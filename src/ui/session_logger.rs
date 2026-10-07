@@ -103,14 +103,14 @@ impl SessionLogger {
 
         let mut file = File::create(&target_path)?;
         writeln!(file, "# Nexus-LLM Conversation Export")?;
-        writeln!(file, "")?;
+        writeln!(file)?;
         writeln!(file, "- **Model**: `{}`", model)?;
         writeln!(file, "- **Host Endpoint**: `{}`", host)?;
         writeln!(file, "- **Hardware Backend**: `{}`", backend)?;
         writeln!(file, "- **Exported At**: `{:?}`", SystemTime::now())?;
-        writeln!(file, "")?;
+        writeln!(file)?;
         writeln!(file, "---")?;
-        writeln!(file, "")?;
+        writeln!(file)?;
 
         for msg in messages {
             let role_display = match msg.role.as_str() {
@@ -120,13 +120,12 @@ impl SessionLogger {
                 _ => "### Message",
             };
             writeln!(file, "{}", role_display)?;
-            writeln!(file, "")?;
+            writeln!(file)?;
             writeln!(file, "{}", msg.content.trim())?;
-            writeln!(file, "")?;
+            writeln!(file)?;
         }
 
         info!("Exported conversation to: {:?}", target_path);
         Ok(target_path)
     }
 }
-

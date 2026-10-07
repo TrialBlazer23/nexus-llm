@@ -4,9 +4,7 @@ mod memory;
 mod rank;
 mod split;
 
-pub use memory::{
-    estimate_compute_buffer_mb, MemoryPlan, MemoryPolicy, Remediation, Verdict,
-};
+pub use memory::{estimate_compute_buffer_mb, MemoryPlan, MemoryPolicy, Remediation, Verdict};
 pub use rank::{
     classify_fit, link_quality_from_timings, rank_execution_plans, ExecutionPlan, LinkQuality,
     PlacementCandidate, PlacementRequest, PlanTarget,
@@ -86,11 +84,10 @@ pub enum ClusterError {
         remote_max_mb: u64,
     },
 
-    #[error("No RPC worker available to offload {overflow_mb} MB beyond host's {host_max_mb} MB budget")]
-    NoRpcWorkerAvailable {
-        overflow_mb: u64,
-        host_max_mb: u64,
-    },
+    #[error(
+        "No RPC worker available to offload {overflow_mb} MB beyond host's {host_max_mb} MB budget"
+    )]
+    NoRpcWorkerAvailable { overflow_mb: u64, host_max_mb: u64 },
 
     #[error("Model has invalid block/layer count")]
     InvalidLayerCount,
@@ -195,10 +192,7 @@ impl ClusterCoordinator {
         }
     }
 
-    pub fn calculate_from_nodes(
-        host: &NodeBudget,
-        worker: Option<&NodeBudget>,
-    ) -> ClusterBudget {
+    pub fn calculate_from_nodes(host: &NodeBudget, worker: Option<&NodeBudget>) -> ClusterBudget {
         let host_max_mb = host.allocatable_mb;
         let remote_max_mb = worker.map_or(0, |w| w.allocatable_mb);
         let total_cluster_mb = host_max_mb + remote_max_mb;
@@ -211,7 +205,10 @@ impl ClusterCoordinator {
     }
 
     /// Calculate budget from host available RAM using default 75% safety.
-    pub fn calculate_budget(host_avail_mb: u64, remote_peer_avail_mb: Option<u64>) -> ClusterBudget {
+    pub fn calculate_budget(
+        host_avail_mb: u64,
+        remote_peer_avail_mb: Option<u64>,
+    ) -> ClusterBudget {
         Self::calculate_dynamic_budget(host_avail_mb, None, remote_peer_avail_mb, 75)
     }
 
@@ -242,9 +239,7 @@ impl ClusterCoordinator {
         budget: &ClusterBudget,
         rpc_endpoint: Option<&str>,
     ) -> Result<LayerSplitDecision, ClusterError> {
-        let total_layers = gguf
-            .block_count
-            .ok_or(ClusterError::MissingGeometry)? as u32;
+        let total_layers = gguf.block_count.ok_or(ClusterError::MissingGeometry)? as u32;
         if total_layers == 0 {
             return Err(ClusterError::InvalidLayerCount);
         }

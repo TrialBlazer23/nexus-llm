@@ -22,7 +22,7 @@ pub enum ConfigError {
 }
 
 /// Root configuration representation for ~/.nexus/config.toml
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct NexusConfig {
     #[serde(default)]
     pub node: NodeConfig,
@@ -37,17 +37,6 @@ pub struct NexusConfig {
     pub cluster: ClusterConfig,
 }
 
-impl Default for NexusConfig {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig::default(),
-            hardware: HardwareConfig::default(),
-            network: NetworkConfig::default(),
-            cluster: ClusterConfig::default(),
-        }
-    }
-}
-
 impl NexusConfig {
     /// Load configuration from default location (~/.nexus/config.toml or $NEXUS_CONFIG).
     /// If the file does not exist, default configuration is saved and returned.
@@ -59,7 +48,10 @@ impl NexusConfig {
         };
 
         if !path.exists() {
-            info!("Configuration file not found at {:?}. Generating default configuration.", path);
+            info!(
+                "Configuration file not found at {:?}. Generating default configuration.",
+                path
+            );
             let mut default_cfg = Self::default();
             default_cfg.ensure_identity()?;
             default_cfg.validate()?;
@@ -132,7 +124,10 @@ impl NexusConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !matches!(self.node.role.as_str(), "host" | "client" | "worker" | "member" | "standalone") {
+        if !matches!(
+            self.node.role.as_str(),
+            "host" | "client" | "worker" | "member" | "standalone"
+        ) {
             return Err(ConfigError::Invalid(format!(
                 "node.role must be host, client, worker, member, or standalone (got {})",
                 self.node.role
@@ -143,7 +138,8 @@ impl NexusConfig {
             && self.network.anchors.primary_compute_id == self.network.anchors.primary_client_id
         {
             return Err(ConfigError::Invalid(
-                "network.anchors.primary_compute_id and primary_client_id must be distinct".to_string(),
+                "network.anchors.primary_compute_id and primary_client_id must be distinct"
+                    .to_string(),
             ));
         }
         if self.cluster.max_rpc_ram_mb == 0 {
@@ -369,7 +365,8 @@ impl NetworkConfig {
         }
         if self.discovery.peer_timeout_ms < self.discovery.broadcast_interval_ms {
             return Err(ConfigError::Invalid(
-                "network.discovery.peer_timeout_ms must be at least the broadcast interval".to_string(),
+                "network.discovery.peer_timeout_ms must be at least the broadcast interval"
+                    .to_string(),
             ));
         }
         if self.discovery.max_peers == 0 {
@@ -396,7 +393,9 @@ impl NetworkConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RuntimeRole {
+    #[default]
     Host,
     Client,
     Worker,
@@ -410,12 +409,6 @@ pub enum NodeCapability {
     Client,
     RpcWorker,
     Discovery,
-}
-
-impl Default for RuntimeRole {
-    fn default() -> Self {
-        Self::Host
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

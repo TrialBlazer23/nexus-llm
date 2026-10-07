@@ -1,7 +1,7 @@
 use nexus::client::NexusClient;
 use nexus::config::NexusConfig;
 use nexus::discovery::DiscoveryService;
-use nexus::ui::chat::{ChatApp, ChatEntry, EntryKind, StreamMsg, wrapped_line_count};
+use nexus::ui::chat::{wrapped_line_count, ChatApp, ChatEntry, EntryKind, StreamMsg};
 use nexus::ui::dashboard::DashboardApp;
 use nexus::ui::models::scan_models_dir;
 use ratatui::backend::TestBackend;
@@ -15,7 +15,11 @@ use tempfile::tempdir;
 #[test]
 fn test_chat_app_state_and_token_streaming() {
     let client = NexusClient::new("http://127.0.0.1:8080");
-    let mut app = ChatApp::new(client, "llama-3-8b", Some("You are a helpful assistant.".to_string()));
+    let mut app = ChatApp::new(
+        client,
+        "llama-3-8b",
+        Some("You are a helpful assistant.".to_string()),
+    );
 
     // User prompt
     app.messages.push(ChatEntry::user("Hello"));
@@ -33,7 +37,7 @@ fn test_chat_app_state_and_token_streaming() {
 
     // Finalize
     app.finalize_stream();
-    assert_eq!(app.is_streaming, false);
+    assert!(!app.is_streaming);
     assert_eq!(app.messages.len(), 2);
     assert_eq!(app.messages[1].message.role, "assistant");
     assert_eq!(app.messages[1].message.content, "Hello world!");
@@ -44,21 +48,39 @@ fn test_chat_tui_headless_render() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut app = ChatApp::new(client, "llama-3-8b", Some("System instruction".to_string()));
     app.messages.push(ChatEntry::user("Testing TUI layout"));
-    app.messages.push(ChatEntry::assistant("Response from model"));
+    app.messages
+        .push(ChatEntry::assistant("Response from model"));
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
 
-    terminal.draw(|f| app.render(f)).expect("Failed to render frame");
+    terminal
+        .draw(|f| app.render(f))
+        .expect("Failed to render frame");
 
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
 
-    assert!(content.contains("Nexus-LLM Terminal"), "Buffer should contain header title");
-    assert!(content.contains("Conversation History"), "Buffer should contain history block");
-    assert!(content.contains("Prompt Input"), "Buffer should contain input block");
-    assert!(content.contains("Testing TUI layout"), "Buffer should contain user prompt");
-    assert!(content.contains("Response from model"), "Buffer should contain assistant reply");
+    assert!(
+        content.contains("Nexus-LLM Terminal"),
+        "Buffer should contain header title"
+    );
+    assert!(
+        content.contains("Conversation History"),
+        "Buffer should contain history block"
+    );
+    assert!(
+        content.contains("Prompt Input"),
+        "Buffer should contain input block"
+    );
+    assert!(
+        content.contains("Testing TUI layout"),
+        "Buffer should contain user prompt"
+    );
+    assert!(
+        content.contains("Response from model"),
+        "Buffer should contain assistant reply"
+    );
 }
 
 #[test]
@@ -68,26 +90,39 @@ fn test_chat_tui_multi_turn_auto_scroll() {
 
     // Simulate 15 turns of conversation (well over 50 lines)
     for i in 1..=15 {
-        app.messages.push(ChatEntry::user(format!("Question {}", i)));
-        app.messages.push(ChatEntry::assistant(format!("Answer {}", i)));
+        app.messages
+            .push(ChatEntry::user(format!("Question {}", i)));
+        app.messages
+            .push(ChatEntry::assistant(format!("Answer {}", i)));
     }
     app.messages.push(ChatEntry::user("Followup question 16"));
     app.messages.push(ChatEntry::assistant("Latest answer 16"));
 
-    assert!(app.total_lines() > 50, "Total lines should exceed terminal height");
+    assert!(
+        app.total_lines() > 50,
+        "Total lines should exceed terminal height"
+    );
     assert!(app.auto_scroll, "Auto-scroll should be enabled by default");
 
     let backend = TestBackend::new(100, 20); // Small 20-row terminal
     let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
 
-    terminal.draw(|f| app.render(f)).expect("Failed to render frame");
+    terminal
+        .draw(|f| app.render(f))
+        .expect("Failed to render frame");
 
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
 
     // With auto-scroll active, the bottom messages MUST be visible in the buffer
-    assert!(content.contains("Followup question 16"), "Auto-scroll must render latest user followup");
-    assert!(content.contains("Latest answer 16"), "Auto-scroll must render latest assistant reply");
+    assert!(
+        content.contains("Followup question 16"),
+        "Auto-scroll must render latest user followup"
+    );
+    assert!(
+        content.contains("Latest answer 16"),
+        "Auto-scroll must render latest assistant reply"
+    );
 }
 
 #[tokio::test]
@@ -100,15 +135,29 @@ async fn test_dashboard_tui_headless_render() {
     let backend = TestBackend::new(120, 35);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
 
-    terminal.draw(|f| dashboard.render(f)).expect("Failed to render dashboard frame");
+    terminal
+        .draw(|f| dashboard.render(f))
+        .expect("Failed to render dashboard frame");
 
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
 
-    assert!(content.contains("Cluster Monitor"), "Buffer should contain cluster monitor title");
-    assert!(content.contains("Memory Utilization"), "Buffer should contain memory gauge");
-    assert!(content.contains("Acceleration Tier"), "Buffer should contain engine capabilities");
-    assert!(content.contains("Discovered Cluster Peers"), "Buffer should contain peers table");
+    assert!(
+        content.contains("Cluster Monitor"),
+        "Buffer should contain cluster monitor title"
+    );
+    assert!(
+        content.contains("Memory Utilization"),
+        "Buffer should contain memory gauge"
+    );
+    assert!(
+        content.contains("Acceleration Tier"),
+        "Buffer should contain engine capabilities"
+    );
+    assert!(
+        content.contains("Discovered Cluster Peers"),
+        "Buffer should contain peers table"
+    );
 }
 
 #[test]
@@ -129,7 +178,9 @@ fn test_models_scanner() {
 fn test_clean_conversation_messages() {
     let raw_messages = vec![
         ChatEntry::notice("Model 'qwen2.5-3b' loaded successfully and ready for inference."),
-        ChatEntry::notice("Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference."),
+        ChatEntry::notice(
+            "Connected to remote model 'qwen2.5-3b' running on Node-12345678. Ready for inference.",
+        ),
         ChatEntry::error("⚠️ [Connection / Generation Error]: Transport Error"),
         ChatEntry::notice("Model unloaded. Local inference engine is idle."),
         ChatEntry::user("What is the capital of France?"),
@@ -137,7 +188,8 @@ fn test_clean_conversation_messages() {
         ChatEntry::user("And its population?"),
     ];
 
-    let cleaned = ChatApp::clean_conversation_messages(&raw_messages, Some("You are a helpful assistant."));
+    let cleaned =
+        ChatApp::clean_conversation_messages(&raw_messages, Some("You are a helpful assistant."));
 
     assert_eq!(cleaned.len(), 4); // System instruction + 3 genuine dialogue turns
     assert_eq!(cleaned[0].role, "system");
@@ -154,7 +206,10 @@ fn test_clean_conversation_messages() {
     assert!(raw_messages[4].is_dialogue());
 }
 
-fn key_event(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> crossterm::event::KeyEvent {
+fn key_event(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent {
         code,
         modifiers,
@@ -171,41 +226,95 @@ fn test_chat_cursor_navigation_and_editing() {
 
     // Type "hello"
     for c in "hello".chars() {
-        app.handle_key_input(key_event(crossterm::event::KeyCode::Char(c), crossterm::event::KeyModifiers::empty()), &tx);
+        app.handle_key_input(
+            key_event(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &tx,
+        );
     }
     assert_eq!(app.input_buffer, "hello");
     assert_eq!(app.cursor_idx, 5);
 
     // Navigate Left twice
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::empty()), &tx);
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Left, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.cursor_idx, 3);
 
     // Insert 'X' in the middle -> "helXlo"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Char('X'), crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Char('X'),
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.input_buffer, "helXlo");
     assert_eq!(app.cursor_idx, 4);
 
     // Backspace deletes 'X' -> "hello"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Backspace, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.input_buffer, "hello");
     assert_eq!(app.cursor_idx, 3);
 
     // Delete at cursor deletes next 'l' -> "helo"
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Delete, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Delete,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.input_buffer, "helo");
     assert_eq!(app.cursor_idx, 3);
 
     // Home jumps to start
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Home, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.cursor_idx, 0);
 
     // End jumps to end
-    app.handle_key_input(key_event(crossterm::event::KeyCode::End, crossterm::event::KeyModifiers::empty()), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::empty(),
+        ),
+        &tx,
+    );
     assert_eq!(app.cursor_idx, 4);
 
     // Shift+Enter inserts newline
-    app.handle_key_input(key_event(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::SHIFT), &tx);
+    app.handle_key_input(
+        key_event(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::SHIFT,
+        ),
+        &tx,
+    );
     assert_eq!(app.input_buffer, "helo\n");
     assert_eq!(app.cursor_idx, 5);
 }
@@ -229,11 +338,17 @@ fn test_chat_slash_command_mutations() {
 
     // Test /system
     assert!(app.handle_slash_command("/system You are an expert system."));
-    assert_eq!(app.system_prompt.as_deref(), Some("You are an expert system."));
+    assert_eq!(
+        app.system_prompt.as_deref(),
+        Some("You are an expert system.")
+    );
 
     // Test /preset coder
     assert!(app.handle_slash_command("/preset coder"));
-    assert_eq!(app.active_preset.as_ref().map(|p| p.name.as_str()), Some("coder"));
+    assert_eq!(
+        app.active_preset.as_ref().map(|p| p.name.as_str()),
+        Some("coder")
+    );
     assert_eq!(app.temperature, 0.2);
 
     // Test /clear
@@ -254,16 +369,36 @@ fn test_markdown_rendering_and_boxed_code() {
     // Check header render
     let full_rendered: String = lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(full_rendered.contains("Test Title"), "Should render heading text");
+    assert!(
+        full_rendered.contains("Test Title"),
+        "Should render heading text"
+    );
     assert!(full_rendered.contains("bold"), "Should render bold text");
-    assert!(full_rendered.contains("inline_code"), "Should render inline code");
-    assert!(full_rendered.contains("┌─ rust"), "Should format fenced code block header");
-    assert!(full_rendered.contains("└─"), "Should format fenced code block footer");
-    assert!(full_rendered.contains("main"), "Should preserve code tokens");
+    assert!(
+        full_rendered.contains("inline_code"),
+        "Should render inline code"
+    );
+    assert!(
+        full_rendered.contains("┌─ rust"),
+        "Should format fenced code block header"
+    );
+    assert!(
+        full_rendered.contains("└─"),
+        "Should format fenced code block footer"
+    );
+    assert!(
+        full_rendered.contains("main"),
+        "Should preserve code tokens"
+    );
 }
 
 #[test]
@@ -281,13 +416,22 @@ fn test_generation_metrics_and_telemetry_badge() {
     app.handle_stream_token("Hello".to_string());
     app.handle_stream_token(" from GPU!".to_string());
 
-    assert!(app.ttft_ms.is_some(), "Time to first token should be recorded");
+    assert!(
+        app.ttft_ms.is_some(),
+        "Time to first token should be recorded"
+    );
     assert_eq!(app.tokens_streamed, 2);
 
     app.finalize_stream();
     assert_eq!(app.messages.len(), 2);
-    assert!(app.messages[1].metrics.is_some(), "Assistant should have metrics");
-    let metrics = app.messages[1].metrics.as_ref().expect("Assistant should have metrics");
+    assert!(
+        app.messages[1].metrics.is_some(),
+        "Assistant should have metrics"
+    );
+    let metrics = app.messages[1]
+        .metrics
+        .as_ref()
+        .expect("Assistant should have metrics");
     assert_eq!(metrics.tokens, 2);
     assert!(metrics.tokens_per_sec > 0.0);
 
@@ -295,14 +439,25 @@ fn test_generation_metrics_and_telemetry_badge() {
     let backend = TestBackend::new(140, 30);
     let mut terminal = Terminal::new(backend).expect("Failed to initialize headless TestBackend");
 
-    terminal.draw(|f| app.render(f)).expect("Failed to render frame");
+    terminal
+        .draw(|f| app.render(f))
+        .expect("Failed to render frame");
 
     let buffer = terminal.backend().buffer();
     let content = format!("{:?}", buffer);
 
-    assert!(content.contains("Galaxy S23 Ultra"), "Header must include target device");
-    assert!(content.contains("Vulkan Adreno 740 GPU"), "Header must include hardware backend");
-    assert!(content.contains("⚡"), "Must render generation performance badge");
+    assert!(
+        content.contains("Galaxy S23 Ultra"),
+        "Header must include target device"
+    );
+    assert!(
+        content.contains("Vulkan Adreno 740 GPU"),
+        "Header must include hardware backend"
+    );
+    assert!(
+        content.contains("⚡"),
+        "Must render generation performance badge"
+    );
 }
 
 #[test]
@@ -321,11 +476,20 @@ fn test_chat_stream_abort() {
     app.abort_generation();
 
     // Verify stream was aborted cleanly
-    assert_eq!(app.is_streaming, false);
-    assert!(abort_rx.try_recv().is_ok(), "Abort signal must be dispatched");
+    assert!(!app.is_streaming);
+    assert!(
+        abort_rx.try_recv().is_ok(),
+        "Abort signal must be dispatched"
+    );
     assert_eq!(app.messages.len(), 1);
-    assert!(app.messages[0].message.content.contains("Generation stopped by operator"));
-    assert_eq!(app.status_message.as_deref(), Some("Generation stopped by operator"));
+    assert!(app.messages[0]
+        .message
+        .content
+        .contains("Generation stopped by operator"));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Generation stopped by operator")
+    );
 }
 
 #[test]
@@ -335,9 +499,11 @@ fn test_session_logger_and_markdown_export() {
     let dir = tempdir().expect("Failed to create tempdir");
     let export_path = dir.path().join("chat_export.md");
 
-    let messages = vec![
+    let messages = [
         ChatEntry::user("Explain distributed inference"),
-        ChatEntry::assistant("Distributed inference offloads neural network layers across connected nodes."),
+        ChatEntry::assistant(
+            "Distributed inference offloads neural network layers across connected nodes.",
+        ),
     ];
     let export_msgs: Vec<_> = messages.iter().map(|e| e.message.clone()).collect();
 
@@ -359,8 +525,6 @@ fn test_session_logger_and_markdown_export() {
     assert!(content.contains("Distributed inference offloads"));
 }
 
-
-
 #[test]
 fn test_chat_entry_kind_filters_dialogue() {
     let notice = ChatEntry::notice("Connected to the database successfully.");
@@ -378,7 +542,10 @@ fn test_wrapped_line_count_for_wide_code() {
         Line::from("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
     ];
     let count = wrapped_line_count(&lines, 20);
-    assert!(count >= 4, "wide line must wrap into multiple visual rows, got {count}");
+    assert!(
+        count >= 4,
+        "wide line must wrap into multiple visual rows, got {count}"
+    );
 }
 
 #[test]

@@ -140,12 +140,14 @@ pub fn plan_tensor_byte_split(
     }
 
     if total_required_mb > cluster_cap {
-        return Err(SplitError::Cluster(ClusterError::ClusterMemoryCapExceeded {
-            required_mb: total_required_mb,
-            cluster_max_mb: cluster_cap,
-            host_max_mb: host_budget_mb,
-            remote_max_mb: remote_cap,
-        }));
+        return Err(SplitError::Cluster(
+            ClusterError::ClusterMemoryCapExceeded {
+                required_mb: total_required_mb,
+                cluster_max_mb: cluster_cap,
+                host_max_mb: host_budget_mb,
+                remote_max_mb: remote_cap,
+            },
+        ));
     }
 
     // Greedy: assign as many layers as possible to host from the start.
@@ -198,12 +200,14 @@ pub fn plan_tensor_byte_split(
     let assigned_remote: u32 = worker_layers.iter().sum();
     if host_layers + assigned_remote < total_layers {
         // Could not place all layers — try forcing remainder onto last worker if any capacity.
-        return Err(SplitError::Cluster(ClusterError::ClusterMemoryCapExceeded {
-            required_mb: total_required_mb,
-            cluster_max_mb: cluster_cap,
-            host_max_mb: host_budget_mb,
-            remote_max_mb: remote_cap,
-        }));
+        return Err(SplitError::Cluster(
+            ClusterError::ClusterMemoryCapExceeded {
+                required_mb: total_required_mb,
+                cluster_max_mb: cluster_cap,
+                host_max_mb: host_budget_mb,
+                remote_max_mb: remote_cap,
+            },
+        ));
     }
 
     // Build tensor-split ratios by layer counts (devices: host + workers).
@@ -243,6 +247,7 @@ pub fn plan_tensor_byte_split(
 
 /// Legacy fraction-based planner retained for comparison tests only.
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn plan_fraction_split_for_test(
     model_size_bytes: u64,
     exact_kv_bytes: u64,
@@ -317,8 +322,8 @@ mod tests {
         let worker = NodeBudget::new(Uuid::new_v4(), "w1", 800);
         let workers = vec![(worker, "10.0.0.2:50052".into())];
 
-        let split = plan_tensor_byte_split(&gguf, 2048, kv, host_budget, &workers, 64)
-            .expect("split");
+        let split =
+            plan_tensor_byte_split(&gguf, 2048, kv, host_budget, &workers, 64).expect("split");
         assert!(split.is_distributed());
         assert!(split.host_layers < split.total_layers);
         assert!(!split.remote_endpoints.is_empty());

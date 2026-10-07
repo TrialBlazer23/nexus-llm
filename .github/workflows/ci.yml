@@ -1,0 +1,86 @@
+# Continuous engineering hygiene (CAPABILITY_REVIEW §6 / §7 Continuous).
+# x86_64 Linux: fmt, clippy (-D warnings), tests, Penryn opcode scan.
+# Android: best-effort cargo check (soft-fail if NDK/linker missing).
+
+name: CI
+
+on:
+  push:
+    branches: [main, "cursor/**"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-feature=-avx,-avx2,-fma,-sse4.2"
+
+jobs:
+  fmt-clippy-test:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+  android-check:
+    name: Android aarch64 check (best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --target aarch64-linux-android
+        id: android
+        run: |
+          set +e
+          cargo check --locked --target aarch64-linux-android 2>&1 | tee android-check.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::Android cross-check failed (NDK/linker often missing on GitHub runners). See android-check.log. This job is best-effort and does not block Continuous."
+            echo "Android target may need \`rustup target add aarch64-linux-android\` plus an NDK linker (CC_aarch64_linux_android)." >> "$GITHUB_STEP_SUMMARY"
+            cat android-check.log >> "$GITHUB_STEP_SUMMARY" || true
+            exit "$status"
+          fi
+          echo "Android aarch64-linux-android check passed." >> "$GITHUB_STEP_SUMMARY"
+
+  penryn-opcodes:
+    name: Penryn opcode scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Release build (Penryn-safe rustflags via .cargo/config.toml)
+        run: cargo build --locked --release --bin nexus
+
+      - name: Scan release binary for AVX / AVX2 / FMA / SSE4.2
+        run: ./scripts/check_penryn_opcodes.sh target/release/nexus

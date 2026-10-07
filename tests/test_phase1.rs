@@ -13,8 +13,14 @@ fn test_sysinfo_probing() {
     println!("Probed System Profile: {:?}", profile);
 
     assert!(profile.total_ram_mb > 0, "Total RAM should be non-zero");
-    assert!(profile.available_ram_mb > 0, "Available RAM should be non-zero");
-    assert!(profile.recommended_threads >= 1, "Recommended threads should be >= 1");
+    assert!(
+        profile.available_ram_mb > 0,
+        "Available RAM should be non-zero"
+    );
+    assert!(
+        profile.recommended_threads >= 1,
+        "Recommended threads should be >= 1"
+    );
 
     // On Termux ARM64, backend should be Vulkan or ArmCpuDotProd
     let valid_backends = [
@@ -37,7 +43,7 @@ Cached:          3145728 kB
 ";
     let (total_mb, avail_mb) = SystemProfile::parse_meminfo(mock_meminfo);
     assert_eq!(total_mb, 12288); // 12582912 / 1024
-    assert_eq!(avail_mb, 8192);  // 8388608 / 1024
+    assert_eq!(avail_mb, 8192); // 8388608 / 1024
 }
 
 #[test]
@@ -49,11 +55,13 @@ Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics asimddp i8mm
 CPU implementer	: 0x41
 ";
     // ARM without Vulkan -> detects ArmCpuDotProd
-    let backend_arm_cpu = SystemProfile::parse_cpuinfo_backend("aarch64", arm_dotprod_cpuinfo, false);
+    let backend_arm_cpu =
+        SystemProfile::parse_cpuinfo_backend("aarch64", arm_dotprod_cpuinfo, false);
     assert_eq!(backend_arm_cpu, AccelerationBackend::ArmCpuDotProd);
 
     // ARM with Vulkan -> detects Vulkan
-    let backend_arm_vulkan = SystemProfile::parse_cpuinfo_backend("aarch64", arm_dotprod_cpuinfo, true);
+    let backend_arm_vulkan =
+        SystemProfile::parse_cpuinfo_backend("aarch64", arm_dotprod_cpuinfo, true);
     assert_eq!(backend_arm_vulkan, AccelerationBackend::Vulkan);
 
     // x86_64 -> detects X86Baseline
@@ -73,8 +81,14 @@ fn test_memory_guard_enforcement() {
     };
 
     assert_eq!(profile.max_allowed_memory_bytes(), 3_000 * 1024 * 1024);
-    assert_eq!(profile.max_allowed_memory_bytes_pct(50), 2_000 * 1024 * 1024);
-    assert_eq!(profile.max_allowed_memory_bytes_pct(100), 4_000 * 1024 * 1024);
+    assert_eq!(
+        profile.max_allowed_memory_bytes_pct(50),
+        2_000 * 1024 * 1024
+    );
+    assert_eq!(
+        profile.max_allowed_memory_bytes_pct(100),
+        4_000 * 1024 * 1024
+    );
 
     // 1. Safe small model (500 MB) with 1024 context tokens (~200 MB KV):
     // Total ~ 700 MB <= 3000 MB -> should pass.
@@ -97,7 +111,7 @@ fn test_config_defaults_and_serde() {
 
     // Verify default constraints specified in DESIGN_SPEC.md
     assert_eq!(config.node.role, "host");
-    assert_eq!(config.hardware.acceleration.prefer_gpu, true);
+    assert!(config.hardware.acceleration.prefer_gpu);
     assert_eq!(config.hardware.acceleration.gpu_layers, 99);
     assert_eq!(config.hardware.acceleration.cpu_threads, 6);
     assert_eq!(config.hardware.safety.max_ram_usage_percent, 75);
@@ -107,7 +121,8 @@ fn test_config_defaults_and_serde() {
 
     // Round-trip TOML serialization
     let toml_str = toml::to_string(&config).expect("Failed to serialize config");
-    let deserialized: NexusConfig = toml::from_str(&toml_str).expect("Failed to deserialize config");
+    let deserialized: NexusConfig =
+        toml::from_str(&toml_str).expect("Failed to deserialize config");
     assert_eq!(config, deserialized);
 }
 
@@ -133,7 +148,7 @@ api_port = 9090
     let parsed: NexusConfig = toml::from_str(custom_toml).expect("Failed to parse custom toml");
     assert_eq!(parsed.node.role, "client");
     assert_eq!(parsed.node.name, "macrowave");
-    assert_eq!(parsed.hardware.acceleration.prefer_gpu, false);
+    assert!(!parsed.hardware.acceleration.prefer_gpu);
     assert_eq!(parsed.hardware.acceleration.gpu_layers, 0);
     assert_eq!(parsed.hardware.acceleration.cpu_threads, 2);
     assert_eq!(parsed.hardware.safety.max_ram_usage_percent, 70);
@@ -182,8 +197,8 @@ fn test_config_persists_identity_on_first_load() {
 
 #[test]
 fn test_config_discovery_security_defaults_are_backward_compatible() {
-    let parsed: NexusConfig = toml::from_str("[network]\napi_port = 9090\n")
-        .expect("parse legacy network config");
+    let parsed: NexusConfig =
+        toml::from_str("[network]\napi_port = 9090\n").expect("parse legacy network config");
     assert!(parsed.network.discovery.enabled);
     assert_eq!(parsed.network.discovery.protocol_version, 1);
     assert_eq!(parsed.network.security.protocol_version, 1);
@@ -194,8 +209,7 @@ fn test_config_discovery_security_defaults_are_backward_compatible() {
 #[test]
 fn test_config_rejects_invalid_loaded_role() {
     let file = NamedTempFile::new().expect("temporary config file");
-    std::fs::write(file.path(), "[node]\nrole = \"invalid\"\n")
-        .expect("write invalid config");
+    std::fs::write(file.path(), "[node]\nrole = \"invalid\"\n").expect("write invalid config");
     let result = NexusConfig::load_from_path(file.path());
     assert!(result.is_err());
 }
@@ -239,28 +253,52 @@ fn test_supervisor_command_args_builder() {
         threads: 6,
         context_size: 4096,
         extra_args: Vec::new(),
-            use_mmap: true,
-            use_mlock: false,
-            cpu_threads_batch: 6,
-            fallback_to_cpu: true,
-            cache_type_k: None,
-            cache_type_v: None,
-            memory_budget_percent: 75,
+        use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
+        memory_budget_percent: 75,
     };
 
     // Test Vulkan offload args (-ngl 99)
     let vulkan_args = cfg.build_args(99);
     assert!(vulkan_args.contains(&"-ngl".to_string()));
-    assert_eq!(vulkan_args.iter().skip_while(|&x| x != "-ngl").nth(1).unwrap(), "99");
+    assert_eq!(
+        vulkan_args
+            .iter()
+            .skip_while(|&x| x != "-ngl")
+            .nth(1)
+            .unwrap(),
+        "99"
+    );
     assert!(vulkan_args.contains(&"--port".to_string()));
-    assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--port").nth(1).unwrap(), "8080");
+    assert_eq!(
+        vulkan_args
+            .iter()
+            .skip_while(|&x| x != "--port")
+            .nth(1)
+            .unwrap(),
+        "8080"
+    );
     assert!(vulkan_args.contains(&"--alias".to_string()));
-    assert_eq!(vulkan_args.iter().skip_while(|&x| x != "--alias").nth(1).unwrap(), "model");
+    assert_eq!(
+        vulkan_args
+            .iter()
+            .skip_while(|&x| x != "--alias")
+            .nth(1)
+            .unwrap(),
+        "model"
+    );
     assert!(!vulkan_args.iter().any(|a| a == "--no-mmap"));
 
     // Test CPU fallback args (-ngl 0)
     let cpu_args = cfg.build_args(0);
-    assert_eq!(cpu_args.iter().skip_while(|&x| x != "-ngl").nth(1).unwrap(), "0");
+    assert_eq!(
+        cpu_args.iter().skip_while(|&x| x != "-ngl").nth(1).unwrap(),
+        "0"
+    );
 
     let mut no_mmap = cfg.clone();
     no_mmap.use_mmap = false;
@@ -294,13 +332,13 @@ async fn test_supervisor_preflight_binary_not_found() {
         threads: 2,
         context_size: 512,
         extra_args: Vec::new(),
-            use_mmap: true,
-            use_mlock: false,
-            cpu_threads_batch: 6,
-            fallback_to_cpu: true,
-            cache_type_k: None,
-            cache_type_v: None,
-            memory_budget_percent: 75,
+        use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
+        memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -330,13 +368,13 @@ async fn test_supervisor_preflight_model_not_found() {
         threads: 2,
         context_size: 512,
         extra_args: Vec::new(),
-            use_mmap: true,
-            use_mlock: false,
-            cpu_threads_batch: 6,
-            fallback_to_cpu: true,
-            cache_type_k: None,
-            cache_type_v: None,
-            memory_budget_percent: 75,
+        use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
+        memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -359,7 +397,9 @@ async fn test_supervisor_memory_cap_rejection() {
     // Create a temporary mock model file
     let mut temp_model = NamedTempFile::new().expect("Failed to create temp file");
     // Write 1 KB dummy content
-    temp_model.write_all(&[0u8; 1024]).expect("Failed to write to temp file");
+    temp_model
+        .write_all(&[0u8; 1024])
+        .expect("Failed to write to temp file");
 
     // Request an absurdly large context size that forces estimated KV memory
     // to exceed the 75% memory ceiling
@@ -377,13 +417,13 @@ async fn test_supervisor_memory_cap_rejection() {
         threads: 2,
         context_size: insane_context,
         extra_args: Vec::new(),
-            use_mmap: true,
-            use_mlock: false,
-            cpu_threads_batch: 6,
-            fallback_to_cpu: true,
-            cache_type_k: None,
-            cache_type_v: None,
-            memory_budget_percent: 75,
+        use_mmap: true,
+        use_mlock: false,
+        cpu_threads_batch: 6,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
+        memory_budget_percent: 75,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;

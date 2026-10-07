@@ -38,10 +38,10 @@
 **Done:** Dynamic host+RPC budgets; `HubApp::selected_context` (default 4096) with Models `[+/-]` and `/context`; remote/local loads use `selected_context` and `config.hardware.acceleration.gpu_layers` (via `configured_gpu_layers()`). Temp/max_tokens remain on `ChatApp` (Phase 1 personas + `/temp`).
 
 **9. ✅ Remote model awareness.** ~~Local-only Models browse; remote load hoped the peer shared the file.~~
-**Done:** Hyper control-plane server on `network.control_port` (default 8081) serves `GET /nexus/control/v1/models` (+ alias `GET /cluster/models`), started from Hub and `nexusd`. Models tab merges local + peer catalogs with a host column; target selection / Cluster `L` dispatch via `control_endpoint()` and only offer remotes that advertise the filename. Push/transfer still deferred.
+**Done:** Hyper control-plane server on `network.control_port` serves `GET /nexus/control/v1/models` (+ alias `/cluster/models`) with content digests. Models tab merges local + peer catalogs (holders column). Phase 10 adds `GET /blob/{digest}` Range transfer and `[T]`/`[S]` pull/push.
 
 **10. ✅ In-TUI downloads.** ~~Empty Models tab was a dead end.~~
-**Done:** Models `[D]` opens a URL modal; `ModelDownloader` runs with a progress Gauge into `models_dir`; empty state tells operators to press `D` or use `nexus download --help`.
+**Done:** Models `[D]` opens a URL modal; hardened `ModelDownloader` runs with a progress Gauge into `models_dir`; `[T]` pulls by digest from a peer; `[S]` asks a peer to fetch via `POST /blob/fetch`.
 
 **11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running. *(Deferred past Phase 4 polish.)*
 

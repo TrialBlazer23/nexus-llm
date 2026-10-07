@@ -82,6 +82,7 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 │   ├── gateway.rs         # Mesh OpenAI gateway on gateway_port (Phase 12 §5.1)
 │   ├── client.rs          # OpenAI HTTP/SSE client
 │   ├── store.rs           # Content-addressed model index (~/.nexus/models.json)
+│   ├── bench.rs           # Throughput bench store (~/.nexus/bench.json; Phase 12 §5.5)
 │   ├── gguf.rs            # Allocating GGUF header/metadata parser (bounded lengths; not zero-copy)
 │   ├── downloader.rs      # HTTP Range resume engine (single connection; not multi-chunk parallel)
 │   ├── preset.rs          # YAML persona & chat template engine

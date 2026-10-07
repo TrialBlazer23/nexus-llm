@@ -1,5 +1,6 @@
 use crate::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use crate::preset::Preset;
+use crate::sysinfo::AccelerationBackend;
 use crate::ui::markdown::render_markdown;
 use crate::ui::session_logger::SessionLogger;
 use crossterm::{
@@ -26,6 +27,19 @@ pub enum StreamMsg {
     Done,
     Error(String),
     Abort,
+}
+
+fn backend_from_label(label: &str) -> AccelerationBackend {
+    let l = label.to_lowercase();
+    if l.contains("vulkan") {
+        AccelerationBackend::Vulkan
+    } else if l.contains("arm") || l.contains("dotprod") {
+        AccelerationBackend::ArmCpuDotProd
+    } else if l.contains("x86") || l.contains("sse") {
+        AccelerationBackend::X86Baseline
+    } else {
+        AccelerationBackend::GenericCpu
+    }
 }
 
 /// Telemetry metrics recorded for each assistant generation turn.
@@ -609,6 +623,28 @@ impl ChatApp {
                 Some(self.tokens_per_sec),
                 Some(self.tokens_streamed),
             );
+
+            // Best-effort Phase 12 §5.5 telemetry into ~/.nexus/bench.json
+            if metrics.tokens > 0 && metrics.tokens_per_sec > 0.0 {
+                let backend = backend_from_label(&self.target_backend);
+                let prompt_tok_s = metrics.ttft_ms.map(|ms| {
+                    let secs = (ms as f32 / 1000.0).max(1e-3);
+                    // Rough prefill estimate from TTFT alone (prompt size unknown here).
+                    1.0 / secs
+                });
+                crate::bench::BenchStore::record_default_best_effort(
+                    &self.model_name,
+                    &self.target_device_name,
+                    backend,
+                    2048,
+                    crate::bench::BenchSample {
+                        gen_tok_s: metrics.tokens_per_sec as f32,
+                        ttft_ms: metrics.ttft_ms,
+                        prompt_tok_s,
+                        measured_at: crate::bench::unix_now(),
+                    },
+                );
+            }
 
             self.messages
                 .push(ChatEntry::assistant(content).with_metrics(metrics));

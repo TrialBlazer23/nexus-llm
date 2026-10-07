@@ -186,6 +186,8 @@ allowed_peer_ids = []
 # POST bodies use headers Nexus-Signature-* over canonical:
 #   nexus-control-v1\n{METHOD}\n{PATH}\n{sha256_hex(body)}\n{timestamp}\n{nonce}\n{signer_id}
 # Pairing: target shows a 6-digit code (5-minute window); initiator POST /nexus/control/v1/pair.
+# Phase 12 §5.5: `nexus bench` persists measured tok/s to ~/.nexus/bench.json
+# (NEXUS_BENCH_PATH override); placement ranking prefers those samples when present.
 
 [cluster]
 rpc_port = 50052

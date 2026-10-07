@@ -1,5 +1,6 @@
 //! Link-quality probing and predicted-throughput ranking (Phase 11 §3.6 / §3.8).
 
+use crate::bench::BenchStore;
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use std::time::{Duration, Instant};
@@ -86,6 +87,8 @@ pub struct PlacementRequest<'a> {
     pub local_gpu_layers: u32,
     pub candidates: Vec<PlacementCandidate>,
     pub enable_rpc: bool,
+    /// Optional Phase 12 §5.5 measured throughput store.
+    pub bench: Option<&'a BenchStore>,
 }
 
 /// Rank execution plans by predicted tokens/sec (descending).
@@ -123,6 +126,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
         .collect();
 
     let offload_available = req.enable_rpc && !rpc_workers.is_empty();
+    let model_key = placement_model_key(req.gguf);
 
     // --- Local GPU ---
     if req.local_gpu_layers > 0 {
@@ -138,6 +142,13 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     req.gguf.quant_label.as_deref(),
                     1.0,
                     0,
+                    measured_tok_s(
+                        req.bench,
+                        &model_key,
+                        &req.local_name,
+                        req.local_profile.detected_backend,
+                        req.policy.context_size,
+                    ),
                 );
                 plans.push(ExecutionPlan {
                     target: PlanTarget::LocalGpu {
@@ -170,6 +181,13 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 req.gguf.quant_label.as_deref(),
                 1.0,
                 0,
+                measured_tok_s(
+                    req.bench,
+                    &model_key,
+                    &req.local_name,
+                    cpu_profile.detected_backend,
+                    req.policy.context_size,
+                ),
             );
             plans.push(ExecutionPlan {
                 target: PlanTarget::LocalCpu,
@@ -200,6 +218,13 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 req.gguf.quant_label.as_deref(),
                 1.0,
                 c.thermal_index,
+                measured_tok_s(
+                    req.bench,
+                    &model_key,
+                    &c.name,
+                    c.backend,
+                    req.policy.context_size,
+                ),
             );
             if c.link.unknown {
                 tok *= 0.85;
@@ -265,6 +290,13 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     req.gguf.quant_label.as_deref(),
                     host_frac,
                     0,
+                    measured_tok_s(
+                        req.bench,
+                        &model_key,
+                        &req.local_name,
+                        req.local_profile.detected_backend,
+                        req.policy.context_size,
+                    ),
                 );
                 let predicted = compute_tok.min(min_net);
                 let args = split.build_llama_args();
@@ -333,23 +365,55 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
     Ok(plans)
 }
 
+fn placement_model_key(gguf: &GgufMetadata) -> String {
+    gguf.model_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| gguf.quant_label.clone())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn measured_tok_s(
+    bench: Option<&BenchStore>,
+    model_id: &str,
+    node_id: &str,
+    backend: AccelerationBackend,
+    context_size: usize,
+) -> Option<f32> {
+    let store = bench?;
+    store
+        .lookup_gen_tok_s(model_id, node_id, backend, context_size)
+        .or_else(|| store.lookup_gen_tok_s_any_node(model_id, backend, context_size))
+}
+
 fn predict_local_tok_s(
     backend: AccelerationBackend,
     quant: Option<&str>,
     layer_frac: f32,
     thermal: u8,
+    measured: Option<f32>,
 ) -> f32 {
-    let base = match backend {
-        AccelerationBackend::Vulkan => 28.0,
-        AccelerationBackend::ArmCpuDotProd => 12.0,
-        AccelerationBackend::X86Baseline => 4.0,
-        AccelerationBackend::GenericCpu => 6.0,
+    let base = if let Some(m) = measured.filter(|v| *v > 0.0) {
+        m
+    } else {
+        match backend {
+            AccelerationBackend::Vulkan => 28.0,
+            AccelerationBackend::ArmCpuDotProd => 12.0,
+            AccelerationBackend::X86Baseline => 4.0,
+            AccelerationBackend::GenericCpu => 6.0,
+        }
     };
-    let quant_boost = match quant.unwrap_or("") {
-        s if s.contains("Q4") => 1.15,
-        s if s.contains("Q5") => 1.05,
-        s if s.contains("Q8") || s.contains("F16") => 0.85,
-        _ => 1.0,
+    // Measured values already include quant/runtime effects; only scale by
+    // layer fraction and thermal when using heuristics or partial offload.
+    let quant_boost = if measured.is_some() {
+        1.0
+    } else {
+        match quant.unwrap_or("") {
+            s if s.contains("Q4") => 1.15,
+            s if s.contains("Q5") => 1.05,
+            s if s.contains("Q8") || s.contains("F16") => 0.85,
+            _ => 1.0,
+        }
     };
     let thermal_pen = if thermal > 75 {
         0.6
@@ -447,6 +511,7 @@ mod tests {
                 is_local: false,
                 thermal_index: 20,
             }],
+            bench: None,
         };
         let plans = rank_execution_plans(&req).expect("plans");
         assert!(!plans.is_empty());

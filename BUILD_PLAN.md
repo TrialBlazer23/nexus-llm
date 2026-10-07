@@ -115,6 +115,24 @@ wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test --test test_hub_ui"
 
 ---
 
+## Phase 10: Model store & LAN transfer
+**Status:** Complete
+
+### Objectives
+- Content-addressed model index (`~/.nexus/models.json`) with cached digests.
+- Digest-aware `GET /nexus/control/v1/models` and mesh Models catalog in the TUI.
+- Privileged `GET /nexus/control/v1/blob/{digest}` with HTTP Range streaming.
+- Privileged `POST /nexus/control/v1/blob/fetch` for push-to-peer convenience.
+- Hardened `ModelDownloader`: async I/O, `.part.json` resume validators, retry/backoff, incremental SHA-256, disk preflight.
+- Models tab lifecycle: `[D]` WAN download, `[T]` LAN pull, `[S]` push.
+
+### Verification Command
+```bash
+cargo test --locked --test test_phase10_store
+```
+
+---
+
 ## Full Regression Suite
 ```bash
 wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"

@@ -13,6 +13,7 @@ pub mod node_identity;
 pub mod peer_registry;
 pub mod preset;
 pub mod registry_runtime;
+pub mod store;
 pub mod supervisor;
 pub mod sysinfo;
 pub mod trust_auth;

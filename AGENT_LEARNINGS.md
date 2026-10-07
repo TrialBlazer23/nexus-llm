@@ -36,6 +36,12 @@ avoid repeating known mistakes.
   5. Fake llama (`tests/support/fake_llama.rs`) + two-node UDP/control-plane mesh cover client SSE and discovery↔control paths that unit suites missed; live GGUF/`llama-server` still required for real load soaks.
 - Action: Ship `.github/workflows/ci.yml`, Penryn script, GGUF bounds, property/adversarial tests, harnesses, clippy zero, doc drift fixes (`DESIGN_SPEC` control paths, `AGENTS.md` layout / non-zero-copy GGUF, Tunnel tab deferred note).
 - Verification: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, `./scripts/check_penryn_opcodes.sh target/release/nexus`.
+## 2026-10-06 — Phase 10 model store / LAN blob transfer
+- Category: design-decision
+- Context: CAPABILITY_REVIEW Phase 10 on `cursor/phase10-model-store-d6cb`.
+- Finding: Control-plane JSON uses `MAX_CONTROL_RESPONSE_BYTES` (16 KiB); blob bodies must stream with a separate body type and never wrap in `Limited`. Phase 9 text requires transfer to be privileged like load/unload — `GET /blob/{digest}` and `POST /blob/fetch` use `verify_control_request` + `authorize_privileged_signer`. Filename-only catalogs are insufficient for verified LAN sync; digests live in `~/.nexus/models.json` (override with `NEXUS_MODELS_INDEX`). Concurrent reconcile of the shared index needs a process lock or tests flake.
+- Action: Added `src/store.rs`, digest fields on `ModelCatalogEntry`, streaming blob route, hardened `downloader.rs` (`.part.json`, retry, incremental hash, disk preflight), Models `[D]`/`[T]`/`[S]` via hub worker commands.
+- Verification: `cargo test --locked` including `tests/test_phase10_store.rs`.
 
 ## 2026-10-06 — Phase 8 TUI: command/event bus, ChatEntry, hot-swap -ngl
 - Category: design-decision

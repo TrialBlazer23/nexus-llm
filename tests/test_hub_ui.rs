@@ -302,7 +302,7 @@ async fn test_hub_app_headless_render_all_tabs() {
         "Must render Models tab active"
     );
     assert!(
-        content.contains("Local Models (1)"),
+        content.contains("Mesh Models (1)"),
         "Must render models list pane"
     );
     assert!(

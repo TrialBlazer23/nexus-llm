@@ -1,6 +1,6 @@
 use crate::gguf::GgufMetadata;
+use crate::store::ModelIndex;
 use crate::sysinfo::SystemProfile;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Local GGUF catalog row with metadata cached at scan time (no reopen in render).
@@ -18,58 +18,64 @@ pub struct ModelEntry {
     pub block_count: usize,
     pub head_count: usize,
     pub embedding_length: usize,
+    /// Lowercase hex SHA-256 of file bytes (from content-addressed store).
+    pub digest: String,
 }
 
-/// Scan a directory for GGUF model files and inspect their metadata.
+/// Scan a directory for GGUF model files via the content-addressed index.
 pub fn scan_models_dir<P: AsRef<Path>>(dir: P) -> Vec<ModelEntry> {
-    let mut entries = Vec::new();
+    let dir = dir.as_ref();
+    let index = ModelIndex::reconcile_default(dir).unwrap_or_else(|_| ModelIndex {
+        version: 1,
+        models: Vec::new(),
+    });
+    entries_from_index(index, Some(dir))
+}
+
+/// Scan using an explicit index path (tests / alternate roots).
+pub fn scan_models_dir_with_index(dir: &Path, index_path: &Path) -> Vec<ModelEntry> {
+    let index = ModelIndex::reconcile(dir, index_path).unwrap_or_else(|_| ModelIndex {
+        version: 1,
+        models: Vec::new(),
+    });
+    entries_from_index(index, Some(dir))
+}
+
+fn entries_from_index(index: ModelIndex, only_under: Option<&Path>) -> Vec<ModelEntry> {
     let profile = SystemProfile::probe();
-
-    if let Ok(read_dir) = fs::read_dir(dir) {
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let is_gguf = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false);
-
-                if is_gguf {
-                    let filename = path
-                        .file_name()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-
-                    if let Ok(meta) = GgufMetadata::open(&path) {
-                        let size_mb = meta.file_size_bytes / (1024 * 1024);
-                        let context_length = meta.context_length.unwrap_or(4096);
-                        let exact_kv_bytes = meta.exact_kv_cache_bytes(context_length.min(4096));
-                        let exact_kv_mb = exact_kv_bytes / (1024 * 1024);
-                        let lmk_compatible =
-                            profile.can_safely_load_gguf(&meta, context_length.min(4096));
-
-                        entries.push(ModelEntry {
-                            path,
-                            filename,
-                            size_mb,
-                            architecture: meta
-                                .architecture
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            context_length,
-                            exact_kv_mb,
-                            lmk_compatible,
-                            gguf_version: meta.version,
-                            block_count: meta.block_count.unwrap_or(0),
-                            head_count: meta.head_count.unwrap_or(0),
-                            embedding_length: meta.embedding_length.unwrap_or(0),
-                        });
-                    }
-                }
+    let only_canon = only_under.and_then(|p| p.canonicalize().ok());
+    let mut entries = Vec::new();
+    for m in index.models {
+        if let Some(ref root) = only_canon {
+            let parent = m.path.parent().and_then(|p| p.canonicalize().ok());
+            if parent.as_ref() != Some(root) {
+                continue;
             }
         }
+        let (exact_kv_mb, lmk_compatible) = match GgufMetadata::open(&m.path) {
+            Ok(meta) => {
+                let ctx = m.context_length.min(4096);
+                let exact_kv_mb = meta.exact_kv_cache_bytes(ctx) / (1024 * 1024);
+                let lmk_compatible = profile.can_safely_load_gguf(&meta, ctx);
+                (exact_kv_mb, lmk_compatible)
+            }
+            Err(_) => (0, false),
+        };
+        entries.push(ModelEntry {
+            path: m.path,
+            filename: m.filename,
+            size_mb: m.size_bytes / (1024 * 1024),
+            architecture: m.architecture,
+            context_length: m.context_length,
+            exact_kv_mb,
+            lmk_compatible,
+            gguf_version: m.gguf_version,
+            block_count: m.block_count,
+            head_count: m.head_count,
+            embedding_length: m.embedding_length,
+            digest: m.digest,
+        });
     }
-
     entries.sort_by(|a, b| a.filename.cmp(&b.filename));
     entries
 }

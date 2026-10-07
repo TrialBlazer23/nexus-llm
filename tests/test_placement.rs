@@ -89,6 +89,7 @@ fn ranked_plans_include_predicted_tok_s() {
             is_local: false,
             thermal_index: 10,
         }],
+        bench: None,
     };
     let plans = rank_execution_plans(&req).expect("plans");
     assert!(!plans.is_empty());

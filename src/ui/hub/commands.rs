@@ -475,6 +475,7 @@ pub(crate) async fn build_target_selection(
             ctx.config.hardware.safety.mlock,
             ctx_size,
         );
+        let bench_store = crate::bench::BenchStore::load_default().ok();
         let req = PlacementRequest {
             gguf: &gguf,
             policy,
@@ -483,6 +484,7 @@ pub(crate) async fn build_target_selection(
             local_gpu_layers: gpu_layers,
             candidates: placement_candidates,
             enable_rpc: ctx.config.cluster.enable_rpc && ctx.config.cluster.auto_offload,
+            bench: bench_store.as_ref(),
         };
         if let Ok(plans) = rank_execution_plans(&req) {
             for plan in plans {

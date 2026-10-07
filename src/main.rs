@@ -194,6 +194,41 @@ enum Commands {
 
     /// Diagnose mesh / inference preconditions (binaries, ports, config, profile)
     Doctor,
+
+    /// Measure prompt/gen throughput and persist to ~/.nexus/bench.json (Phase 12 §5.5)
+    Bench {
+        /// OpenAI-compatible base URL (gateway, api_port, or fake llama)
+        #[arg(long)]
+        endpoint: String,
+
+        /// Model id as advertised by `/v1/models`
+        #[arg(short, long)]
+        model: String,
+
+        /// Context-size key recorded with the sample (does not change server -c)
+        #[arg(short = 'c', long, default_value_t = 2048)]
+        ctx: usize,
+
+        /// Number of timed streaming runs
+        #[arg(short = 'n', long, default_value_t = 3)]
+        runs: u32,
+
+        /// Prompt text for the benchmark completion
+        #[arg(long, default_value = "Write a short paragraph about mesh networking.")]
+        prompt: String,
+
+        /// Max tokens to generate per run
+        #[arg(long, default_value_t = 64)]
+        max_tokens: usize,
+
+        /// Node id key in the store (default: local)
+        #[arg(long, default_value = "local")]
+        node: String,
+
+        /// Backend key: vulkan | arm-dotprod | x86-sse41 | cpu (default: probed)
+        #[arg(long)]
+        backend: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -957,6 +992,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Log file: {}", path.display());
             }
             std::process::exit(report.exit_code());
+        }
+        Commands::Bench {
+            endpoint,
+            model,
+            ctx,
+            runs,
+            prompt,
+            max_tokens,
+            node,
+            backend,
+        } => {
+            use nexus::bench::{
+                backend_key, parse_backend_key, run_benchmark, BenchRunConfig, BenchStore,
+            };
+
+            let backend = backend
+                .as_deref()
+                .and_then(parse_backend_key)
+                .unwrap_or_else(|| SystemProfile::probe().detected_backend);
+
+            let path = BenchStore::default_path();
+            let mut store = BenchStore::load(&path)?;
+            println!(
+                "Bench: endpoint={} model={} node={} backend={} ctx={} runs={}",
+                endpoint,
+                model,
+                node,
+                backend_key(backend),
+                ctx,
+                runs
+            );
+            let cfg = BenchRunConfig {
+                endpoint: &endpoint,
+                model: &model,
+                node_id: &node,
+                backend,
+                context_size: ctx,
+                runs,
+                prompt: &prompt,
+                max_tokens,
+            };
+            let entry = run_benchmark(&mut store, &cfg).await?;
+            store.save(&path)?;
+            println!(
+                "Recorded gen_tok_s={:.2} ttft_ms={:?} prompt_tok_s={:?} → {}",
+                entry.gen_tok_s,
+                entry.ttft_ms,
+                entry.prompt_tok_s,
+                path.display()
+            );
+            for (i, sample) in entry.samples.iter().enumerate() {
+                println!(
+                    "  run {}: gen_tok_s={:.2} ttft_ms={:?}",
+                    i + 1,
+                    sample.gen_tok_s,
+                    sample.ttft_ms
+                );
+            }
         }
     }
 

@@ -1076,6 +1076,13 @@ between a useful node and a hot, dead battery:
 
 ### 5.5 Benchmarking and telemetry history
 
+> **Status (2026-10-07): Done on `cursor/phase12-bench-telemetry-5f3d`.**
+> `src/bench.rs` persists samples to `~/.nexus/bench.json` (`NEXUS_BENCH_PATH`
+> override). `nexus bench --endpoint … --model …` times streaming completions;
+> chat `finalize_stream` appends best-effort samples. Phase 11
+> `predict_local_tok_s` prefers measured `gen_tok_s` when a matching store entry
+> exists. CI covers store I/O + fake-llama measurement + ranker preference.
+
 A `nexus bench` subcommand measuring prompt-eval and token-generation throughput
 per (model, node, backend, context) combination, persisted to
 `~/.nexus/bench.json`, would give the placement planner (§3.8) real numbers
@@ -1262,26 +1269,27 @@ options with predicted tokens per second; a 32 GB worker can advertise more than
 
 ### Phase 12 — Capability expansion
 
-> **Status (2026-10-07): §5.1 MVP in progress/shipped on
-> `cursor/phase12-mesh-gateway-5f3d`.** Mesh OpenAI gateway on `gateway_port`
-> 8090 (`src/gateway.rs`). Remaining backlog (§5.2–§5.6) and hub rebind
-> collapse are follow-on PRs. Out of scope for this track: beacon v2 `ctrl`/
-> display name, control-plane SSE `/events`, Tunnel hub tab, closing stale
-> draft PRs #9–#12.
+> **Status (2026-10-07):** §5.1 mesh gateway **merged** (PR #16, `gateway_port`
+> 8090). §5.5 bench telemetry on `cursor/phase12-bench-telemetry-5f3d`.
+> Remaining: hub rebind collapse, §5.4 thermal/battery, §5.2 slot restore,
+> §5.3 draft model, §5.6 embeddings. Out of scope: beacon v2, SSE `/events`,
+> Tunnel hub tab, closing stale draft PRs #9–#12.
 
 - ~~Mesh gateway: one OpenAI-compatible endpoint fronting the whole mesh (§5.1)~~
   **MVP Done** (`gateway_port` 8090; fake-llama multi-holder CI coverage)
 - Prompt cache reuse and session restore (§5.2, §2.8) — follow-on
 - Speculative decoding with a draft model (§5.3) — follow-on
 - Thermal, power, and battery-aware scheduling (§5.4) — follow-on
-- `nexus bench` feeding the planner (§5.5) — follow-on
+- ~~`nexus bench` feeding the planner (§5.5)~~ **Done** (`src/bench.rs`,
+  `~/.nexus/bench.json`, ranker hook, fake-llama CI)
 - Optional: embeddings and local retrieval (§5.6) — follow-on
 
 *Invasiveness:* mostly additive, built on Phases 7–11.
 *Acceptance:* an unmodified OpenAI client reaches the active model through any
 node (**§5.1 MVP: covered by fake llama harness; live multi-node LAN soak
 remaining**); a resumed session skips prompt reprocessing; a hot phone declines
-a load instead of thermally throttling mid-generation.
+a load instead of thermally throttling mid-generation; placement rankings use
+measured tok/s when `bench.json` has samples (**§5.5 unit-tested**).
 
 ### Continuous
 

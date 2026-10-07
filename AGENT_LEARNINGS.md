@@ -25,16 +25,27 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-07 — Phase 12 §5.5 bench store feeding placement ranker
+- Category: design-decision
+- Context: CAPABILITY_REVIEW §5.5 on `cursor/phase12-bench-telemetry-5f3d` from `origin/main` (rebased after gateway #16).
+- Finding:
+  1. `GenerationMetrics` only lived in-session / thin JSONL; placement `predict_local_tok_s` used fixed backend heuristics (Vulkan 28, etc.).
+  2. Persist rolling averages to `~/.nexus/bench.json` keyed by `(model_id, node_id, backend, context_size)`; override with `NEXUS_BENCH_PATH`.
+  3. Prefer measured `gen_tok_s` as the prediction base (still apply layer_frac + thermal); skip quant boost when measured.
+  4. `nexus bench --endpoint` works against any OpenAI surface (gateway/api/fake llama) — no GGUF required for CI.
+- Action: Added `src/bench.rs`, CLI `Commands::Bench`, `PlacementRequest.bench`, chat finalize best-effort record, `tests/test_bench.rs`.
+- Verification: `cargo fmt`, `clippy -D warnings`, `cargo test --locked` (store + fake-llama measure + ranker prefers 500 tok/s sample).
+
 ## 2026-10-07 — Phase 12 §5.1 mesh gateway on dedicated gateway_port
 - Category: design-decision
-- Context: CAPABILITY_REVIEW §5.1 / Phase 12 MVP on `cursor/phase12-mesh-gateway-5f3d` from `origin/main` @ `038eaa4`.
+- Context: CAPABILITY_REVIEW §5.1 / Phase 12 MVP on `cursor/phase12-mesh-gateway-5f3d` (merged as PR #16).
 - Finding:
-  1. Do not multiplex the mesh OpenAI front door onto `api_port` (llama-server owns 8080) or `control_port` (signed trust domain on 9998). Use `network.gateway_port` default 8090 + `gateway_enabled`.
+  1. Do not multiplex the mesh OpenAI front door onto `api_port` (llama-server owns 8080) or `control_port` (signed trust domain on 9998). Use `network.gateway_port` default 8090 + `gateway_enabled` (8090 avoids multi-slot ports from 8080).
   2. Inbound `/v1/*` stays unauthenticated so unmodified OpenAI clients work; when pairing is enforced, resolution only considers verified/trusted peers.
   3. Prefer byte-stream reverse proxy for `/v1/chat/completions` over re-tokenizing via `NexusClient::stream_chat` (that API yields text tokens only and would break OpenAI chunk shape).
   4. `PeerRegistry` has no model fields — resolve via local `SupervisorManager`/`DiscoveryService` `active_model` plus peer beacon `active_model`. Auto-load on miss and full hub rebind collapse are follow-ons.
 - Action: Added `src/gateway.rs`, config/Settings/doctor wiring, hub bootstrap prefers local gateway, `tests/test_gateway.rs` with multi-holder `fake_llama`.
-- Verification: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (incl. gateway suite). Live multi-node LAN soak still required.
+- Verification: `cargo test --locked` (incl. gateway suite). Live multi-node LAN soak still required.
 
 ## 2026-10-07 — Continuous: CI, Penryn opcode scan, decoder property tests, fake llama
 - Category: design-decision | environment

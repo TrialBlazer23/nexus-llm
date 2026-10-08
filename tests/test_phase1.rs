@@ -263,6 +263,7 @@ fn test_supervisor_command_args_builder() {
         cache_type_v: None,
         memory_budget_percent: 75,
         tags: Vec::new(),
+        slot_save_path: None,
     };
 
     // Test Vulkan offload args (-ngl 99)
@@ -322,6 +323,19 @@ fn test_supervisor_command_args_builder() {
     let policy = nexus::supervisor::SupervisorPolicy::default();
     assert!(policy.backoff_delay(0).as_millis() >= 1000);
     assert!(policy.backoff_delay(2) > policy.backoff_delay(0));
+
+    let mut with_slot = cfg.clone();
+    with_slot.slot_save_path = Some(PathBuf::from("/tmp/slots"));
+    let slot_args = with_slot.build_args(99);
+    assert!(slot_args.iter().any(|a| a == "--slot-save-path"));
+    assert_eq!(
+        slot_args
+            .iter()
+            .skip_while(|&x| x != "--slot-save-path")
+            .nth(1)
+            .unwrap(),
+        "/tmp/slots"
+    );
 }
 
 #[tokio::test]
@@ -343,6 +357,7 @@ async fn test_supervisor_preflight_binary_not_found() {
         cache_type_v: None,
         memory_budget_percent: 75,
         tags: Vec::new(),
+        slot_save_path: None,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -380,6 +395,7 @@ async fn test_supervisor_preflight_model_not_found() {
         cache_type_v: None,
         memory_budget_percent: 75,
         tags: Vec::new(),
+        slot_save_path: None,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;
@@ -430,6 +446,7 @@ async fn test_supervisor_memory_cap_rejection() {
         cache_type_v: None,
         memory_budget_percent: 75,
         tags: Vec::new(),
+        slot_save_path: None,
     };
 
     let res = ProcessSupervisor::spawn_with_fallback(cfg).await;

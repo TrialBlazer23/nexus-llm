@@ -25,6 +25,28 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-08 — Web UI Superpowers (Track A) & Prompt Cache Slot Persistence (Track B)
+- Category: design-decision | bug
+- Context: Implementing Track A (Hugging Face Search & 1-Click Download, GGUF Header Inspection, Runtime Settings Editor) and Track B (Prompt Cache KV slot persistence `--slot-save-path` and disk quota eviction) with configurable options for inference and battery safety.
+- Finding:
+  1. **Llama-server Slot Persistence Isolation**: When enabling `--slot-save-path`, llama.cpp expects a dedicated directory where KV state is serialized across turns. Creating this directory asynchronously prior to child process spawn and enforcing an LRU disk quota (`enforce_slot_cache_quota`) prevents cache exhaustion without requiring external daemons.
+  2. **Configurable Runtime Policies with Disk Persistence**: Exposing `GET /api/config` and `POST /api/config` allows operators to modify prompt caching and battery safety thresholds dynamically from the Web UI, with automatic serialization to `config.toml` via `NexusConfig::save()`.
+  3. **Zero-Allocation GGUF Header Inspection**: `GgufMetadata::open()` reads and deserializes the binary header and tensor metadata dictionary without mapping tensor buffers into RAM, enabling instant client inspection of architecture, dominant quantization, context limit, and layer geometry.
+  4. **Background Download Coordination in Gateway**: Running `ModelDownloader` in a background `tokio::spawn` task while exposing atomic progress through `GET /api/models/download/status` decouples file acquisition from HTTP connection lifetimes, preventing connection timeouts on slow or mobile connections.
+- Action: Implemented slot cache quota enforcement in `src/supervisor.rs`, wired `slot_save_path` throughout supervisors and CLI/daemon, added gateway endpoints (`/api/hf/*`, `/api/models/*`, `/api/config`), added Settings tab and inspection/HF modals in `web/dist/index.html`, and added comprehensive integration tests in `tests/test_gateway.rs`.
+- Verification: `cargo test --locked`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo fmt --check`, `bash scripts/check_penryn_opcodes.sh`, `bash scripts/build_web.sh`.
+
+## 2026-10-08 — Embedded Zero-Dependency Web Interface, Gateway API Routing, & Termux Environment
+- Category: design-decision | environment | bug
+- Context: Implementing the embedded single-page Web Interface served via the Mesh Gateway (`network.gateway_port`, 8090) with PIN authentication, cluster telemetry SSE, and model orchestration across Termux ARM64 and legacy x86.
+- Finding:
+  1. **Zero-dependency single-bundle web embedding**: Using `include_str!("../web/dist/index.html")` with an optional `NEXUS_WEB_DIR` override provides sub-millisecond serving directly from hyper without requiring Node.js, npm, or heavy embedding crates (`rust-embed`) on edge targets.
+  2. **Raw string literal prefixing in Rust 2021**: In Rust 2021 edition, raw string literals containing `#` followed by characters like `0b...` (e.g. `fill="#0b0f19"`) or `"sans-serif"` trigger compiler errors (`prefix serif is unknown`, `expected operator, found 0b0f19`). Use `r##"..."##` delimiters to escape internal `#` and quotes cleanly.
+  3. **RwLock across async awaits**: Hyper route handlers must not hold `std::sync::RwLockReadGuard` across `.await` points (such as `local_active_model().await`), which fails the `Send` trait bound on `tokio::spawn`. Always scope synchronous locks inside local blocks `{ let val = lock.read().unwrap(); ... }`.
+  4. **Termux shebang resolution**: Shell scripts on Android Termux fail with `bad interpreter: No such file or directory` if using `/usr/bin/env bash`. Execute scripts via `bash scripts/<script>.sh` or configure Termux-compatible interpreters.
+- Action: Implemented single-page Web Hub (`web/dist/index.html`), PWA manifest, `/api/*` telemetry and PIN verification endpoints, `nexus web` CLI subcommand, and `test_gateway_serves_web_ui_and_api` integration tests.
+- Verification: `cargo test --locked`, `cargo check --bins`, `bash scripts/build_web.sh`.
+
 ## 2026-10-07 — Phase 4: Models Tab Explorer, Sharded GGUF Aggregation, & Sequential Download Queue
 - Category: design-decision | bug
 - Context: Implementing Models tab dual-mode navigation (Local vs HF Explorer), multi-shard GGUF grouping, and automated sequential shard download queueing.

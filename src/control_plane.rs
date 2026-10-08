@@ -1052,6 +1052,9 @@ pub async fn handle_load_model(
         cache_type_v: None,
         memory_budget_percent,
         tags: request.tags.clone(),
+        slot_save_path: std::env::var("NEXUS_SLOT_CACHE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from),
     };
 
     match manager.spawn_slot(config).await {

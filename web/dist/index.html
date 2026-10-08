@@ -1,0 +1,2080 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Nexus-LLM Hub</title>
+  <meta name="description" content="Distributed LLM Mesh Orchestrator & Client">
+  <meta name="theme-color" content="#0b0f19">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.json">
+  <style>
+    :root {
+      --bg-dark: #0b0f19;
+      --bg-card: #111827;
+      --bg-card-hover: #1f293d;
+      --bg-input: #151d30;
+      --border-color: #23314d;
+      --border-focus: #38bdf8;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent-cyan: #06b6d4;
+      --accent-blue: #3b82f6;
+      --accent-green: #10b981;
+      --accent-yellow: #f59e0b;
+      --accent-red: #ef4444;
+      --accent-purple: #8b5cf6;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: var(--bg-dark);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      width: 100%;
+      position: relative;
+    }
+    /* Top Header */
+    header {
+      height: 56px;
+      min-height: 56px;
+      background: rgba(17, 24, 39, 0.95);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      z-index: 40;
+    }
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-badge {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #06b6d4, #3b82f6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 900;
+      font-size: 16px;
+      color: #fff;
+      box-shadow: 0 0 12px rgba(6, 182, 212, 0.4);
+    }
+    .brand-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-title span.tag {
+      font-size: 10px;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(6, 182, 212, 0.15);
+      color: var(--accent-cyan);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      font-weight: 600;
+    }
+    .header-center {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .active-model-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .active-model-pill:hover {
+      border-color: var(--accent-cyan);
+      color: var(--text-main);
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 8px var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.9); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--text-muted);
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #0284c7, #0369a1);
+      border-color: #38bdf8;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #0369a1, #075985);
+    }
+    .btn-auth {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 20px;
+    }
+    .btn-auth.admin {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: rgba(16, 185, 129, 0.4);
+      color: var(--accent-green);
+    }
+    .btn-auth.guest {
+      background: rgba(245, 158, 11, 0.15);
+      border-color: rgba(245, 158, 11, 0.4);
+      color: var(--accent-yellow);
+    }
+
+    /* Main Container & Tabs */
+    .main-layout {
+      display: flex;
+      flex: 1;
+      height: calc(100% - 56px);
+      overflow: hidden;
+      position: relative;
+    }
+    nav.tab-bar {
+      width: 72px;
+      min-width: 72px;
+      background: #0f1523;
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 16px 0;
+      gap: 16px;
+      z-index: 30;
+    }
+    .tab-btn {
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      font-size: 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn svg { width: 20px; height: 20px; }
+    .tab-btn:hover {
+      background: var(--bg-card);
+      color: var(--text-main);
+    }
+    .tab-btn.active {
+      background: rgba(6, 182, 212, 0.15);
+      border-color: rgba(6, 182, 212, 0.4);
+      color: var(--accent-cyan);
+      box-shadow: 0 0 16px rgba(6, 182, 212, 0.15);
+    }
+    .tab-content {
+      flex: 1;
+      height: 100%;
+      overflow: hidden;
+      position: relative;
+      display: none;
+    }
+    .tab-content.active {
+      display: flex;
+    }
+
+    /* CHAT TAB */
+    .chat-container {
+      display: flex;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    .chat-sidebar {
+      width: 260px;
+      min-width: 260px;
+      background: #0e1422;
+      border-right: 1px solid var(--border-color);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .sidebar-header {
+      padding: 14px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      gap: 8px;
+    }
+    .session-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .session-item {
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: all 0.15s;
+    }
+    .session-item:hover {
+      background: var(--bg-card);
+      color: var(--text-main);
+    }
+    .session-item.active {
+      background: var(--bg-card-hover);
+      color: var(--text-main);
+      border-left: 3px solid var(--accent-cyan);
+    }
+    .session-title {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 170px;
+    }
+    .chat-main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      background: var(--bg-dark);
+      position: relative;
+    }
+    .chat-top-status {
+      height: 38px;
+      min-height: 38px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 12px;
+      color: var(--text-muted);
+      background: rgba(15, 21, 35, 0.5);
+    }
+    .ctx-meter {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ctx-bar {
+      width: 120px;
+      height: 6px;
+      background: #1e293b;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .ctx-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent-cyan);
+      transition: width 0.3s;
+    }
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      scroll-behavior: smooth;
+    }
+    .msg-row {
+      display: flex;
+      gap: 14px;
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .msg-avatar {
+      width: 32px;
+      height: 32px;
+      min-width: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .msg-row.user .msg-avatar {
+      background: #3b82f6;
+      color: #fff;
+    }
+    .msg-row.assistant .msg-avatar {
+      background: linear-gradient(135deg, #06b6d4, #10b981);
+      color: #fff;
+    }
+    .msg-body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .msg-sender {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .msg-bubble {
+      padding: 12px 16px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.6;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      overflow-wrap: break-word;
+    }
+    .msg-row.user .msg-bubble {
+      background: #1e293b;
+      border-color: #334155;
+    }
+    /* Reasoning accordion */
+    details.think-box {
+      margin-bottom: 10px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.8);
+      overflow: hidden;
+    }
+    details.think-box summary {
+      padding: 6px 12px;
+      font-size: 12px;
+      color: #94a3b8;
+      cursor: pointer;
+      user-select: none;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    details.think-box .think-content {
+      padding: 8px 12px;
+      font-size: 13px;
+      color: #cbd5e1;
+      font-style: italic;
+      border-top: 1px solid #1e293b;
+      white-space: pre-wrap;
+    }
+    /* Code Blocks */
+    .code-container {
+      margin: 10px 0;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #334155;
+      background: #090d16;
+    }
+    .code-header {
+      background: #111827;
+      padding: 6px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: #94a3b8;
+      border-bottom: 1px solid #1f293d;
+    }
+    .copy-btn {
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: color 0.15s;
+    }
+    .copy-btn:hover { color: #fff; }
+    pre.code-block {
+      padding: 12px;
+      margin: 0;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.5;
+      color: #e2e8f0;
+    }
+    /* Chat Input Form */
+    .chat-bottom-bar {
+      padding: 16px 24px;
+      border-top: 1px solid var(--border-color);
+      background: rgba(17, 24, 39, 0.95);
+      position: relative;
+    }
+    .input-box-wrapper {
+      max-width: 900px;
+      margin: 0 auto;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      background: var(--bg-input);
+      transition: border-color 0.2s;
+    }
+    .input-box-wrapper:focus-within {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 12px rgba(6, 182, 212, 0.2);
+    }
+    textarea#chatInput {
+      width: 100%;
+      min-height: 52px;
+      max-height: 180px;
+      padding: 12px 14px;
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      resize: none;
+      outline: none;
+    }
+    .input-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .input-hints {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .send-btn-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    /* CLUSTER TAB */
+    .cluster-view {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 24px;
+      gap: 24px;
+    }
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .section-title {
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .mesh-canvas-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 24px;
+      position: relative;
+      min-height: 320px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .node-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      z-index: 2;
+    }
+    .node-card {
+      background: #151d30;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      transition: all 0.2s;
+      position: relative;
+    }
+    .node-card:hover {
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+    }
+    .node-card.host-active {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 16px rgba(6, 182, 212, 0.25);
+    }
+    .node-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .node-name {
+      font-weight: 700;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .node-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .meter-label {
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .bar-container {
+      height: 8px;
+      background: #23314d;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .bar-fill {
+      height: 100%;
+      background: var(--accent-cyan);
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+    .safe-threshold-line {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 75%;
+      width: 2px;
+      background: var(--accent-red);
+      z-index: 5;
+    }
+
+    /* SVG RPC PIPELINE */
+    .rpc-pipeline-visualizer {
+      width: 100%;
+      height: 140px;
+      position: relative;
+      margin: 10px 0;
+      background: #090e1a;
+      border-radius: 10px;
+      border: 1px dashed var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* MODELS TAB */
+    .models-view {
+      width: 100%;
+      height: 100%;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .models-table-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    table.models-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+    table.models-table th {
+      background: #151d30;
+      padding: 12px 16px;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border-color);
+    }
+    table.models-table td {
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    table.models-table tr:hover td {
+      background: var(--bg-card-hover);
+    }
+
+    /* LAYER SPLIT CALCULATOR */
+    .calculator-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .calc-slider-box {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .calc-slider-box input[type="range"] {
+      width: 100%;
+      height: 8px;
+      border-radius: 4px;
+      accent-color: var(--accent-cyan);
+      cursor: pointer;
+    }
+
+    /* LOGS TAB */
+    .logs-view {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      background: #070a12;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+    .logs-header {
+      padding: 10px 16px;
+      background: var(--bg-card);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .logs-console {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      line-height: 1.6;
+      color: #94a3b8;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .log-line.error { color: var(--accent-red); }
+    .log-line.warn { color: var(--accent-yellow); }
+    .log-line.info { color: #38bdf8; }
+
+    /* AUTH MODAL */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+    }
+    .modal-overlay.open {
+      display: flex;
+    }
+    .modal-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 24px;
+      max-width: 400px;
+      width: 90%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .pin-input {
+      font-family: var(--font-mono);
+      font-size: 24px;
+      letter-spacing: 6px;
+      text-align: center;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      color: #fff;
+      outline: none;
+    }
+    .pin-input:focus { border-color: var(--accent-cyan); }
+
+    /* SETTINGS TAB */
+    .settings-view {
+      width: 100%;
+      height: 100%;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 20px;
+    }
+    .settings-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .settings-card-title {
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--accent-cyan);
+    }
+    .settings-card-desc {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+    .setting-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .setting-item:last-child {
+      border-bottom: none;
+    }
+    .setting-item-text {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .setting-hint {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .setting-input {
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .setting-input:focus {
+      border-color: var(--accent-cyan);
+    }
+    input.switch[type="checkbox"] {
+      width: 40px;
+      height: 22px;
+      appearance: none;
+      background: #1e293b;
+      border-radius: 11px;
+      position: relative;
+      cursor: pointer;
+      outline: none;
+      transition: background 0.2s;
+    }
+    input.switch[type="checkbox"]:checked {
+      background: var(--accent-cyan);
+    }
+    input.switch[type="checkbox"]::after {
+      content: '';
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      top: 2px;
+      left: 2px;
+      transition: transform 0.2s;
+    }
+    input.switch[type="checkbox"]:checked::after {
+      transform: translateX(18px);
+    }
+
+    /* BADGES & MODAL SIZES */
+    .badge-fits {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--accent-green);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .badge-offload {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--accent-yellow);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
+    .badge-exceeds {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--accent-red);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .modal-card-lg {
+      max-width: 640px;
+      width: 95%;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+
+    /* Responsive Mobile Overrides */
+    @media (max-width: 768px) {
+      .main-layout {
+        flex-direction: column-reverse;
+      }
+      nav.tab-bar {
+        width: 100%;
+        height: 60px;
+        min-height: 60px;
+        flex-direction: row;
+        border-right: none;
+        border-top: 1px solid var(--border-color);
+        justify-content: space-around;
+        padding: 0 8px;
+      }
+      .tab-btn {
+        width: 48px;
+        height: 48px;
+      }
+      .chat-sidebar {
+        display: none; /* Collapsed on mobile, toggleable */
+      }
+      .brand-title span.tag { display: none; }
+      .chat-messages { padding: 12px 14px; }
+      .chat-bottom-bar { padding: 8px 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- Top Header -->
+    <header>
+      <div class="brand-section">
+        <div class="logo-badge">N</div>
+        <div class="brand-title">
+          Nexus-LLM
+          <span class="tag">Mesh Hub</span>
+        </div>
+      </div>
+      <div class="header-center">
+        <div class="active-model-pill" id="activeModelPill" onclick="switchTab('models')">
+          <div class="pulse-dot"></div>
+          <span id="headerModelName">Probing Mesh...</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-auth guest" id="authBtn" onclick="openAuthModal()">
+          <span id="authIcon">🔒</span> <span id="authLabel">Guest</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Area -->
+    <div class="main-layout">
+      <!-- Tab Navigation Sidebar / Bottom Bar -->
+      <nav class="tab-bar">
+        <button class="tab-btn active" id="tabBtn-chat" onclick="switchTab('chat')" title="Chat (F1)">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+          Chat
+        </button>
+        <button class="tab-btn" id="tabBtn-cluster" onclick="switchTab('cluster')" title="Cluster Mesh (F3)">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+          Cluster
+        </button>
+        <button class="tab-btn" id="tabBtn-models" onclick="switchTab('models')" title="Models & Split (F2)">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg>
+          Models
+        </button>
+        <button class="tab-btn" id="tabBtn-logs" onclick="switchTab('logs')" title="Telemetry Logs (F7)">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+          Logs
+        </button>
+        <button class="tab-btn" id="tabBtn-settings" onclick="switchTab('settings')" title="Settings & Cache (F8)">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+          Settings
+        </button>
+      </nav>
+
+      <!-- TAB 1: CHAT -->
+      <div class="tab-content active" id="tabContent-chat">
+        <div class="chat-container">
+          <div class="chat-sidebar">
+            <div class="sidebar-header">
+              <button class="btn btn-primary" style="width: 100%" onclick="createNewSession()">+ New Chat</button>
+            </div>
+            <div class="session-list" id="sessionList">
+              <!-- Dynamically populated from IndexedDB -->
+            </div>
+          </div>
+          <div class="chat-main">
+            <div class="chat-top-status">
+              <div class="ctx-meter">
+                <span>Context: <strong id="ctxCount">0</strong> / <span id="ctxLimit">4096</span></span>
+                <div class="ctx-bar">
+                  <div class="ctx-fill" id="ctxFill"></div>
+                </div>
+              </div>
+              <div id="genSpeedBadge">Ready</div>
+            </div>
+            <div class="chat-messages" id="chatMessages">
+              <div class="msg-row assistant">
+                <div class="msg-avatar">⚡</div>
+                <div class="msg-body">
+                  <div class="msg-sender">Nexus-LLM Mesh</div>
+                  <div class="msg-bubble">
+                    Welcome to <strong>Nexus-LLM Web Hub</strong>. Connected across your heterogeneous device mesh.<br/>
+                    Start chatting with the active model, or switch to <strong>Cluster</strong> or <strong>Models</strong> to distribute and offload layers.
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="chat-bottom-bar">
+              <div class="input-box-wrapper">
+                <textarea id="chatInput" placeholder="Message active model... (Enter to send, Shift+Enter for newline, '/' for commands)" rows="1"></textarea>
+                <div class="input-controls">
+                  <div class="input-hints">Esc to abort · Markdown & Code enabled</div>
+                  <div class="send-btn-group">
+                    <button class="btn" id="abortBtn" style="display:none; color:var(--accent-red)" onclick="abortChatStream()">Stop</button>
+                    <button class="btn btn-primary" id="sendBtn" onclick="sendChatMessage()">Send</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: CLUSTER -->
+      <div class="tab-content" id="tabContent-cluster">
+        <div class="cluster-view">
+          <div class="section-header">
+            <div class="section-title">Mesh Node Topology</div>
+            <button class="btn" onclick="fetchClusterNodes()">Refresh Mesh</button>
+          </div>
+          <div class="mesh-canvas-card">
+            <div class="rpc-pipeline-visualizer" id="rpcVisualizer">
+              <svg width="100%" height="100%" id="pipelineSvg">
+                <defs>
+                  <linearGradient id="pipeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stop-color="#06b6d4" />
+                    <stop offset="100%" stop-color="#3b82f6" />
+                  </linearGradient>
+                </defs>
+                <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#64748b" font-size="13">
+                  Pipelined Layer Offload Graph (Sequential RPC Mesh)
+                </text>
+              </svg>
+            </div>
+            <div class="node-grid" id="clusterNodeGrid">
+              <!-- Dynamically populated node cards -->
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: MODELS & SPLIT CALCULATOR -->
+      <div class="tab-content" id="tabContent-models">
+        <div class="models-view">
+          <div class="section-header">
+            <div class="section-title">GGUF Model Catalog & Layer Split Calculator</div>
+            <button class="btn btn-primary" onclick="openHfModal()">🔍 Search Hugging Face</button>
+          </div>
+
+          <!-- Interactive Calculator -->
+          <div class="calculator-card">
+            <div style="font-weight: 700; font-size: 15px; color: var(--accent-cyan)">
+              Visual Sequential Layer Split Planner
+            </div>
+            <p style="font-size: 13px; color: var(--text-muted)">
+              Drag the layer offload slider to balance compute between your phone's Vulkan VRAM and remote RPC workers without exceeding Android's 75% LMK limit.
+            </p>
+            <div class="calc-slider-box">
+              <div style="display: flex; justify-content: space-between; font-size: 13px;">
+                <span>Local GPU Layers: <strong id="gpuLayerCount" style="color:var(--accent-cyan)">24</strong></span>
+                <span>Offloaded RPC Layers: <strong id="rpcLayerCount" style="color:var(--accent-purple)">8</strong></span>
+              </div>
+              <input type="range" id="layerSlider" min="0" max="32" value="24" oninput="updateLayerSplit(this.value)">
+            </div>
+            <div id="splitSafetySummary" style="font-size: 12px; color: var(--accent-green)">
+              ✅ Allocation within safe LMK budget (Phone: ~4.1 GB / 8.5 GB allocatable)
+            </div>
+          </div>
+
+          <!-- Catalog Table -->
+          <div class="models-table-card">
+            <table class="models-table">
+              <thead>
+                <tr>
+                  <th>Model Name</th>
+                  <th>Size</th>
+                  <th>Context Limit</th>
+                  <th>Holders</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="modelsTableBody">
+                <!-- Dynamically loaded -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 4: LOGS -->
+      <div class="tab-content" id="tabContent-logs">
+        <div class="logs-view">
+          <div class="logs-header">
+            <span>Process & Mesh Event Stream</span>
+            <button class="btn" onclick="clearLogs()">Clear</button>
+          </div>
+          <div class="logs-console" id="logsConsole">
+            <div class="log-line info">[SYS] Nexus-LLM Telemetry stream initialized.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 5: SETTINGS -->
+      <div class="tab-content" id="tabContent-settings">
+        <div class="settings-view">
+          <div class="section-header">
+            <div class="section-title">Mesh & Hardware Configuration</div>
+            <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+          </div>
+
+          <div class="settings-grid">
+            <!-- Prompt Cache & Slot Persistence -->
+            <div class="settings-card">
+              <div class="settings-card-title">
+                ⚡ Inference & Prompt Cache Persistence
+              </div>
+              <p class="settings-card-desc">
+                Enable sequential KV slot disk persistence (<code style="color:var(--accent-cyan)">--slot-save-path</code>) to eliminate prompt recomputation across conversational turns and multi-turn sessions.
+              </p>
+              
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="promptCacheToggle" style="font-weight:600">Prompt Cache Slot Persistence</label>
+                  <div class="setting-hint">Save KV cache slots to disk for instant session resumption</div>
+                </div>
+                <input type="checkbox" id="promptCacheToggle" class="switch" checked>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="slotSavePathInput" style="font-weight:600">Slot Cache Directory</label>
+                  <div class="setting-hint">Folder where slot checkpoint files are persisted</div>
+                </div>
+                <input type="text" id="slotSavePathInput" class="setting-input" value="~/.nexus/slots" placeholder="~/.nexus/slots">
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="maxCacheMbInput" style="font-weight:600">Max Disk Cache Quota (MB)</label>
+                  <div class="setting-hint">Automatic LRU eviction keeps total directory size below this limit</div>
+                </div>
+                <input type="number" id="maxCacheMbInput" class="setting-input" value="2048" min="256" step="256" style="width:120px">
+              </div>
+            </div>
+
+            <!-- Hardware & Battery Safety -->
+            <div class="settings-card">
+              <div class="settings-card-title">
+                🛡️ Hardware Safety & Mobile Battery Guard
+              </div>
+              <p class="settings-card-desc">
+                Configure Android LMK memory thresholds and mobile battery preservation policies for unattended mesh nodes.
+              </p>
+
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="batteryFloorSlider" style="font-weight:600">Battery Floor Limit: <span id="batteryFloorVal" style="color:var(--accent-yellow)">20%</span></label>
+                  <div class="setting-hint">Refuse or throttle compute when battery level falls below this threshold</div>
+                </div>
+                <input type="range" id="batteryFloorSlider" min="5" max="50" value="20" oninput="document.getElementById('batteryFloorVal').textContent = this.value + '%'">
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="batteryActionSelect" style="font-weight:600">Low Battery Action</label>
+                  <div class="setting-hint">Policy enforced when node operates below the battery floor</div>
+                </div>
+                <select id="batteryActionSelect" class="setting-input" style="width:200px">
+                  <option value="decline">Decline Remote Requests</option>
+                  <option value="throttle">Throttle CPU/GPU Layers</option>
+                  <option value="ignore">Ignore (Run Unconstrained)</option>
+                </select>
+              </div>
+
+              <div class="setting-item">
+                <div class="setting-item-text">
+                  <label for="maxRamSlider" style="font-weight:600">Max RAM Usage Ceiling: <span id="maxRamVal" style="color:var(--accent-cyan)">75%</span></label>
+                  <div class="setting-hint">Android LMK safety ceiling (rejects models that exceed this available memory fraction)</div>
+                </div>
+                <input type="range" id="maxRamSlider" min="50" max="90" value="75" oninput="document.getElementById('maxRamVal').textContent = this.value + '%'">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUTHENTICATION MODAL -->
+  <div class="modal-overlay" id="authModal">
+    <div class="modal-card">
+      <div style="font-size: 16px; font-weight: 700">Enter Admin 6-Digit PIN</div>
+      <p style="font-size: 13px; color: var(--text-muted)">
+        Enter the 6-digit pairing code displayed in your terminal or Nexus TUI to unlock administrative model loading and node dispatch.
+      </p>
+      <input type="text" class="pin-input" id="pinInput" maxlength="6" placeholder="000000" autofocus>
+      <div style="display: flex; justify-content: flex-end; gap: 8px;">
+        <button class="btn" onclick="closeAuthModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="submitPin()">Verify PIN</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- GGUF INSPECTION MODAL -->
+  <div class="modal-overlay" id="inspectModal">
+    <div class="modal-card modal-card-lg">
+      <div style="display:flex; justify-content:space-between; align-items:center">
+        <div style="font-size: 16px; font-weight: 700" id="inspectTitle">GGUF Metadata Inspector</div>
+        <button class="btn" style="padding:2px 8px;font-size:12px" onclick="closeInspectModal()">✕</button>
+      </div>
+      <div id="inspectContent" style="display:flex; flex-direction:column; gap:12px; font-size:13px">
+        <!-- Dynamically loaded inspection cards -->
+      </div>
+      <div style="display:flex; justify-content:flex-end">
+        <button class="btn" onclick="closeInspectModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HUGGING FACE SEARCH & DOWNLOAD MODAL -->
+  <div class="modal-overlay" id="hfModal">
+    <div class="modal-card modal-card-lg">
+      <div style="display:flex; justify-content:space-between; align-items:center">
+        <div style="font-size: 16px; font-weight: 700">Hugging Face GGUF Hub</div>
+        <button class="btn" style="padding:2px 8px;font-size:12px" onclick="closeHfModal()">✕</button>
+      </div>
+      <p style="font-size: 13px; color: var(--text-muted)">
+        Search GGUF models directly from Hugging Face Hub, check compatibility against your device RAM, and download in 1 click.
+      </p>
+
+      <div style="display:flex; gap:8px">
+        <input type="text" id="hfSearchInput" class="setting-input" style="flex:1" placeholder="Search (e.g. Qwen2.5-Coder, Llama-3.2, bartowski/...)">
+        <button class="btn btn-primary" onclick="searchHf()">Search</button>
+      </div>
+
+      <!-- Download progress banner if download active -->
+      <div id="dlProgressBox" style="display:none; background:rgba(6,182,212,0.1); border:1px solid var(--accent-cyan); border-radius:8px; padding:12px">
+        <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px">
+          <span id="dlFileName" style="font-weight:600">Downloading model...</span>
+          <span id="dlSpeed" style="color:var(--accent-cyan)">0 MB/s</span>
+        </div>
+        <div class="bar-container" style="height:10px">
+          <div class="bar-fill" id="dlBarFill" style="width:0%"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-muted); margin-top:4px">
+          <span id="dlBytes">0 MB / 0 MB</span>
+          <span id="dlPercent">0%</span>
+        </div>
+      </div>
+
+      <!-- Search results or quants list -->
+      <div id="hfResultsList" style="max-height:360px; overflow-y:auto; display:flex; flex-direction:column; gap:8px">
+        <div style="color:var(--text-muted); text-align:center; padding:20px; font-size:13px">
+          Type a model name above to search Hugging Face Hub.
+        </div>
+      </div>
+
+      <div style="display:flex; justify-content:flex-end">
+        <button class="btn" onclick="closeHfModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Global Application State
+    const state = {
+      activeTab: 'chat',
+      activeModel: 'None',
+      isAdmin: false,
+      adminToken: sessionStorage.getItem('nexus_auth_token') || null,
+      sessions: [],
+      currentSessionId: null,
+      abortController: null,
+      nodes: [],
+      models: [],
+      systemProfile: null
+    };
+
+    // Tab Switching
+    function switchTab(tabId) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      const btn = document.getElementById(`tabBtn-${tabId}`);
+      const content = document.getElementById(`tabContent-${tabId}`);
+      if (btn && content) {
+        btn.classList.add('active');
+        content.classList.add('active');
+        state.activeTab = tabId;
+      }
+      if (tabId === 'cluster') fetchClusterNodes();
+      if (tabId === 'models') fetchModels();
+      if (tabId === 'settings') fetchSettings();
+    }
+
+    // Modal helpers
+    function openAuthModal() {
+      document.getElementById('authModal').classList.add('open');
+      const pin = document.getElementById('pinInput');
+      pin.value = '';
+      pin.focus();
+    }
+    function closeAuthModal() {
+      document.getElementById('authModal').classList.remove('open');
+    }
+
+    async function submitPin() {
+      const pin = document.getElementById('pinInput').value.trim();
+      if (pin.length !== 6) {
+        alert('PIN must be 6 digits');
+        return;
+      }
+      try {
+        const resp = await fetch('/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin })
+        });
+        const data = await resp.json();
+        if (resp.ok && data.token) {
+          state.adminToken = data.token;
+          sessionStorage.setItem('nexus_auth_token', data.token);
+          setAdminState(true);
+          closeAuthModal();
+        } else {
+          alert(data.error || 'Invalid PIN');
+        }
+      } catch (err) {
+        alert('Auth error: ' + err.message);
+      }
+    }
+
+    function setAdminState(isAdmin) {
+      state.isAdmin = isAdmin;
+      const label = document.getElementById('authLabel');
+      const icon = document.getElementById('authIcon');
+      const btn = document.getElementById('authBtn');
+      if (isAdmin) {
+        label.textContent = 'Admin';
+        icon.textContent = '🔓';
+        btn.className = 'btn btn-auth admin';
+      } else {
+        label.textContent = 'Guest';
+        icon.textContent = '🔒';
+        btn.className = 'btn btn-auth guest';
+      }
+    }
+
+    // IndexedDB for Local-First Chat Storage
+    const DB_NAME = 'NexusChatDB';
+    const DB_VERSION = 1;
+    let db = null;
+
+    function initDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+          const d = e.target.result;
+          if (!d.objectStoreNames.contains('sessions')) {
+            d.createObjectStore('sessions', { keyPath: 'id' });
+          }
+        };
+        req.onsuccess = (e) => {
+          db = e.target.result;
+          loadSessions();
+          resolve(db);
+        };
+        req.onerror = (e) => reject(e);
+      });
+    }
+
+    async function loadSessions() {
+      if (!db) return;
+      const tx = db.transaction('sessions', 'readonly');
+      const store = tx.objectStore('sessions');
+      const req = store.getAll();
+      req.onsuccess = () => {
+        state.sessions = req.result || [];
+        if (state.sessions.length === 0) {
+          createNewSession();
+        } else {
+          state.currentSessionId = state.sessions[0].id;
+          renderSessionList();
+          renderActiveMessages();
+        }
+      };
+    }
+
+    function createNewSession() {
+      const newSession = {
+        id: 'sess_' + Date.now(),
+        title: 'New Conversation',
+        createdAt: new Date().toISOString(),
+        messages: []
+      };
+      state.sessions.unshift(newSession);
+      state.currentSessionId = newSession.id;
+      saveSession(newSession);
+      renderSessionList();
+      renderActiveMessages();
+    }
+
+    function saveSession(session) {
+      if (!db) return;
+      const tx = db.transaction('sessions', 'readwrite');
+      tx.objectStore('sessions').put(session);
+    }
+
+    function renderSessionList() {
+      const list = document.getElementById('sessionList');
+      list.innerHTML = '';
+      state.sessions.forEach(sess => {
+        const item = document.createElement('div');
+        item.className = 'session-item' + (sess.id === state.currentSessionId ? ' active' : '');
+        item.onclick = () => {
+          state.currentSessionId = sess.id;
+          renderSessionList();
+          renderActiveMessages();
+        };
+        item.innerHTML = `<span class="session-title">${escapeHtml(sess.title)}</span>`;
+        list.appendChild(item);
+      });
+    }
+
+    function renderActiveMessages() {
+      const sess = state.sessions.find(s => s.id === state.currentSessionId);
+      const container = document.getElementById('chatMessages');
+      container.innerHTML = '';
+      if (!sess || sess.messages.length === 0) {
+        container.innerHTML = `
+          <div class="msg-row assistant">
+            <div class="msg-avatar">⚡</div>
+            <div class="msg-body">
+              <div class="msg-sender">Nexus-LLM Mesh</div>
+              <div class="msg-bubble">Conversation ready. What would you like to explore or solve?</div>
+            </div>
+          </div>
+        `;
+        return;
+      }
+      sess.messages.forEach(msg => appendMessageDOM(msg.role, msg.content, msg.thinking));
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function appendMessageDOM(role, content, thinking) {
+      const container = document.getElementById('chatMessages');
+      const row = document.createElement('div');
+      row.className = `msg-row ${role}`;
+      const avatar = role === 'user' ? '👤' : '⚡';
+      const sender = role === 'user' ? 'You' : 'Assistant';
+
+      let thinkHtml = '';
+      if (thinking) {
+        thinkHtml = `
+          <details class="think-box">
+            <summary>Thinking Process</summary>
+            <div class="think-content">${escapeHtml(thinking)}</div>
+          </details>
+        `;
+      }
+
+      row.innerHTML = `
+        <div class="msg-avatar">${avatar}</div>
+        <div class="msg-body">
+          <div class="msg-sender">${sender}</div>
+          <div class="msg-bubble">${thinkHtml}${formatMarkdown(content)}</div>
+        </div>
+      `;
+      container.appendChild(row);
+      container.scrollTop = container.scrollHeight;
+      return row.querySelector('.msg-bubble');
+    }
+
+    // Markdown & Code Highlighter
+    function formatMarkdown(text) {
+      if (!text) return '';
+      // Fenced code blocks
+      let html = text.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const id = 'code_' + Math.random().toString(36).substring(2, 9);
+        return `
+          <div class="code-container">
+            <div class="code-header">
+              <span>${lang || 'code'}</span>
+              <button class="copy-btn" onclick="copyCode('${id}')">📋 Copy</button>
+            </div>
+            <pre class="code-block"><code id="${id}">${escapeHtml(code.trim())}</code></pre>
+          </div>
+        `;
+      });
+      // Bold
+      html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+      // Inline code
+      html = html.replace(/`([^`]+)`/g, '<code style="background:#1e293b;padding:2px 5px;border-radius:4px;font-family:var(--font-mono)">$1</code>');
+      // Line breaks
+      html = html.replace(/\n/g, '<br>');
+      return html;
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    window.copyCode = (elemId) => {
+      const code = document.getElementById(elemId);
+      if (code) {
+        navigator.clipboard.writeText(code.innerText).then(() => {
+          alert('Code copied to clipboard');
+        });
+      }
+    };
+
+    // Chat Streaming Execution
+    async function sendChatMessage() {
+      const input = document.getElementById('chatInput');
+      const prompt = input.value.trim();
+      if (!prompt) return;
+
+      input.value = '';
+      input.style.height = 'auto';
+
+      const sess = state.sessions.find(s => s.id === state.currentSessionId);
+      if (!sess) return;
+
+      // Append user msg
+      sess.messages.push({ role: 'user', content: prompt });
+      if (sess.messages.length === 1) {
+        sess.title = prompt.slice(0, 28);
+        renderSessionList();
+      }
+      appendMessageDOM('user', prompt);
+      saveSession(sess);
+
+      // Setup assistant response DOM
+      const bubble = appendMessageDOM('assistant', '...');
+      bubble.innerHTML = '<span style="color:var(--text-muted)">Generating...</span>';
+
+      const abortBtn = document.getElementById('abortBtn');
+      abortBtn.style.display = 'inline-flex';
+      state.abortController = new AbortController();
+
+      let assistantText = '';
+      let thinkingText = '';
+      let inThinking = false;
+      const startTime = performance.now();
+      let tokenCount = 0;
+
+      try {
+        const resp = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: state.activeModel || 'default',
+            messages: sess.messages.map(m => ({ role: m.role, content: m.content })),
+            stream: true
+          }),
+          signal: state.abortController.signal
+        });
+
+        if (!resp.ok) {
+          const err = await resp.text();
+          bubble.innerHTML = `<span style="color:var(--accent-red)">Error: ${escapeHtml(err)}</span>`;
+          abortBtn.style.display = 'none';
+          return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const dataStr = trimmed.slice(5).trim();
+            if (dataStr === '[DONE]') break;
+
+            try {
+              const json = JSON.parse(dataStr);
+              const delta = json.choices?.[0]?.delta?.content || '';
+              if (delta) {
+                tokenCount++;
+                if (delta.includes('<think>')) inThinking = true;
+                if (inThinking) {
+                  thinkingText += delta.replace('<think>', '');
+                  if (delta.includes('</think>')) {
+                    inThinking = false;
+                    thinkingText = thinkingText.replace('</think>', '');
+                  }
+                } else {
+                  assistantText += delta;
+                }
+
+                // Live DOM update
+                let thinkHtml = thinkingText ? `
+                  <details class="think-box" open>
+                    <summary>Thinking (${thinkingText.length} chars)</summary>
+                    <div class="think-content">${escapeHtml(thinkingText)}</div>
+                  </details>
+                ` : '';
+                bubble.innerHTML = thinkHtml + formatMarkdown(assistantText);
+
+                // Speed calculation
+                const elapsedSec = (performance.now() - startTime) / 1000;
+                const tokPerSec = (tokenCount / (elapsedSec || 1)).toFixed(1);
+                document.getElementById('genSpeedBadge').textContent = `${tokPerSec} tok/s`;
+              }
+            } catch (e) { /* ignore chunk parse error */ }
+          }
+        }
+
+        sess.messages.push({ role: 'assistant', content: assistantText, thinking: thinkingText });
+        saveSession(sess);
+
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          bubble.innerHTML = `<span style="color:var(--accent-red)">Network error: ${escapeHtml(err.message)}</span>`;
+        }
+      } finally {
+        abortBtn.style.display = 'none';
+        state.abortController = null;
+      }
+    }
+
+    function abortChatStream() {
+      if (state.abortController) {
+        state.abortController.abort();
+      }
+    }
+
+    // Telemetry & Cluster State
+    async function fetchClusterNodes() {
+      try {
+        const resp = await fetch('/api/cluster/nodes');
+        if (resp.ok) {
+          state.nodes = await resp.json();
+          renderClusterNodes();
+        }
+      } catch (e) { console.error('fetchClusterNodes', e); }
+    }
+
+    function renderClusterNodes() {
+      const grid = document.getElementById('clusterNodeGrid');
+      grid.innerHTML = '';
+      state.nodes.forEach(node => {
+        const card = document.createElement('div');
+        card.className = 'node-card' + (node.is_local ? ' host-active' : '');
+        const memPercent = Math.min(100, Math.round(((node.total_ram_mb - node.free_ram_mb) / (node.total_ram_mb || 1)) * 100));
+        card.innerHTML = `
+          <div class="node-head">
+            <div class="node-name">
+              <span>${node.is_local ? '📱' : '💻'}</span>
+              ${escapeHtml(node.display_name || 'Node')}
+            </div>
+            <span class="node-badge" style="color:var(--accent-cyan)">${node.backend || 'CPU'}</span>
+          </div>
+          <div>
+            <div class="meter-label">
+              <span>RAM Budget</span>
+              <span>${node.free_ram_mb} MB free / ${node.total_ram_mb} MB</span>
+            </div>
+            <div class="bar-container">
+              <div class="bar-fill" style="width: ${memPercent}%"></div>
+              <div class="safe-threshold-line" title="75% LMK limit"></div>
+            </div>
+          </div>
+          <div style="font-size:11px;color:var(--text-muted);display:flex;justify-content:space-between">
+            <span>Model: <strong>${escapeHtml(node.active_model || 'Idle')}</strong></span>
+            <span>${node.is_local ? 'Local Host' : 'RPC Worker'}</span>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+    }
+
+    // Models & Layer Calculator
+    async function fetchModels() {
+      try {
+        const resp = await fetch('/v1/models');
+        if (resp.ok) {
+          const data = await resp.json();
+          state.models = data.data || [];
+          renderModelsTable();
+          if (state.models.length > 0 && state.activeModel === 'None') {
+            state.activeModel = state.models[0].id;
+            document.getElementById('headerModelName').textContent = state.activeModel;
+          }
+        }
+      } catch (e) { console.error('fetchModels', e); }
+    }
+
+    function renderModelsTable() {
+      const tbody = document.getElementById('modelsTableBody');
+      tbody.innerHTML = '';
+      state.models.forEach(m => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><strong>${escapeHtml(m.id)}</strong></td>
+          <td>GGUF Model</td>
+          <td>4096 ctx</td>
+          <td>Local & Mesh</td>
+          <td>
+            <div style="display:flex; gap:6px">
+              <button class="btn btn-primary" style="padding:4px 8px;font-size:11px" onclick="loadModel('${escapeHtml(m.id)}')">
+                Load & Activate
+              </button>
+              <button class="btn" style="padding:4px 8px;font-size:11px" onclick="inspectModel('${escapeHtml(m.id)}')">
+                Inspect GGUF
+              </button>
+            </div>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function loadModel(modelId) {
+      if (!state.adminToken) {
+        openAuthModal();
+        return;
+      }
+      try {
+        const resp = await fetch('/api/model/load', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.adminToken
+          },
+          body: JSON.stringify({ model_path: modelId, context_size: 4096, gpu_layers: 24 })
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          alert('Model load initiated successfully!');
+          state.activeModel = modelId;
+          document.getElementById('headerModelName').textContent = modelId;
+        } else {
+          alert('Load error: ' + (data.error || 'Failed'));
+        }
+      } catch (e) { alert('Load error: ' + e.message); }
+    }
+
+    function updateLayerSplit(val) {
+      document.getElementById('gpuLayerCount').textContent = val;
+      document.getElementById('rpcLayerCount').textContent = (32 - val);
+      const phoneMem = (val * 0.17 + 0.5).toFixed(1);
+      const summary = document.getElementById('splitSafetySummary');
+      if (phoneMem > 6.5) {
+        summary.textContent = `⚠️ High allocation: ~${phoneMem} GB exceeds recommended safety threshold`;
+        summary.style.color = 'var(--accent-red)';
+      } else {
+        summary.textContent = `✅ Allocation within safe LMK budget (Phone: ~${phoneMem} GB / 8.5 GB allocatable)`;
+        summary.style.color = 'var(--accent-green)';
+      }
+    }
+
+    // Live Logs SSE Stream
+    function initLogsStream() {
+      const es = new EventSource('/api/logs/stream');
+      const consoleDiv = document.getElementById('logsConsole');
+      es.onmessage = (e) => {
+        const line = document.createElement('div');
+        line.className = 'log-line ' + (e.data.includes('ERROR') ? 'error' : e.data.includes('WARN') ? 'warn' : 'info');
+        line.textContent = e.data;
+        consoleDiv.appendChild(line);
+        consoleDiv.scrollTop = consoleDiv.scrollHeight;
+      };
+      es.onerror = () => { /* reconnect automatically */ };
+    }
+
+    function clearLogs() {
+      document.getElementById('logsConsole').innerHTML = '';
+    }
+
+    // GGUF Metadata Inspector
+    function closeInspectModal() {
+      document.getElementById('inspectModal').classList.remove('open');
+    }
+
+    async function inspectModel(modelId) {
+      try {
+        const resp = await fetch(`/api/models/${encodeURIComponent(modelId)}/inspect`);
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          alert('Inspection error: ' + (err.error || resp.statusText));
+          return;
+        }
+        const data = await resp.json();
+        document.getElementById('inspectTitle').textContent = `GGUF Metadata Inspector: ${data.filename || modelId}`;
+        const content = document.getElementById('inspectContent');
+        const sizeMb = ((data.file_size_bytes || 0) / (1024 * 1024)).toFixed(1);
+        const sizeGb = ((data.file_size_bytes || 0) / (1024 * 1024 * 1024)).toFixed(2);
+        content.innerHTML = `
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; background:#151d30; padding:16px; border-radius:10px; border:1px solid var(--border-color)">
+            <div><span style="color:var(--text-muted)">Architecture:</span> <strong style="color:var(--accent-cyan)">${escapeHtml(data.architecture || 'Unknown')}</strong></div>
+            <div><span style="color:var(--text-muted)">Quantization:</span> <span class="badge-fits">${escapeHtml(data.quant_label || 'Standard')}</span></div>
+            <div><span style="color:var(--text-muted)">Context Length:</span> <strong>${data.context_length ? data.context_length.toLocaleString() : 'N/A'}</strong></div>
+            <div><span style="color:var(--text-muted)">Layers / Blocks:</span> <strong>${data.block_count || 'N/A'}</strong></div>
+            <div><span style="color:var(--text-muted)">Attention Heads:</span> <strong>${data.head_count || 'N/A'} (KV: ${data.head_count_kv || 'N/A'})</strong></div>
+            <div><span style="color:var(--text-muted)">Embedding Dimension:</span> <strong>${data.embedding_length || 'N/A'}</strong></div>
+            <div><span style="color:var(--text-muted)">Tensors Count:</span> <strong>${data.tensor_count ? data.tensor_count.toLocaleString() : '0'}</strong></div>
+            <div><span style="color:var(--text-muted)">File Size:</span> <strong>${sizeGb} GB (${sizeMb} MB)</strong></div>
+          </div>
+          <div style="font-size:12px; color:var(--text-muted); background:rgba(255,255,255,0.03); padding:10px; border-radius:8px">
+            Metadata extracted directly from GGUF binary header without allocating weights in RAM.
+          </div>
+        `;
+        document.getElementById('inspectModal').classList.add('open');
+      } catch (err) {
+        alert('Inspection request failed: ' + err.message);
+      }
+    }
+
+    // Hugging Face Search & 1-Click Download
+    function openHfModal() {
+      document.getElementById('hfModal').classList.add('open');
+      document.getElementById('hfSearchInput').focus();
+    }
+    function closeHfModal() {
+      document.getElementById('hfModal').classList.remove('open');
+    }
+
+    async function searchHf() {
+      const q = document.getElementById('hfSearchInput').value.trim();
+      const list = document.getElementById('hfResultsList');
+      list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:20px">Searching Hugging Face Hub...</div>';
+      try {
+        const resp = await fetch(`/api/hf/search?q=${encodeURIComponent(q)}&limit=15`);
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          list.innerHTML = `<div style="color:var(--accent-red); padding:16px">Search error: ${escapeHtml(err.error || resp.statusText)}</div>`;
+          return;
+        }
+        const models = await resp.json();
+        if (!models || models.length === 0) {
+          list.innerHTML = '<div style="color:var(--text-muted); text-align:center; padding:20px">No GGUF models found matching query.</div>';
+          return;
+        }
+        list.innerHTML = '';
+        models.forEach(m => {
+          const card = document.createElement('div');
+          card.style.cssText = 'background:#151d30; border:1px solid var(--border-color); border-radius:8px; padding:12px; display:flex; justify-content:space-between; align-items:center; cursor:pointer; transition:all 0.15s';
+          card.onmouseenter = () => card.style.borderColor = 'var(--accent-cyan)';
+          card.onmouseleave = () => card.style.borderColor = 'var(--border-color)';
+          card.onclick = () => viewHfRepo(m.id);
+          card.innerHTML = `
+            <div>
+              <div style="font-weight:600; color:#fff">${escapeHtml(m.id)}</div>
+              <div style="font-size:11px; color:var(--text-muted); display:flex; gap:12px; margin-top:4px">
+                <span>⬇️ ${m.downloads ? m.downloads.toLocaleString() : '0'}</span>
+                <span>❤️ ${m.likes ? m.likes.toLocaleString() : '0'}</span>
+                <span>Author: ${escapeHtml(m.author || 'Community')}</span>
+              </div>
+            </div>
+            <button class="btn" style="padding:4px 10px; font-size:12px">View Quants →</button>
+          `;
+          list.appendChild(card);
+        });
+      } catch (err) {
+        list.innerHTML = `<div style="color:var(--accent-red); padding:16px">Failed to connect: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    async function viewHfRepo(repoId) {
+      const list = document.getElementById('hfResultsList');
+      list.innerHTML = `<div style="color:var(--text-muted); text-align:center; padding:20px">Fetching quant groups for <strong>${escapeHtml(repoId)}</strong>...</div>`;
+      try {
+        const resp = await fetch(`/api/hf/repo?id=${encodeURIComponent(repoId)}`);
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          list.innerHTML = `<div style="color:var(--accent-red); padding:16px">Failed to fetch repo: ${escapeHtml(err.error || resp.statusText)}</div>`;
+          return;
+        }
+        const data = await resp.json();
+        const groups = data.quant_groups || [];
+        if (groups.length === 0) {
+          list.innerHTML = `<div style="color:var(--text-muted); padding:16px; text-align:center">No GGUF files found in repository. <button class="btn" style="margin-top:10px" onclick="searchHf()">← Back to Search</button></div>`;
+          return;
+        }
+
+        list.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; padding:0 4px">
+            <span style="font-weight:700; color:var(--accent-cyan)">${escapeHtml(repoId)}</span>
+            <button class="btn" style="padding:2px 8px; font-size:11px" onclick="searchHf()">← Back to Search</button>
+          </div>
+        `;
+
+        groups.forEach(g => {
+          const row = document.createElement('div');
+          row.style.cssText = 'background:#151d30; border:1px solid var(--border-color); border-radius:8px; padding:12px; display:flex; justify-content:space-between; align-items:center; margin-bottom:6px';
+          const sizeGb = (g.total_size_bytes / (1024 * 1024 * 1024)).toFixed(2);
+          const badgeClass = g.fit_status === 'Fits' ? 'badge-fits' : g.fit_status === 'OffloadRequired' ? 'badge-offload' : 'badge-exceeds';
+          const badgeText = g.fit_status === 'Fits' ? '✅ Fits Safe RAM' : g.fit_status === 'OffloadRequired' ? '⚡ Cluster Offload' : '⚠️ Exceeds Safe RAM';
+          const fileToDownload = g.files && g.files[0] ? g.files[0] : null;
+
+          row.innerHTML = `
+            <div>
+              <div style="font-weight:600; display:flex; align-items:center; gap:8px">
+                <span>${escapeHtml(g.quant_label)}</span>
+                <span class="${badgeClass}">${badgeText}</span>
+                ${g.is_sharded ? '<span style="font-size:10px; background:#334155; padding:1px 5px; border-radius:4px">Sharded</span>' : ''}
+              </div>
+              <div style="font-size:11px; color:var(--text-muted); margin-top:4px">
+                ${sizeGb} GB · ${escapeHtml(g.base_name)}
+              </div>
+            </div>
+            ${fileToDownload ? `
+              <button class="btn btn-primary" style="padding:6px 12px; font-size:12px" onclick="startDownload('${escapeHtml(fileToDownload.download_url)}', '${escapeHtml(fileToDownload.filename)}')">
+                ⬇️ Download
+              </button>
+            ` : ''}
+          `;
+          list.appendChild(row);
+        });
+      } catch (err) {
+        list.innerHTML = `<div style="color:var(--accent-red); padding:16px">Error: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    let dlPollTimer = null;
+    async function startDownload(url, filename) {
+      if (!state.adminToken) {
+        openAuthModal();
+        return;
+      }
+      try {
+        const resp = await fetch('/api/models/download', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.adminToken
+          },
+          body: JSON.stringify({ url, filename })
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          document.getElementById('dlProgressBox').style.display = 'block';
+          document.getElementById('dlFileName').textContent = `Downloading ${filename}...`;
+          if (dlPollTimer) clearInterval(dlPollTimer);
+          dlPollTimer = setInterval(pollDownloadStatus, 1000);
+        } else {
+          alert('Download failed: ' + (data.error || 'Server error'));
+        }
+      } catch (err) {
+        alert('Download error: ' + err.message);
+      }
+    }
+
+    async function pollDownloadStatus() {
+      try {
+        const resp = await fetch('/api/models/download/status');
+        if (!resp.ok) return;
+        const st = await resp.json();
+        if (st.status === 'idle') {
+          return;
+        }
+        document.getElementById('dlProgressBox').style.display = 'block';
+        document.getElementById('dlFileName').textContent = `Downloading ${st.filename || 'model'}...`;
+        const pct = st.percent != null ? Math.round(st.percent) : 0;
+        document.getElementById('dlBarFill').style.width = `${pct}%`;
+        document.getElementById('dlPercent').textContent = `${pct}%`;
+        const speedMb = ((st.speed_bytes_per_sec || 0) / (1024 * 1024)).toFixed(2);
+        document.getElementById('dlSpeed').textContent = `${speedMb} MB/s`;
+        const downloadedMb = ((st.downloaded_bytes || 0) / (1024 * 1024)).toFixed(1);
+        const totalMb = st.total_bytes ? (st.total_bytes / (1024 * 1024)).toFixed(1) : '?';
+        document.getElementById('dlBytes').textContent = `${downloadedMb} MB / ${totalMb} MB`;
+
+        if (st.done) {
+          clearInterval(dlPollTimer);
+          dlPollTimer = null;
+          if (st.error) {
+            alert('Download failed: ' + st.error);
+          } else {
+            document.getElementById('dlFileName').textContent = `✅ ${st.filename} completed!`;
+            fetchModels();
+            setTimeout(() => {
+              document.getElementById('dlProgressBox').style.display = 'none';
+            }, 4000);
+          }
+        }
+      } catch (e) { console.error('pollDownloadStatus', e); }
+    }
+
+    // Settings Management
+    async function fetchSettings() {
+      try {
+        const resp = await fetch('/api/config');
+        if (!resp.ok) return;
+        const cfg = await resp.json();
+        if (cfg.inference) {
+          document.getElementById('promptCacheToggle').checked = !!cfg.inference.prompt_cache_enabled;
+          document.getElementById('slotSavePathInput').value = cfg.inference.slot_save_path || '~/.nexus/slots';
+          document.getElementById('maxCacheMbInput').value = cfg.inference.max_cache_mb || 2048;
+        }
+        if (cfg.safety) {
+          const floor = cfg.safety.battery_floor_percent || 20;
+          document.getElementById('batteryFloorSlider').value = floor;
+          document.getElementById('batteryFloorVal').textContent = floor + '%';
+          document.getElementById('batteryActionSelect').value = cfg.safety.battery_action || 'decline';
+          const maxRam = cfg.safety.max_ram_usage_percent || 75;
+          document.getElementById('maxRamSlider').value = maxRam;
+          document.getElementById('maxRamVal').textContent = maxRam + '%';
+        }
+      } catch (e) { console.error('fetchSettings', e); }
+    }
+
+    async function saveSettings() {
+      if (!state.adminToken) {
+        openAuthModal();
+        return;
+      }
+      try {
+        const payload = {
+          prompt_cache_enabled: document.getElementById('promptCacheToggle').checked,
+          slot_save_path: document.getElementById('slotSavePathInput').value.trim(),
+          max_cache_mb: parseInt(document.getElementById('maxCacheMbInput').value, 10),
+          battery_floor_percent: parseInt(document.getElementById('batteryFloorSlider').value, 10),
+          battery_action: document.getElementById('batteryActionSelect').value,
+          max_ram_usage_percent: parseInt(document.getElementById('maxRamSlider').value, 10)
+        };
+        const resp = await fetch('/api/config', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + state.adminToken
+          },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          alert('Settings saved and persisted successfully!');
+        } else {
+          alert('Save error: ' + (data.error || 'Failed'));
+        }
+      } catch (err) {
+        alert('Failed to save settings: ' + err.message);
+      }
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'F1') { e.preventDefault(); switchTab('chat'); }
+      if (e.key === 'F2') { e.preventDefault(); switchTab('models'); }
+      if (e.key === 'F3') { e.preventDefault(); switchTab('cluster'); }
+      if (e.key === 'F7') { e.preventDefault(); switchTab('logs'); }
+      if (e.key === 'F8') { e.preventDefault(); switchTab('settings'); }
+      if (e.key === 'Escape') { abortChatStream(); closeInspectModal(); closeHfModal(); }
+    });
+
+    const chatInput = document.getElementById('chatInput');
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    // Startup Initialization
+    window.addEventListener('DOMContentLoaded', () => {
+      initDB();
+      if (state.adminToken) setAdminState(true);
+      fetchModels();
+      fetchClusterNodes();
+      fetchSettings();
+      pollDownloadStatus();
+      initLogsStream();
+    });
+  </script>
+</body>
+</html>

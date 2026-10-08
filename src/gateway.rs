@@ -8,27 +8,46 @@
 use crate::config::NexusConfig;
 use crate::control_plane::build_model_catalog;
 use crate::discovery::{DiscoveryService, PeerNode};
+use crate::node_identity::NodeIdentity;
 use crate::supervisor::SupervisorManager;
+use crate::sysinfo::SystemProfile;
 use crate::trust_auth::pairing_enforced;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::stream::unfold;
+use futures_util::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+static EMBEDDED_INDEX_HTML: &str = include_str!("../web/dist/index.html");
+static EMBEDDED_MANIFEST_JSON: &str = include_str!("../web/dist/manifest.json");
+
 type RespBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+/// Status report for an active or completed background model download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgressStatus {
+    pub filename: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bytes_per_sec: f64,
+    pub percent: Option<f32>,
+    pub done: bool,
+    pub error: Option<String>,
+}
 
 /// Shared state for the mesh OpenAI gateway.
 #[derive(Clone)]
@@ -41,6 +60,10 @@ pub struct GatewayContext {
     pub config: Arc<std::sync::RwLock<NexusConfig>>,
     /// Override local llama OpenAI base URL (tests / tunnels).
     pub local_api_base: Option<String>,
+    pub identity: Option<Arc<NodeIdentity>>,
+    pub session_tokens: Arc<tokio::sync::RwLock<HashMap<String, std::time::Instant>>>,
+    pub active_pin: Option<String>,
+    pub download_status: Arc<tokio::sync::RwLock<Option<DownloadProgressStatus>>>,
 }
 
 impl GatewayContext {
@@ -59,6 +82,10 @@ impl GatewayContext {
             node_id,
             config,
             local_api_base: None,
+            identity: None,
+            session_tokens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            active_pin: None,
+            download_status: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -69,6 +96,16 @@ impl GatewayContext {
 
     pub fn with_local_api_base(mut self, base: impl Into<String>) -> Self {
         self.local_api_base = Some(base.into());
+        self
+    }
+
+    pub fn with_identity(mut self, identity: Arc<NodeIdentity>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    pub fn with_pin(mut self, pin: impl Into<String>) -> Self {
+        self.active_pin = Some(pin.into());
         self
     }
 
@@ -252,15 +289,834 @@ async fn accept_loop(
 async fn route(req: Request<Incoming>, ctx: Arc<GatewayContext>) -> Response<RespBody> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
-    match (method, path.as_str()) {
+    match (method.clone(), path.as_str()) {
+        (Method::GET, "/") | (Method::GET, "/index.html") => handle_web_index().await,
+        (Method::GET, "/manifest.json") => handle_web_manifest(),
         (Method::GET, "/health") => json_response(StatusCode::OK, &json!({"status": "ok"})),
         (Method::GET, "/v1/models") => handle_models(ctx).await,
         (Method::POST, "/v1/chat/completions") => handle_chat_completions(req, ctx).await,
-        _ => json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": {"message": "not found", "type": "not_found"}}),
+        (Method::GET, "/api/system/profile") => handle_system_profile(ctx).await,
+        (Method::GET, "/api/cluster/nodes") => handle_cluster_nodes(ctx).await,
+        (Method::GET, "/api/events") => handle_events_stream(ctx).await,
+        (Method::GET, "/api/logs/stream") => handle_logs_stream(ctx).await,
+        (Method::POST, "/api/auth/verify") => handle_auth_verify(req, ctx).await,
+        (Method::POST, "/api/model/load") => handle_api_model_load(req, ctx).await,
+        (Method::POST, "/api/model/unload") => handle_api_model_unload(req, ctx).await,
+        (Method::GET, "/api/hf/search") => handle_hf_search(req, ctx).await,
+        (Method::GET, "/api/hf/repo") => handle_hf_repo(req, ctx).await,
+        (Method::POST, "/api/models/download") => handle_model_download(req, ctx).await,
+        (Method::GET, "/api/models/download/status") => handle_model_download_status(ctx).await,
+        (Method::GET, "/api/config") => handle_config_get(ctx).await,
+        (Method::POST, "/api/config") => handle_config_update(req, ctx).await,
+        _ => {
+            if method == Method::GET
+                && path.starts_with("/api/models/")
+                && path.ends_with("/inspect")
+            {
+                let stripped = &path["/api/models/".len()..path.len() - "/inspect".len()];
+                handle_model_inspect(stripped, ctx).await
+            } else if path.starts_with("/assets/") {
+                handle_web_asset(&path).await
+            } else {
+                json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": {"message": "not found", "type": "not_found"}}),
+                )
+            }
+        }
+    }
+}
+
+async fn handle_web_index() -> Response<RespBody> {
+    if let Ok(dir) = std::env::var("NEXUS_WEB_DIR") {
+        let path = PathBuf::from(dir).join("index.html");
+        if let Ok(content) = tokio::fs::read(&path).await {
+            return html_response(StatusCode::OK, content);
+        }
+    }
+    html_response(StatusCode::OK, EMBEDDED_INDEX_HTML.as_bytes().to_vec())
+}
+
+fn handle_web_manifest() -> Response<RespBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/manifest+json")
+        .body(full_body(Bytes::from_static(
+            EMBEDDED_MANIFEST_JSON.as_bytes(),
+        )))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b"{}"))))
+}
+
+async fn handle_web_asset(path: &str) -> Response<RespBody> {
+    if let Ok(dir) = std::env::var("NEXUS_WEB_DIR") {
+        let clean = path.trim_start_matches('/');
+        let file_path = PathBuf::from(dir).join(clean);
+        if let Ok(bytes) = tokio::fs::read(&file_path).await {
+            let mime = if path.ends_with(".js") {
+                "application/javascript"
+            } else if path.ends_with(".css") {
+                "text/css"
+            } else if path.ends_with(".svg") {
+                "image/svg+xml"
+            } else {
+                "application/octet-stream"
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, mime)
+                .body(full_body(Bytes::from(bytes)))
+                .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b""))));
+        }
+    }
+    if path.ends_with("icon.svg") {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="#0b0f19" stroke="#06b6d4" stroke-width="4"/><text x="50" y="62" font-size="40" font-family="sans-serif" font-weight="bold" text-anchor="middle" fill="#06b6d4">N</text></svg>"##;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "image/svg+xml")
+            .body(full_body(Bytes::from_static(svg.as_bytes())))
+            .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b""))));
+    }
+    json_response(StatusCode::NOT_FOUND, &json!({"error": "asset not found"}))
+}
+
+fn html_response(status: StatusCode, body: Vec<u8>) -> Response<RespBody> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(hyper::header::CACHE_CONTROL, "no-cache")
+        .body(full_body(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::from_static(b""))))
+}
+
+async fn handle_system_profile(ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let profile = SystemProfile::probe();
+    let node_name = {
+        let cfg = ctx.config.read().unwrap();
+        cfg.node.name.clone()
+    };
+    let local_model = local_active_model(&ctx).await;
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "node_id": ctx.node_id.to_string(),
+            "node_name": node_name,
+            "total_ram_mb": profile.total_ram_mb,
+            "available_ram_mb": profile.available_ram_mb,
+            "backend": format!("{:?}", profile.detected_backend),
+            "cpu_threads": profile.recommended_threads,
+            "active_model": local_model,
+        }),
+    )
+}
+
+async fn handle_cluster_nodes(ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let mut nodes = Vec::new();
+    let profile = SystemProfile::probe();
+    let node_name = {
+        let cfg = ctx.config.read().unwrap();
+        if cfg.node.name == "auto" {
+            "Local Host".to_string()
+        } else {
+            cfg.node.name.clone()
+        }
+    };
+    let active_model = local_active_model(&ctx).await.unwrap_or_default();
+    nodes.push(json!({
+        "uuid": ctx.node_id.to_string(),
+        "display_name": node_name,
+        "is_local": true,
+        "total_ram_mb": profile.total_ram_mb,
+        "free_ram_mb": profile.available_ram_mb,
+        "backend": format!("{:?}", profile.detected_backend),
+        "active_model": active_model,
+        "role": "Host",
+    }));
+
+    if let Some(ref disc) = ctx.discovery {
+        for peer in disc.get_active_peers().await {
+            let display = if peer.display_name.is_empty() {
+                format!("Node-{}", &peer.uuid.to_string()[..8])
+            } else {
+                peer.display_name.clone()
+            };
+            nodes.push(json!({
+                "uuid": peer.uuid.to_string(),
+                "display_name": display,
+                "is_local": false,
+                "total_ram_mb": peer.total_ram_mb,
+                "free_ram_mb": peer.free_ram_mb,
+                "backend": format!("{:?}", peer.backend),
+                "active_model": peer.active_model,
+                "role": format!("{:?}", peer.role),
+            }));
+        }
+    }
+
+    json_response(StatusCode::OK, &nodes)
+}
+
+async fn handle_events_stream(ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let stream = unfold(ctx, |ctx| async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let local_model = local_active_model(&ctx).await.unwrap_or_default();
+        let peers_count = match &ctx.discovery {
+            Some(d) => d.get_active_peers().await.len(),
+            None => 0,
+        };
+        let payload = json!({
+            "type": "heartbeat",
+            "active_model": local_model,
+            "peers_count": peers_count,
+        });
+        let sse = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&payload).unwrap_or_default()
+        );
+        Some((sse, ctx))
+    });
+
+    let frame_stream =
+        stream.map(|data| Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(data))));
+    let body = StreamBody::new(frame_stream).boxed_unsync();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+        .header(hyper::header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| {
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "stream failed"}),
+            )
+        })
+}
+
+async fn handle_logs_stream(_ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let initial = "data: [INFO] Connected to Nexus-LLM live telemetry stream\n\n".to_string();
+    let stream = unfold(Some(initial), |mut state| async move {
+        if let Some(msg) = state.take() {
+            Some((msg, None))
+        } else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let ping = "data: [HEARTBEAT] Telemetry pulse alive\n\n".to_string();
+            Some((ping, None))
+        }
+    });
+
+    let frame_stream =
+        stream.map(|data| Ok::<Frame<Bytes>, std::io::Error>(Frame::data(Bytes::from(data))));
+    let body = StreamBody::new(frame_stream).boxed_unsync();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+        .header(hyper::header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| {
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "stream failed"}),
+            )
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct PinVerifyRequest {
+    pin: String,
+}
+
+async fn handle_auth_verify(
+    req: Request<Incoming>,
+    ctx: Arc<GatewayContext>,
+) -> Response<RespBody> {
+    let body_bytes = match req.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+    let payload = match serde_json::from_slice::<PinVerifyRequest>(&body_bytes) {
+        Ok(p) => p,
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+
+    let pin = payload.pin.trim();
+    let unix_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut valid = false;
+    if let Some(ref active) = ctx.active_pin {
+        if active == pin {
+            valid = true;
+        }
+    }
+    if !valid {
+        if let Some(ref id) = ctx.identity {
+            if id.verify_pairing_code_at(unix_now, pin) {
+                valid = true;
+            }
+        }
+    }
+    if !valid && ctx.identity.is_none() && ctx.active_pin.is_none() {
+        valid = true;
+    }
+
+    if valid {
+        let token = Uuid::new_v4().to_string();
+        let expires = std::time::Instant::now() + std::time::Duration::from_secs(86400);
+        ctx.session_tokens
+            .write()
+            .await
+            .insert(token.clone(), expires);
+        json_response(
+            StatusCode::OK,
+            &json!({
+                "success": true,
+                "token": token,
+                "expires_in": 86400
+            }),
+        )
+    } else {
+        json_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({
+                "success": false,
+                "error": "Invalid 6-digit PIN"
+            }),
+        )
+    }
+}
+
+async fn is_authorized(req: &Request<Incoming>, ctx: &GatewayContext) -> bool {
+    let auth_header = req
+        .headers()
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(auth) = auth_header {
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            let tokens = ctx.session_tokens.read().await;
+            if let Some(&expire) = tokens.get(token.trim()) {
+                if std::time::Instant::now() < expire {
+                    return true;
+                }
+            }
+        }
+    }
+    ctx.active_pin.is_none() && ctx.identity.is_none()
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiModelLoadReq {
+    model_path: String,
+    #[serde(default = "default_context_size")]
+    context_size: usize,
+    #[serde(default = "default_gpu_layers")]
+    gpu_layers: u32,
+}
+fn default_context_size() -> usize {
+    4096
+}
+fn default_gpu_layers() -> u32 {
+    99
+}
+
+async fn handle_api_model_load(
+    req: Request<Incoming>,
+    ctx: Arc<GatewayContext>,
+) -> Response<RespBody> {
+    if !is_authorized(&req, &ctx).await {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Admin authorization required (verify 6-digit PIN first)"}),
+        );
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+    let payload: ApiModelLoadReq = match serde_json::from_slice(&body_bytes) {
+        Ok(p) => p,
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+
+    let filename = std::path::Path::new(&payload.model_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| payload.model_path.clone());
+    let candidate = ctx.models_dir.join(&filename);
+    let resolved_path = if candidate.exists() {
+        candidate
+    } else {
+        std::path::PathBuf::from(&payload.model_path)
+    };
+
+    let (threads, binary, use_mmap, budget_percent, slot_save_path) = {
+        let cfg_lock = ctx.config.read().unwrap();
+        let slot_path = if cfg_lock.inference.cache.prompt_cache_enabled {
+            Some(PathBuf::from(&cfg_lock.inference.cache.slot_save_path))
+        } else {
+            None
+        };
+        (
+            cfg_lock.hardware.acceleration.cpu_threads,
+            cfg_lock.node.llama_server_binary.clone(),
+            cfg_lock.hardware.safety.mmap,
+            cfg_lock.hardware.safety.max_ram_usage_percent,
+            slot_path,
+        )
+    };
+
+    let server_config = crate::supervisor::LlamaServerConfig {
+        binary_path: PathBuf::from(binary),
+        model_path: resolved_path,
+        host: "127.0.0.1".to_string(),
+        port: ctx.api_port,
+        gpu_layers: payload.gpu_layers,
+        threads,
+        context_size: payload.context_size,
+        extra_args: Vec::new(),
+        use_mmap,
+        use_mlock: false,
+        cpu_threads_batch: threads,
+        fallback_to_cpu: true,
+        cache_type_k: None,
+        cache_type_v: None,
+        memory_budget_percent: budget_percent,
+        tags: Vec::new(),
+        slot_save_path,
+    };
+
+    match ctx.supervisor.spawn_slot(server_config).await {
+        Ok(_) => {
+            if let Some(ref d) = ctx.discovery {
+                d.set_active_model(&filename).await;
+            }
+            json_response(
+                StatusCode::OK,
+                &json!({
+                    "success": true,
+                    "message": format!("Model '{filename}' loaded successfully"),
+                    "active_model": filename
+                }),
+            )
+        }
+        Err(e) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "success": false,
+                "error": e.to_string()
+            }),
         ),
     }
+}
+
+async fn handle_api_model_unload(
+    req: Request<Incoming>,
+    ctx: Arc<GatewayContext>,
+) -> Response<RespBody> {
+    if !is_authorized(&req, &ctx).await {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Admin authorization required"}),
+        );
+    }
+
+    let _ = ctx.supervisor.stop().await;
+    if let Some(ref d) = ctx.discovery {
+        d.set_active_model("").await;
+    }
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "success": true,
+            "message": "Model unloaded"
+        }),
+    )
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                result.push(b);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).to_string()
+}
+
+fn parse_query_param(query: Option<&str>, key: &str) -> Option<String> {
+    let q = query?;
+    for pair in q.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k == key {
+                return Some(url_decode(v));
+            }
+        }
+    }
+    None
+}
+
+async fn handle_hf_search(req: Request<Incoming>, ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let query_str = req.uri().query();
+    let q = parse_query_param(query_str, "q").unwrap_or_default();
+    let limit = parse_query_param(query_str, "limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(10);
+
+    let token = {
+        let cfg = ctx.config.read().unwrap();
+        cfg.resolved_hf_token()
+    };
+    let client = crate::hf::HfClient::new(token);
+    match client.search_models(&q, limit).await {
+        Ok(results) => json_response(StatusCode::OK, &results),
+        Err(e) => json_response(
+            StatusCode::BAD_GATEWAY,
+            &json!({"error": format!("Hugging Face search failed: {e}")}),
+        ),
+    }
+}
+
+async fn handle_hf_repo(req: Request<Incoming>, ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let query_str = req.uri().query();
+    let repo_id = match parse_query_param(query_str, "id") {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Missing 'id' query parameter"}),
+            )
+        }
+    };
+
+    let token = {
+        let cfg = ctx.config.read().unwrap();
+        cfg.resolved_hf_token()
+    };
+    let client = crate::hf::HfClient::new(token);
+    match client.model_details(&repo_id).await {
+        Ok(detail) => {
+            let profile = SystemProfile::probe();
+            let mut cluster_free_mb = profile.available_ram_mb;
+            if let Some(ref d) = ctx.discovery {
+                for peer in d.get_active_peers().await {
+                    cluster_free_mb = cluster_free_mb.saturating_add(peer.free_ram_mb as u64);
+                }
+            }
+            let groups = crate::hf::HfClient::parse_gguf_groups(
+                &detail,
+                profile.available_ram_mb,
+                cluster_free_mb,
+            );
+            json_response(
+                StatusCode::OK,
+                &json!({
+                    "repo_id": repo_id,
+                    "detail": detail,
+                    "quant_groups": groups,
+                }),
+            )
+        }
+        Err(e) => json_response(
+            StatusCode::BAD_GATEWAY,
+            &json!({"error": format!("Hugging Face fetch failed: {e}")}),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelDownloadRequest {
+    url: String,
+    filename: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+}
+
+async fn handle_model_download(
+    req: Request<Incoming>,
+    ctx: Arc<GatewayContext>,
+) -> Response<RespBody> {
+    if !is_authorized(&req, &ctx).await {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Admin authorization required (verify 6-digit PIN first)"}),
+        );
+    }
+    let body_bytes = match req.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+    let payload = match serde_json::from_slice::<ModelDownloadRequest>(&body_bytes) {
+        Ok(p) => p,
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+
+    let filename = payload.filename.trim().to_string();
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Invalid filename; must be a flat filename"}),
+        );
+    }
+
+    {
+        let lock = ctx.download_status.read().await;
+        if let Some(ref st) = *lock {
+            if !st.done && st.error.is_none() {
+                return json_response(
+                    StatusCode::CONFLICT,
+                    &json!({
+                        "error": format!("Download already in progress for '{}'", st.filename),
+                        "active": st
+                    }),
+                );
+            }
+        }
+    }
+
+    let dest_path = ctx.models_dir.join(&filename);
+    let _ = tokio::fs::create_dir_all(&ctx.models_dir).await;
+
+    let status_lock = ctx.download_status.clone();
+    {
+        let mut status = status_lock.write().await;
+        *status = Some(DownloadProgressStatus {
+            filename: filename.clone(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            speed_bytes_per_sec: 0.0,
+            percent: Some(0.0),
+            done: false,
+            error: None,
+        });
+    }
+
+    let token = {
+        let cfg = ctx.config.read().unwrap();
+        cfg.resolved_hf_token()
+    };
+    let url = payload.url.clone();
+    let expected_sha = payload.expected_sha256.clone();
+    let spawn_filename = filename.clone();
+
+    tokio::spawn(async move {
+        let downloader = crate::downloader::ModelDownloader::new().with_hf_token(token);
+        let status_cb = status_lock.clone();
+        let fname = spawn_filename.clone();
+        let res = downloader
+            .download(&url, &dest_path, expected_sha.as_deref(), move |progress| {
+                if let Ok(mut lock) = status_cb.try_write() {
+                    *lock = Some(DownloadProgressStatus {
+                        filename: fname.clone(),
+                        downloaded_bytes: progress.downloaded_bytes,
+                        total_bytes: progress.total_bytes,
+                        speed_bytes_per_sec: progress.speed_bytes_per_sec,
+                        percent: progress.percent,
+                        done: false,
+                        error: None,
+                    });
+                }
+            })
+            .await;
+
+        let mut lock = status_lock.write().await;
+        match res {
+            Ok(_) => {
+                if let Some(ref mut st) = *lock {
+                    st.done = true;
+                    st.percent = Some(100.0);
+                }
+            }
+            Err(e) => {
+                if let Some(ref mut st) = *lock {
+                    st.done = true;
+                    st.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "status": "started",
+            "filename": filename
+        }),
+    )
+}
+
+async fn handle_model_download_status(ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let lock = ctx.download_status.read().await;
+    match &*lock {
+        Some(st) => json_response(StatusCode::OK, st),
+        None => json_response(StatusCode::OK, &json!({"status": "idle"})),
+    }
+}
+
+async fn handle_model_inspect(model_id: &str, ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let decoded = url_decode(model_id);
+    let target_path = ctx.models_dir.join(&decoded);
+    let resolved = if target_path.exists() {
+        Some(target_path)
+    } else {
+        let direct = PathBuf::from(&decoded);
+        if direct.exists() {
+            Some(direct)
+        } else if let Ok(entries) = std::fs::read_dir(&ctx.models_dir) {
+            entries.flatten().map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .map(|name| model_matches(&decoded, &name))
+                    .unwrap_or(false)
+            })
+        } else {
+            None
+        }
+    };
+
+    let path = match resolved {
+        Some(p) => p,
+        None => {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("Model file not found: {}", decoded)}),
+            );
+        }
+    };
+
+    match crate::gguf::GgufMetadata::open(&path) {
+        Ok(meta) => json_response(
+            StatusCode::OK,
+            &json!({
+                "filename": path.file_name().map(|f| f.to_string_lossy()).unwrap_or_default(),
+                "architecture": meta.architecture,
+                "model_name": meta.model_name,
+                "context_length": meta.context_length,
+                "block_count": meta.block_count,
+                "head_count": meta.head_count,
+                "head_count_kv": meta.head_count_kv,
+                "embedding_length": meta.embedding_length,
+                "tensor_count": meta.tensor_count,
+                "kv_count": meta.kv_count,
+                "file_size_bytes": meta.file_size_bytes,
+                "quant_label": meta.quant_label,
+            }),
+        ),
+        Err(e) => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Failed to parse GGUF metadata: {e}")}),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUpdateRequest {
+    pub prompt_cache_enabled: Option<bool>,
+    pub slot_save_path: Option<String>,
+    pub max_cache_mb: Option<u64>,
+    pub battery_floor_percent: Option<u8>,
+    pub battery_action: Option<String>,
+    pub max_ram_usage_percent: Option<u8>,
+}
+
+async fn handle_config_get(ctx: Arc<GatewayContext>) -> Response<RespBody> {
+    let cfg = ctx.config.read().unwrap();
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "inference": {
+                "prompt_cache_enabled": cfg.inference.cache.prompt_cache_enabled,
+                "slot_save_path": cfg.inference.cache.slot_save_path,
+                "max_cache_mb": cfg.inference.cache.max_cache_mb,
+            },
+            "safety": {
+                "battery_floor_percent": cfg.hardware.safety.battery_floor_percent,
+                "battery_action": cfg.hardware.safety.battery_action,
+                "max_ram_usage_percent": cfg.hardware.safety.max_ram_usage_percent,
+            }
+        }),
+    )
+}
+
+async fn handle_config_update(
+    req: Request<Incoming>,
+    ctx: Arc<GatewayContext>,
+) -> Response<RespBody> {
+    if !is_authorized(&req, &ctx).await {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Admin authorization required (verify 6-digit PIN first)"}),
+        );
+    }
+    let body_bytes = match req.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+    let payload = match serde_json::from_slice::<ConfigUpdateRequest>(&body_bytes) {
+        Ok(p) => p,
+        Err(e) => return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()})),
+    };
+
+    let mut cfg = ctx.config.write().unwrap();
+    if let Some(enabled) = payload.prompt_cache_enabled {
+        cfg.inference.cache.prompt_cache_enabled = enabled;
+    }
+    if let Some(path) = payload.slot_save_path {
+        cfg.inference.cache.slot_save_path = path;
+    }
+    if let Some(max_mb) = payload.max_cache_mb {
+        cfg.inference.cache.max_cache_mb = max_mb;
+    }
+    if let Some(floor) = payload.battery_floor_percent {
+        cfg.hardware.safety.battery_floor_percent = floor;
+    }
+    if let Some(action) = payload.battery_action {
+        cfg.hardware.safety.battery_action = action;
+    }
+    if let Some(ram) = payload.max_ram_usage_percent {
+        cfg.hardware.safety.max_ram_usage_percent = ram;
+    }
+
+    if let Err(e) = cfg.save() {
+        warn!("Failed to persist config to disk: {}", e);
+    }
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "success": true,
+            "inference": {
+                "prompt_cache_enabled": cfg.inference.cache.prompt_cache_enabled,
+                "slot_save_path": cfg.inference.cache.slot_save_path,
+                "max_cache_mb": cfg.inference.cache.max_cache_mb,
+            },
+            "safety": {
+                "battery_floor_percent": cfg.hardware.safety.battery_floor_percent,
+                "battery_action": cfg.hardware.safety.battery_action,
+                "max_ram_usage_percent": cfg.hardware.safety.max_ram_usage_percent,
+            }
+        }),
+    )
 }
 
 #[derive(Debug, Deserialize)]

@@ -24,7 +24,7 @@ pub enum HfError {
     Api { status: u16, message: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FitStatus {
     /// Fits safely within local node: Size + KV Cache <= 0.75 * MemAvailable
     Fits,
@@ -104,7 +104,7 @@ pub struct HfLfs {
     pub oid: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfGgufGroup {
     pub base_name: String,
     pub quant_label: String,
@@ -114,7 +114,7 @@ pub struct HfGgufGroup {
     pub fit_status: FitStatus,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HfGgufFile {
     pub filename: String,
     pub size_bytes: u64,

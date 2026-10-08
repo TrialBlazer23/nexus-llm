@@ -70,6 +70,8 @@ pub struct LlamaServerConfig {
     /// LMK / memory ceiling percent (from `hardware.safety.max_ram_usage_percent`).
     pub memory_budget_percent: u8,
     pub tags: Vec<String>,
+    /// Optional slot save directory for prompt cache reuse (--slot-save-path).
+    pub slot_save_path: Option<PathBuf>,
 }
 
 /// Restart / demotion policy for unattended nodes.
@@ -121,11 +123,17 @@ impl LlamaServerConfig {
             cache_type_v: None,
             memory_budget_percent: 75,
             tags: Vec::new(),
+            slot_save_path: None,
         }
     }
 
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
+        self
+    }
+
+    pub fn with_slot_save_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.slot_save_path = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -176,6 +184,10 @@ impl LlamaServerConfig {
         if let Some(v) = &self.cache_type_v {
             args.push("--cache-type-v".to_string());
             args.push(v.clone());
+        }
+        if let Some(slot_path) = &self.slot_save_path {
+            args.push("--slot-save-path".to_string());
+            args.push(slot_path.to_string_lossy().to_string());
         }
         args.extend(self.extra_args.clone());
         args
@@ -894,6 +906,11 @@ impl SupervisorManager {
         };
         config.port = target_port;
 
+        if let Some(ref slot_path) = config.slot_save_path {
+            let _ = tokio::fs::create_dir_all(slot_path).await;
+            enforce_slot_cache_quota(slot_path, 2048);
+        }
+
         let sup = ProcessSupervisor::spawn_with_fallback_extra_footprint(
             config.clone(),
             existing_footprint,
@@ -1062,5 +1079,67 @@ mod which {
             }
         }
         Err(())
+    }
+}
+
+/// Enforces a maximum disk quota (in megabytes) on a slot cache directory by removing
+/// oldest files (LRU by modified time) until the total directory size is within budget.
+pub fn enforce_slot_cache_quota(dir: &Path, max_mb: u64) {
+    if !dir.exists() || !dir.is_dir() {
+        return;
+    }
+    let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    let mut files = Vec::new();
+    let mut total_size: u64 = 0;
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    let len = meta.len();
+                    total_size = total_size.saturating_add(len);
+                    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    files.push((entry.path(), len, mtime));
+                }
+            }
+        }
+    }
+
+    if total_size > max_bytes {
+        // Sort oldest first
+        files.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, len, _) in files {
+            if total_size <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total_size = total_size.saturating_sub(len);
+                debug!("Evicted slot cache file {:?} (freed {} bytes)", path, len);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_enforce_slot_cache_quota_evicts_oldest() {
+        let dir = tempdir().expect("tempdir");
+        let file1 = dir.path().join("slot1.bin");
+        let file2 = dir.path().join("slot2.bin");
+
+        let data = vec![0u8; 1024 * 1024]; // 1MB each
+        std::fs::write(&file1, &data).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&file2, &data).unwrap();
+
+        // Enforce quota of 1 MB max on 2 MB total directory
+        enforce_slot_cache_quota(dir.path(), 1);
+
+        assert!(!file1.exists(), "Older slot file should be evicted");
+        assert!(file2.exists(), "Newer slot file should be preserved");
     }
 }

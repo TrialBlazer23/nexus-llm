@@ -41,6 +41,9 @@ pub struct NexusConfig {
 
     #[serde(default)]
     pub huggingface: HuggingFaceConfig,
+
+    #[serde(default)]
+    pub inference: InferenceConfig,
 }
 
 impl NexusConfig {
@@ -321,6 +324,14 @@ pub struct SafetyConfig {
 
     #[serde(default = "default_false")]
     pub mlock: bool,
+
+    /// Battery floor percent on mobile devices (default 20%).
+    #[serde(default = "default_battery_floor_percent")]
+    pub battery_floor_percent: u8,
+
+    /// Action when below battery floor: "decline", "throttle", or "ignore".
+    #[serde(default = "default_battery_action")]
+    pub battery_action: String,
 }
 
 impl Default for SafetyConfig {
@@ -329,8 +340,58 @@ impl Default for SafetyConfig {
             max_ram_usage_percent: default_max_ram_usage_percent(),
             mmap: default_true(),
             mlock: default_false(),
+            battery_floor_percent: default_battery_floor_percent(),
+            battery_action: default_battery_action(),
         }
     }
+}
+
+fn default_battery_floor_percent() -> u8 {
+    20
+}
+
+fn default_battery_action() -> String {
+    "decline".to_string()
+}
+
+/// Inference engine settings and KV cache slot persistence (Phase 12 §5.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InferenceConfig {
+    #[serde(default)]
+    pub cache: PromptCacheConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheConfig {
+    /// Directory where llama-server persists prompt cache slots (--slot-save-path).
+    #[serde(default = "default_slot_save_path")]
+    pub slot_save_path: String,
+
+    /// Whether prompt cache slot saving is enabled.
+    #[serde(default = "default_true")]
+    pub prompt_cache_enabled: bool,
+
+    /// Maximum disk space (MB) allowed for prompt cache slots before LRU eviction.
+    #[serde(default = "default_max_cache_mb")]
+    pub max_cache_mb: u64,
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self {
+            slot_save_path: default_slot_save_path(),
+            prompt_cache_enabled: default_true(),
+            max_cache_mb: default_max_cache_mb(),
+        }
+    }
+}
+
+fn default_slot_save_path() -> String {
+    "~/.nexus/slots".to_string()
+}
+
+fn default_max_cache_mb() -> u64 {
+    2048
 }
 
 /// Network endpoints and discovery settings.

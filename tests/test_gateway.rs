@@ -413,3 +413,186 @@ fn gateway_port_defaults_and_validation() {
     disabled.network.gateway_port = disabled.network.api_port;
     disabled.validate().expect("disabled gateway may collide");
 }
+
+#[tokio::test]
+async fn gateway_serves_web_ui_and_api() {
+    let cfg = gateway_test_config();
+    let models_dir = TempDir::new().expect("tmpdir");
+    let ctx = Arc::new(
+        GatewayContext::new(
+            SupervisorManager::new(),
+            cfg.network.api_port,
+            models_dir.path().to_path_buf(),
+            Uuid::new_v4(),
+            Arc::new(std::sync::RwLock::new(cfg)),
+        )
+        .with_pin("123456"),
+    );
+
+    let (addr, gw_handle) = spawn_ephemeral(ctx).await.expect("gateway bind");
+    let client = reqwest::Client::new();
+
+    // 1. GET / serves embedded index.html
+    let resp = client
+        .get(format!("http://{}/", addr))
+        .send()
+        .await
+        .expect("get /");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.contains("text/html"));
+    let body = resp.text().await.expect("html text");
+    assert!(body.contains("Nexus-LLM"));
+    assert!(body.contains("Mesh Hub"));
+
+    // 2. GET /manifest.json serves PWA manifest
+    let resp = client
+        .get(format!("http://{}/manifest.json", addr))
+        .send()
+        .await
+        .expect("get manifest");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.expect("manifest text");
+    assert!(body.contains("Nexus-LLM Hub"));
+
+    // 3. GET /api/system/profile
+    let resp = client
+        .get(format!("http://{}/api/system/profile", addr))
+        .send()
+        .await
+        .expect("profile");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let json: serde_json::Value = resp.json().await.expect("json");
+    assert!(json.get("total_ram_mb").is_some());
+    assert!(json.get("available_ram_mb").is_some());
+
+    // 4. GET /api/cluster/nodes
+    let resp = client
+        .get(format!("http://{}/api/cluster/nodes", addr))
+        .send()
+        .await
+        .expect("nodes");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let nodes: Vec<serde_json::Value> = resp.json().await.expect("nodes json");
+    assert!(!nodes.is_empty());
+    assert_eq!(nodes[0]["is_local"], true);
+
+    // 5. POST /api/auth/verify with wrong pin
+    let resp = client
+        .post(format!("http://{}/api/auth/verify", addr))
+        .json(&serde_json::json!({"pin": "999999"}))
+        .send()
+        .await
+        .expect("auth wrong");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 6. POST /api/auth/verify with correct pin
+    let resp = client
+        .post(format!("http://{}/api/auth/verify", addr))
+        .json(&serde_json::json!({"pin": "123456"}))
+        .send()
+        .await
+        .expect("auth correct");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let auth_data: serde_json::Value = resp.json().await.expect("auth json");
+    assert!(auth_data["token"].is_string());
+
+    // 7. GET /api/config
+    let resp = client
+        .get(format!("http://{}/api/config", addr))
+        .send()
+        .await
+        .expect("get config");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let cfg_json: serde_json::Value = resp.json().await.expect("config json");
+    assert_eq!(cfg_json["inference"]["prompt_cache_enabled"], true);
+    assert_eq!(cfg_json["safety"]["battery_floor_percent"], 20);
+
+    // 8. POST /api/config without auth (rejected with 401)
+    let resp = client
+        .post(format!("http://{}/api/config", addr))
+        .json(&serde_json::json!({
+            "prompt_cache_enabled": false,
+            "battery_floor_percent": 30
+        }))
+        .send()
+        .await
+        .expect("post config no auth");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 9. POST /api/config with auth token
+    let token = auth_data["token"].as_str().unwrap();
+    let resp = client
+        .post(format!("http://{}/api/config", addr))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&serde_json::json!({
+            "prompt_cache_enabled": false,
+            "battery_floor_percent": 30,
+            "max_cache_mb": 4096
+        }))
+        .send()
+        .await
+        .expect("post config with auth");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated_cfg: serde_json::Value = resp.json().await.expect("updated json");
+    assert_eq!(updated_cfg["inference"]["prompt_cache_enabled"], false);
+    assert_eq!(updated_cfg["inference"]["max_cache_mb"], 4096);
+    assert_eq!(updated_cfg["safety"]["battery_floor_percent"], 30);
+
+    // 10. GET /api/models/download/status
+    let resp = client
+        .get(format!("http://{}/api/models/download/status", addr))
+        .send()
+        .await
+        .expect("download status");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let dl_status: serde_json::Value = resp.json().await.expect("dl status json");
+    assert_eq!(dl_status["status"], "idle");
+
+    // 11. GET /api/models/{id}/inspect for non-existent model (404)
+    let resp = client
+        .get(format!(
+            "http://{}/api/models/nonexistent.gguf/inspect",
+            addr
+        ))
+        .send()
+        .await
+        .expect("inspect 404");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 12. Create a minimal dummy GGUF and test GET /api/models/{id}/inspect (200)
+    let dummy_path = models_dir.path().join("test-model.gguf");
+    let mut dummy_buf = Vec::new();
+    dummy_buf.extend_from_slice(&nexus::gguf::GGUF_MAGIC.to_le_bytes()); // Magic
+    dummy_buf.extend_from_slice(&3u32.to_le_bytes()); // Version 3
+    dummy_buf.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+    dummy_buf.extend_from_slice(&1u64.to_le_bytes()); // 1 KV
+    let key = "general.architecture";
+    dummy_buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    dummy_buf.extend_from_slice(key.as_bytes());
+    dummy_buf.extend_from_slice(&8u32.to_le_bytes()); // String type
+    let val = "llama";
+    dummy_buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+    dummy_buf.extend_from_slice(val.as_bytes());
+    std::fs::write(&dummy_path, &dummy_buf).expect("write dummy gguf");
+
+    let resp = client
+        .get(format!(
+            "http://{}/api/models/test-model.gguf/inspect",
+            addr
+        ))
+        .send()
+        .await
+        .expect("inspect dummy");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let inspect_data: serde_json::Value = resp.json().await.expect("inspect json");
+    assert_eq!(inspect_data["architecture"], "llama");
+    assert_eq!(inspect_data["filename"], "test-model.gguf");
+
+    gw_handle.abort();
+}

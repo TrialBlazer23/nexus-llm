@@ -229,6 +229,17 @@ enum Commands {
         #[arg(long)]
         backend: Option<String>,
     },
+
+    /// Launch the embedded zero-dependency Web Interface and Mesh Gateway
+    Web {
+        /// Gateway port to listen on (defaults to config network.gateway_port, 8090)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// API host address to bind (defaults to config network.api_host, 0.0.0.0)
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -405,7 +416,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         discovery.node_uuid(),
                         trust.config.clone(),
                     )
-                    .with_discovery(discovery.clone()),
+                    .with_discovery(discovery.clone())
+                    .with_identity(trust.identity.clone()),
                 );
                 let handle = spawn_gateway(
                     SocketAddr::from(([0, 0, 0, 0], config.network.gateway_port)),
@@ -441,6 +453,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_type_v: None,
                 memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
                 tags: Vec::new(),
+                slot_save_path: if config.inference.cache.prompt_cache_enabled {
+                    Some(PathBuf::from(&config.inference.cache.slot_save_path))
+                } else {
+                    None
+                },
             };
             supervisor.spawn(server_cfg).await?;
             let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -1052,6 +1069,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sample.ttft_ms
                 );
             }
+        }
+
+        Commands::Web { port, host } => {
+            let config = NexusConfig::load()?;
+            let trust = TrustBootstrap::load(config.clone())?;
+            let discovery = Arc::new(DiscoveryService::with_shared_config(
+                trust.config.clone(),
+                None,
+            ));
+            let _registry = spawn_registry_runtime(
+                discovery.clone(),
+                trust.identity.clone(),
+                discovery.node_uuid(),
+            );
+            let _broadcaster = discovery.clone().start_broadcaster();
+            let _listener = discovery.clone().start_listener();
+            let _mdns = discovery.clone().start_mdns();
+
+            let supervisor = SupervisorManager::new();
+            let gateway_port = port.unwrap_or(config.network.gateway_port);
+            let bind_host = host.unwrap_or_else(|| config.network.api_host.clone());
+            let gateway_addr: SocketAddr = format!("{bind_host}:{gateway_port}")
+                .parse()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], gateway_port)));
+
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let pin = trust.identity.current_pairing_code(unix_now);
+
+            let gateway_ctx = Arc::new(
+                GatewayContext::new(
+                    supervisor.clone(),
+                    config.network.api_port,
+                    PathBuf::from(&config.node.models_dir),
+                    discovery.node_uuid(),
+                    trust.config.clone(),
+                )
+                .with_discovery(discovery.clone())
+                .with_identity(trust.identity.clone())
+                .with_pin(&pin),
+            );
+
+            let _gw_handle = spawn_gateway(gateway_addr, gateway_ctx);
+
+            println!(
+                "\x1b[1;36m┌──────────────────────────────────────────────────────────┐\x1b[0m"
+            );
+            println!("\x1b[1;36m│\x1b[0m       \x1b[1;37m⚡ NEXUS-LLM EMBEDDED WEB INTERFACE READY ⚡\x1b[0m       \x1b[1;36m│\x1b[0m");
+            println!(
+                "\x1b[1;36m├──────────────────────────────────────────────────────────┤\x1b[0m"
+            );
+            println!("\x1b[1;36m│\x1b[0m  \x1b[1;32mWeb Hub URL  \x1b[0m: http://{bind_host}:{gateway_port}/");
+            println!("\x1b[1;36m│\x1b[0m  \x1b[1;33mAdmin 6-PIN  \x1b[0m: \x1b[1;44;37m {pin} \x1b[0m (rotates every 5 min)");
+            println!("\x1b[1;36m│\x1b[0m  \x1b[1;35mOpenAI API   \x1b[0m: http://{bind_host}:{gateway_port}/v1");
+            println!(
+                "\x1b[1;36m├──────────────────────────────────────────────────────────┤\x1b[0m"
+            );
+            println!("\x1b[1;36m│\x1b[0m  Open the URL on any mobile phone, tablet, or browser    \x1b[1;36m│\x1b[0m");
+            println!("\x1b[1;36m│\x1b[0m  on your local network to chat, inspect, and offload.     \x1b[1;36m│\x1b[0m");
+            println!(
+                "\x1b[1;36m└──────────────────────────────────────────────────────────┘\x1b[0m"
+            );
+            println!("\x1b[2mPress Ctrl+C to terminate the web server.\x1b[0m");
+
+            tokio::signal::ctrl_c().await?;
+            println!("\nShutting down Nexus Web Hub...");
         }
     }
 

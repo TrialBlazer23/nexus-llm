@@ -1247,6 +1247,11 @@ async fn run_local_load(
         cache_type_v: None,
         memory_budget_percent: ctx.config.hardware.safety.max_ram_usage_percent,
         tags: Vec::new(),
+        slot_save_path: if ctx.config.inference.cache.prompt_cache_enabled {
+            Some(PathBuf::from(&ctx.config.inference.cache.slot_save_path))
+        } else {
+            None
+        },
     };
 
     let _ = evt_tx

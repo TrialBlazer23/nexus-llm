@@ -146,7 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 discovery.node_uuid(),
                 trust.config.clone(),
             )
-            .with_discovery(discovery.clone()),
+            .with_discovery(discovery.clone())
+            .with_identity(trust.identity.clone()),
         );
         let gateway_addr = SocketAddr::from(([0, 0, 0, 0], config.network.gateway_port));
         let handle = spawn_gateway(gateway_addr, gateway_ctx);
@@ -267,6 +268,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cache_type_v: None,
             memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
             tags: Vec::new(),
+            slot_save_path: if config.inference.cache.prompt_cache_enabled {
+                Some(PathBuf::from(&config.inference.cache.slot_save_path))
+            } else {
+                None
+            },
         };
 
         info!(

@@ -1774,7 +1774,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 hub.discovery.node_uuid(),
                 hub.shared_config.clone(),
             )
-            .with_discovery(hub.discovery.clone()),
+            .with_discovery(hub.discovery.clone())
+            .with_identity(hub.identity.clone()),
         );
         let handle = spawn_gateway(gateway_addr, gateway_ctx);
         info!(

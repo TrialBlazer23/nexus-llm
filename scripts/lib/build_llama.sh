@@ -29,7 +29,7 @@ nexus_llama_cmake_flags() {
 
   # Vulkan is optional; enable when headers exist and operator did not disable.
   if [ "${NEXUS_DISABLE_VULKAN:-0}" != "1" ] \
-    && { [ -f /usr/include/vulkan/vulkan.h ] || [ -f "${PREFIX:-}/include/vulkan/vulkan.h" ]; }; then
+    && { [ -f /usr/include/vulkan/vulkan.h ] || [ -f "${PREFIX:-}/include/vulkan/vulkan.h" ] || [ -f /data/data/com.termux/files/usr/include/vulkan/vulkan.h ]; }; then
     flags+=(-DGGML_VULKAN=ON)
   fi
 
@@ -67,6 +67,16 @@ nexus_build_llama() {
   local jobs="${NEXUS_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 
   mkdir -p "${prefix}/bin"
+  if [ -x "${prefix}/bin/llama-server" ] && [ "${NEXUS_REBUILD_LLAMA:-0}" != "1" ]; then
+    echo "==> Using existing llama-server at ${prefix}/bin/llama-server"
+    return 0
+  fi
+  if [ -x "/data/data/com.termux/files/usr/bin/llama-server" ] && [ "${NEXUS_REBUILD_LLAMA:-0}" != "1" ]; then
+    echo "==> Adopting system llama-server -> ${prefix}/bin/llama-server"
+    ln -sf "/data/data/com.termux/files/usr/bin/llama-server" "${prefix}/bin/llama-server"
+    return 0
+  fi
+
   nexus_clone_or_update "$LLAMA_CPP_REPO" "$LLAMA_CPP_REF" "$src_dir"
 
   echo "==> Configuring llama.cpp (${LLAMA_CPP_REF})"

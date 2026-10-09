@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use nexus::bmoe_client::{should_use_bmoe, BmoeSessionConfig};
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use nexus::config::NexusConfig;
 use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
@@ -466,34 +467,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let server_cfg = LlamaServerConfig {
-                binary_path: binary,
-                model_path: model,
-                host: api_host,
-                port: api_port,
-                gpu_layers: if config.hardware.acceleration.prefer_gpu {
-                    config.hardware.acceleration.gpu_layers
-                } else {
-                    0
-                },
-                threads: profile.recommended_threads,
-                context_size: ctx,
-                extra_args: Vec::new(),
-                use_mmap: config.hardware.safety.mmap,
-                use_mlock: false,
-                cpu_threads_batch: 6,
-                fallback_to_cpu: true,
-                cache_type_k: None,
-                cache_type_v: None,
-                memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
-                tags: Vec::new(),
-                slot_save_path: if config.inference.cache.prompt_cache_enabled {
-                    Some(PathBuf::from(&config.inference.cache.slot_save_path))
-                } else {
-                    None
-                },
+            let gguf = GgufMetadata::open(&model).ok();
+            let want_bmoe = if let Some(ref meta) = gguf {
+                should_use_bmoe(
+                    meta,
+                    &profile,
+                    &config.inference.moe,
+                    ctx,
+                    config.hardware.safety.max_ram_usage_percent,
+                )
+            } else {
+                false
             };
-            supervisor.spawn(server_cfg).await?;
+
+            if want_bmoe {
+                let bmoe_cfg = BmoeSessionConfig::from_profile(
+                    std::path::PathBuf::from(&config.inference.moe.bmoe_binary),
+                    model,
+                    api_host,
+                    api_port,
+                    ctx,
+                    profile.recommended_threads,
+                    config.inference.moe.clone(),
+                    &profile,
+                    config.hardware.safety.max_ram_usage_percent,
+                    Vec::new(),
+                );
+                supervisor.spawn_bmoe(bmoe_cfg).await?;
+            } else {
+                let server_cfg = LlamaServerConfig {
+                    binary_path: binary,
+                    model_path: model,
+                    host: api_host,
+                    port: api_port,
+                    gpu_layers: if config.hardware.acceleration.prefer_gpu {
+                        config.hardware.acceleration.gpu_layers
+                    } else {
+                        0
+                    },
+                    threads: profile.recommended_threads,
+                    context_size: ctx,
+                    extra_args: Vec::new(),
+                    use_mmap: config.hardware.safety.mmap,
+                    use_mlock: false,
+                    cpu_threads_batch: 6,
+                    fallback_to_cpu: true,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    memory_budget_percent: config.hardware.safety.max_ram_usage_percent,
+                    tags: Vec::new(),
+                    slot_save_path: if config.inference.cache.prompt_cache_enabled {
+                        Some(PathBuf::from(&config.inference.cache.slot_save_path))
+                    } else {
+                        None
+                    },
+                };
+                supervisor.spawn(server_cfg).await?;
+            }
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             loop {
                 tokio::select! {

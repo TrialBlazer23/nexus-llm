@@ -34,6 +34,10 @@ nexus_ensure_rust() {
 }
 
 nexus_install_deps() {
+  if nexus_have_cmd git && nexus_have_cmd cmake && nexus_have_cmd clang && nexus_have_cmd rustc && nexus_have_cmd cargo; then
+    echo "==> Build dependencies already satisfied (git, cmake, clang, rustc, cargo)"
+    return 0
+  fi
   echo "==> Installing build dependencies (pkg=${NEXUS_PKG_MGR})"
   case "$NEXUS_PKG_MGR" in
     pkg)

@@ -179,6 +179,8 @@ max_cache_mb = 2048
 # Phase 16 — BigMoeOnEdge expert flash streaming (RAM cache for active experts)
 # Operator knobs: enabled + cache_mb (defaults after scripts/setup.sh are enough).
 # Expert knobs below: leave at defaults unless tuning flash I/O or lossy quality.
+# Termux / Bionic: native build targets -target aarch64-linux-android28 for AHardwareBuffer support.
+# Session stdout lifecycle: wait_for_ready evaluates against overall deadline; n_predict clamps to context_size.
 [inference.moe]
 enabled = true
 bmoe_binary = "~/.nexus/bin/bmoe-cli"  # setup writes absolute paths under ~/.nexus/bin

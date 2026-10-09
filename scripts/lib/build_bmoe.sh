@@ -55,6 +55,11 @@ nexus_build_bmoe() {
 
   mkdir -p "${prefix}/bin"
 
+  if [ -x "${prefix}/bin/bmoe-cli" ] && [ "${NEXUS_REBUILD_BMOE:-0}" != "1" ]; then
+    echo "==> Using existing bmoe-cli at ${prefix}/bin/bmoe-cli"
+    return 0
+  fi
+
   if nexus_try_bmoe_prebuilt "$prefix"; then
     return 0
   fi
@@ -63,15 +68,22 @@ nexus_build_bmoe() {
   echo "==> Init BigMoe llama.cpp submodule (Helldez expert-ready fork)"
   git -C "$src_dir" submodule update --init --recursive
 
+  local termux_flags=""
+  if [ "${NEXUS_IS_TERMUX}" = "1" ]; then
+    termux_flags="-target aarch64-linux-android28"
+  fi
+
   if [ -x "$src_dir/scripts/build-host.sh" ]; then
     echo "==> Building bmoe-cli via scripts/build-host.sh"
     (
       cd "$src_dir"
+      export CFLAGS="${CFLAGS:-} ${termux_flags}"
+      export CXXFLAGS="${CXXFLAGS:-} ${termux_flags}"
       BUILD_DIR=build-nexus BUILD_TYPE=Release JOBS="$jobs" bash scripts/build-host.sh
     )
   else
     echo "==> Building bmoe-cli via cmake"
-    cmake -S "$src_dir" -B "$src_dir/build-nexus" -DCMAKE_BUILD_TYPE=Release
+    cmake -S "$src_dir" -B "$src_dir/build-nexus" -DCMAKE_BUILD_TYPE=Release ${termux_flags:+-DCMAKE_CXX_FLAGS="$termux_flags" -DCMAKE_C_FLAGS="$termux_flags"}
     cmake --build "$src_dir/build-nexus" -j "$jobs"
   fi
 

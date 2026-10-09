@@ -134,7 +134,7 @@ cargo test --locked --test test_phase10_store
 ---
 
 ## Phase 16: MoE Flash Streaming Backend (BigMoeOnEdge)
-**Status:** Complete (v1 single-node); Phase D mesh research deferred
+**Status:** Completed & Verified on Hardware (Snapdragon 8 Gen 2 / Termux aarch64 / Qwen3-Coder-30B-A3B-Instruct)
 
 ### Objectives
 - Treat Helldez/BigMoeOnEdge `bmoe-cli` as a third supervised inference backend (no C++ bindings, no llama.cpp submodule in Nexus).
@@ -146,6 +146,12 @@ cargo test --locked --test test_phase10_store
 - **Do not** combine MoE flash streaming with `--rpc --split-mode layer` in v1.
 - **Phase D (research only):** networked route-ahead prefetch hints, distributed expert-cache affinity, Vulkan expert path — see DESIGN_SPEC §3.1.
 
+### Hardware Soak & Verification
+- Verified on physical Galaxy S23 Ultra (Snapdragon 8 Gen 2, 12GB RAM, Android 14 Termux):
+  - Model: `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (18.55 GB file size, 48 layers, 128 experts).
+  - Dense LMK would require 18+ GB and fail; MoE flash streaming loaded in ~2.0 GB LRU cache + ~950 MB anon buffers without LMK kill.
+  - Achieved ~2.35 tok/s sustained decode, 0 major page faults, and clean streaming SSE completions.
+
 ### Verification Command
 ```bash
 cargo test --locked --lib bmoe_client::
@@ -156,7 +162,7 @@ cargo test --locked
 ---
 
 ## Phase 17: Unified Bootstrap (setup.sh)
-**Status:** Complete
+**Status:** Completed & Verified on Hardware
 
 ### Objectives
 - One operator entrypoint: `bash scripts/setup.sh` (Windows: `scripts/setup.ps1` → WSL).
@@ -166,6 +172,11 @@ cargo test --locked
 - `cargo build --release --locked` for `nexus` / `nexusd`; write absolute binary paths into config; optional `--model` download; run `nexus doctor`.
 - `nexus setup` CLI forwards to the script; `nexus setup __write_bins` applies paths; Settings exposes `bmoe_binary`.
 - Keep MoE operator surface simple: `enabled` + `cache_mb = "auto"`; advanced knobs stay TOML-only.
+
+### Hardware Fixes Verified
+- Termux platform detection fix when `$PREFIX` is shadowed by setup destination prefix.
+- Android Bionic `-target aarch64-linux-android28` flag so `AHardwareBuffer` APIs link without availability errors.
+- Cold load stdout timeout fix in `wait_for_ready` and `context_size` clamping in `handle_chat`.
 
 ### Verification Command
 ```bash

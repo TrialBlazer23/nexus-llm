@@ -72,6 +72,8 @@ flowchart TD
    Standardized `/cluster/model/load` and `/cluster/model/unload` endpoints enable any node to supervise, hot-swap, or stop models across the cluster.
 7. **Hybrid Transport Fallback**:
    Transparent support for Wi-Fi LAN, direct IP, static peer fallback, and zero-latency USB cable tethering via automated ADB port forwarding.
+8. **MoE Flash Streaming with BigMoeOnEdge**:
+   Run massive Mixture-of-Experts (MoE) models (such as Qwen3-Coder-30B-A3B-Instruct) on RAM-constrained devices like mobile phones. While dense execution would require 18+ GB and trigger the Android Low Memory Killer (LMK), Nexus supervises `bmoe-cli` to stream active expert weights dynamically from fast flash storage into an LRU cache (e.g. 2 GB), enabling real-time local MoE generation without OOM kills.
 
 ---
 
@@ -230,10 +232,15 @@ nexus-llm/
 ├── .cargo/
 │   └── config.toml          # Target compiler flags (Snapdragon vs Penryn SSE4.1)
 ├── AGENTS.md                # System guidelines and architecture rules
-├── DESIGN_SPEC.md           # Network protocols and binary packet layout
+├── DESIGN_SPEC.md           # Network protocols, binary beacons, and MoE flash streaming spec
 ├── BUILD_PLAN.md            # Phased execution milestones
 ├── AGENT_LEARNINGS.md       # Operational lessons and environment notes
 ├── README.md                # Setup and user documentation
+├── scripts/
+│   ├── setup.sh             # Unified bootstrap: backends + Nexus -> ~/.nexus/bin
+│   ├── setup.ps1            # Windows setup forwarder to WSL
+│   ├── versions.env         # Pinned llama.cpp and BigMoeOnEdge refs
+│   └── lib/                 # Platform detect, deps, llama, bmoe, and config helpers
 ├── presets/
 │   ├── coder.yaml           # Systems programming persona (ChatML)
 │   └── general.yaml         # Conversational assistant persona (Llama-3)
@@ -241,58 +248,43 @@ nexus-llm/
 │   ├── main.rs              # CLI router, default Unified Hub entry point
 │   ├── daemon.rs            # Headless supervisor daemon (nexusd)
 │   ├── config.rs            # TOML configuration engine (~/.nexus/config.toml)
-│   ├── sysinfo.rs           # /proc parser & Android LMK memory guard
-│   ├── supervisor.rs        # Asynchronous llama-server process manager
+│   ├── sysinfo.rs           # /proc parser, Android LMK memory guard, and MoE stream LMK
+│   ├── supervisor.rs        # Asynchronous llama-server & bmoe-cli supervisor
+│   ├── bmoe_client.rs       # BigMoe bmoe-cli --session client & OpenAI/SSE streaming adapter
+│   ├── setup.rs             # CLI setup command and automated config writer
 │   ├── control_plane.rs     # Remote model load/unload dispatch protocol
+│   ├── control_plane_server.rs # HTTP control plane listener
+│   ├── gateway.rs           # Mesh OpenAI API Gateway
 │   ├── discovery.rs         # 64-byte UDP beacon protocol & peer cache
 │   ├── peer_registry.rs     # Dynamic peer lifecycle and state management
 │   ├── mdns.rs              # Zero-config mDNS service discovery
 │   ├── client.rs            # OpenAI HTTP/SSE streaming client
 │   ├── cluster.rs           # Distributed RPC layer pipelining coordinator
+│   ├── bench.rs             # Model benchmark store & telemetry
 │   ├── tunnel.rs            # ADB USB port forwarding & reverse supervisor
-│   ├── gguf.rs              # Zero-copy GGUF v2/v3 metadata parser
-│   ├── downloader.rs        # Chunked HTTP resume downloader with SHA-256
+│   ├── gguf.rs              # GGUF v2/v3 metadata parser & MoE architecture inspector
+│   ├── downloader.rs        # Chunked HTTP Range resume downloader with SHA-256
 │   ├── preset.rs            # YAML persona & prompt formatting templates
 │   └── ui/
-│       ├── hub.rs           # Unified interactive Ratatui Hub controller
+│       ├── hub/             # Unified interactive Ratatui Hub controller
 │       ├── chat.rs          # Ratatui split-screen streaming chat view
 │       ├── models_view.rs   # Split-pane model browser & GGUF inspector
 │       ├── settings_view.rs # In-app configuration editor
 │       ├── tunnel_view.rs   # Interactive USB ADB tunnel monitor
-│       ├── dashboard.rs     # Cluster performance monitor TUI
-│       └── models.rs        # Local model directory scanner
-└── tests/
-    ├── test_phase1.rs       # System profiling & memory guard test suite
-    ├── test_discovery.rs    # UDP 9999 beacon & SSE stream test suite
-    ├── test_phase3_network.rs # Control plane & peer registry test suite
-    ├── test_cluster_rpc.rs  # Distributed RPC layer offload & ADB tests
-    ├── test_gguf_metadata.rs# GGUF parsing & persona templates test suite
-    ├── test_ui.rs           # Headless Ratatui widget render test suite
-    └── test_hub_ui.rs       # Unified Hub, navigation, and settings test suite
+│       └── dashboard.rs     # Cluster performance monitor TUI
+└── tests/                   # Complete integration test suites
 ```
 
 ---
 
 ## Verification & Automated Test Suite
 
-All 60 automated tests pass deterministically across all supported platforms:
+All 75 library unit tests and comprehensive integration test suites pass deterministically across all supported platforms:
 
 ```bash
-# Run complete test suite (in WSL or Linux)
-cargo test
+# Run unit test suite (in Termux, Linux, or WSL)
+cargo test --locked --lib
 ```
-
-### Test Suite Breakdown
-| Test Suite | Tests | Description |
-| :--- | :---: | :--- |
-| `test_phase1` | 17 | Memory guard, system profiling, and supervisor preflight |
-| `test_discovery` | 9 | UDP beacon protocol, CRC-16, and peer caching |
-| `test_phase3_network` | 7 | Control plane model dispatch, peer registry, and security policies |
-| `test_gguf_metadata` | 7 | GGUF parsing, exact KV cache calculation, and chat presets |
-| `test_cluster_rpc` | 8 | Dynamic cluster budgeting, layer offload, and RPC allocation caps |
-| `test_hub_ui` | 7 | Unified Hub tab cycling, settings mutations, and target node selection modal |
-| `test_ui` | 5 | Headless chat streaming, token rendering, and dashboard monitor |
-| **Total** | **60** | **100% Pass Rate** |
 
 ---
 
@@ -304,10 +296,23 @@ cargo test
 
 ### 2. Android Termux terminates `llama-server` unexpectedly
 - Verify available RAM with `./target/release/nexus inspect -m <model>`.
-- The Android LMK guard protects against models where `Model Size + KV Cache > 0.75 * MemAvailable`. If memory is tight, reduce context length (`-c 2048`) or offload layers to an RPC worker.
+- The Android LMK guard protects against models where `Model Size + KV Cache > 0.75 * MemAvailable`. If memory is tight, reduce context length (`-c 2048`), offload layers to an RPC worker, or use MoE flash streaming for MoE models (`bmoe-cli`).
 
 ### 3. Mac shows `SIGILL (Illegal Instruction)`
 - This occurs if code was compiled with modern CPU instructions (AVX/AVX2/FMA/SSE4.2). Verify `.cargo/config.toml` includes `-C target-feature=-avx,-avx2,-fma,-sse4.2` and rebuild with `cargo build --release`.
 
 ### 4. PowerShell "command not found: cargo"
 - Windows PowerShell may not have Rust/Cargo in PATH. Execute all cargo commands through WSL: `wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"`.
+
+---
+
+## Acknowledgments & Credits
+
+Nexus-LLM stands on the shoulders of remarkable open-source engineering. We extend our deepest gratitude to:
+
+- **[Helldez](https://github.com/Helldez)** for creating **[BigMoeOnEdge](https://github.com/Helldez/BigMoeOnEdge)**:
+  Special credit and appreciation to Helldez for developing the groundbreaking BigMoe flash-streaming engine. Its dynamic expert LRU caching, row streaming, and asynchronous I/O overlap make it possible to run massive 30B+ MoE architectures (such as `Qwen3-Coder-30B-A3B-Instruct`) fluidly on memory-constrained mobile devices and edge hardware without suffering Low Memory Killer (LMK) termination.
+- **[Georgi Gerganov](https://github.com/ggerganov)** & the **[llama.cpp](https://github.com/ggerganov/llama.cpp)** / **[ggml](https://github.com/ggerganov/ggml)** community:
+  For pioneering high-performance CPU/GPU local LLM inference across diverse hardware architectures.
+- **The [Ratatui](https://github.com/ratatui/ratatui)** & **[crossterm](https://github.com/crossterm-rs/crossterm)** teams:
+  For providing the premier reactive terminal user interface ecosystem in Rust.

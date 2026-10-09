@@ -25,12 +25,38 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-09 — BigMoe Termux Bionic Build, Wait-for-Ready Deadline, and Host CLI MoE Dispatch
+- Category: bug | environment | design-decision
+- Context: Building `bmoe-cli` natively in Termux and running the 18GB `Qwen3-Coder-30B-A3B-Instruct` model on Android (Galaxy S23 Ultra, Snapdragon 8 Gen 2, 12GB RAM).
+- Finding:
+  1. **Termux Detection Shadowed**: `scripts/setup.sh` defaults `PREFIX="${NEXUS_PREFIX:-$HOME/.nexus}"`, which shadowed Termux's system `$PREFIX` (`/data/data/com.termux/files/usr`). `detect_platform.sh` checked `[ -x "$PREFIX/bin/pkg" ]` which failed, misidentifying Termux as unknown Linux.
+  2. **Android NDK Clang API Target**: Termux clang defaults to `aarch64-linux-android24`. BigMoe's `platform_io.cpp` uses `AHardwareBuffer` APIs which require Android API >= 26 (`__INTRODUCED_IN(26)`), failing compilation. Supplying `-target aarch64-linux-android28` resolves the symbol availability cleanly.
+  3. **bmoe-cli stdout Pre-Ready Timeout**: `wait_for_ready` previously used `tokio::time::timeout(Duration::from_secs(30), lines.next_line())`. `bmoe-cli` prints progress to stderr and only writes `BMOE_READY` to stdout after completely mapping and initializing weights. On large 18GB+ GGUFs, cold flash initialization can take >30s, causing false timeout aborts.
+  4. **n_predict / Context Clamping**: `handle_chat` in `bmoe_client.rs` defaulted to 512 `n_predict` when unprovided by clients. If context was small, `prompt + 512` exceeded `n_ctx`, causing 500 error from `bmoe-cli`.
+- Action:
+  1. Added `TERMUX_VERSION` and `/data/data/com.termux` checks to `detect_platform.sh` and adopted existing system `llama-server`.
+  2. Configured `-target aarch64-linux-android28` for Termux in `build_bmoe.sh`.
+  3. Changed `wait_for_ready` to use the remaining overall deadline (`deadline.saturating_sub(start.elapsed())`).
+  4. Clamped `n_predict` to available context (`context_size - prompt_estimate`) and wired `nexus host` to inspect GGUF and automatically route streamable MoEs through `spawn_bmoe`.
+- Verification: Built `bmoe-cli` natively on Termux; ran `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` under `nexus host` and verified both non-streaming and streaming completions via `nexus client` and curl. All 75 tests passing.
+
 ## 2026-10-09 — Unified setup installs backends under ~/.nexus/bin (no C++ in crate)
 - Category: design-decision
 - Context: Operators needed one clone→ready path for Nexus + llama.cpp + bmoe-cli across Termux, Penryn Linux, WSL, and macOS.
 - Finding: Bundling via Cargo `build.rs` / FFI would violate the subprocess rule and break Penryn/Termux baselines. Prebuilt llama/bmoe blobs often ship AVX and are unsafe as the only install path. BigMoe vendors its own Helldez llama.cpp fork; stock `llama-server`/`rpc-server` need a separate tree. Modern llama.cpp may emit `ggml-rpc-server` — install/symlink as `rpc-server` for Nexus config.
 - Action: Ship `scripts/setup.sh` (+ `setup.ps1` → WSL) with pinned refs in `scripts/versions.env`; install to `~/.nexus/bin`; `nexus setup __write_bins` rewrites config paths and can set `inference.moe.enabled`. Cloud/CI may use `--skip-llama --skip-moe`. Keep advanced MoE knobs out of the primary Settings surface.
 - Verification: `bash scripts/setup.sh --dry-run`; `cargo test --locked --lib setup::`; full backend builds are operator/hardware soak (long compile).
+
+## 2026-10-09 — Downloader Resume Socket Idle Timeout on Large Partial Files & Buffer Tuning
+- Category: bug | design-decision
+- Context: When resuming large model downloads (e.g. 15GB+ partial files) via `nexus download`, network retries failed with `Reqwest(Decode(hyper::Error(UnexpectedEof, "peer closed connection without sending TLS close_notify")))`.
+- Finding:
+  1. **Premature Request Dispatch vs Idle Timeout**: `download_once` called `req.send().await?` (opening the HTTP connection and receiving response headers) *before* running `hash_prefix(part_path, downloaded, &mut hasher).await?`.
+  2. **Flash Read Stalls Socket**: Hashing 15+ GB of partial file data on disk using a 64 KB buffer took ~70 seconds. During this disk read, zero bytes were consumed from the HTTP response socket stream. Remote CDNs (such as AWS CloudFront / Hugging Face CDN) enforce a ~60s idle response timeout and closed the connection before the first byte could be read.
+- Action:
+  1. Moved partial prefix hashing before `req.send().await?` so `hasher` is pre-populated from existing disk bytes before the remote HTTP connection is opened. Upon receiving HTTP 206 Partial Content headers, `resp.bytes_stream()` is consumed immediately with zero idle delay.
+  2. Increased `hash_prefix` chunk buffer from 64 KB to 1 MB (`1024 * 1024`), significantly reducing disk read syscall overhead.
+- Verification: Tested with 15GB `.part` file, confirmed clean resume with immediate streaming and all tests passing.
 
 ## 2026-10-09 — BigMoeOnEdge integration: external bmoe-cli, stream LMK, no RPC+stream
 - Category: design-decision

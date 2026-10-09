@@ -310,6 +310,7 @@ impl BmoeRuntime {
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "moe-model".into()),
+            context_size: ready.n_ctx.map(|c| c as usize).unwrap_or(config.context_size),
         };
         let listen_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
         // Prefer binding the configured host when it is loopback/unspecified.
@@ -442,10 +443,11 @@ async fn wait_for_ready(
     let start = tokio::time::Instant::now();
 
     loop {
-        if start.elapsed() > deadline {
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
             return Err(BmoeError::NotReady("timeout waiting for BMOE_READY".into()));
         }
-        let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+        let line = tokio::time::timeout(remaining, lines.next_line())
             .await
             .map_err(|_| BmoeError::NotReady("timeout reading bmoe stdout".into()))?
             .map_err(|e| BmoeError::NotReady(e.to_string()))?
@@ -544,6 +546,7 @@ struct AdapterState {
     event_rx: Arc<Mutex<mpsc::UnboundedReceiver<BmoeEvent>>>,
     next_id: Arc<AtomicU64>,
     model_name: String,
+    context_size: usize,
 }
 
 async fn run_openai_adapter(
@@ -628,7 +631,9 @@ async fn handle_chat(req: Request<Incoming>, state: Arc<AdapterState>) -> Respon
         }
     };
     let prompt = messages_to_prompt(&parsed.messages);
-    let n_predict = parsed.max_tokens.unwrap_or(512);
+    let prompt_est = (prompt.len() / 3).max(1);
+    let max_avail = state.context_size.saturating_sub(prompt_est).max(1);
+    let n_predict = parsed.max_tokens.unwrap_or(512).min(max_avail);
     let stream = parsed.stream;
     let id = state.next_id.fetch_add(1, Ordering::SeqCst) as i64;
     let req_line = json!({

@@ -316,6 +316,11 @@ impl ModelDownloader {
             }
         }
 
+        let mut hasher = Sha256::new();
+        if existing_bytes > 0 {
+            hash_prefix(part_path, existing_bytes, &mut hasher).await?;
+        }
+
         let resp = req.send().await?;
         let status = resp.status();
 
@@ -337,6 +342,7 @@ impl ModelDownloader {
                 // Fresh start (server ignored Range / If-Range forced full body)
                 if existing_bytes > 0 {
                     let _ = tokio::fs::remove_file(part_path).await;
+                    hasher = Sha256::new();
                 }
                 (false, 0u64, resp.content_length())
             };
@@ -369,11 +375,6 @@ impl ModelDownloader {
             tokio::fs::File::create(part_path).await?
         };
         let mut writer = BufWriter::new(file);
-
-        let mut hasher = Sha256::new();
-        if downloaded > 0 {
-            hash_prefix(part_path, downloaded, &mut hasher).await?;
-        }
 
         let mut stream = resp.bytes_stream();
         let mut last_emit = Instant::now();
@@ -673,7 +674,7 @@ async fn save_sidecar(path: &Path, sc: &PartSidecar) -> Result<(), DownloaderErr
 async fn hash_prefix(path: &Path, len: u64, hasher: &mut Sha256) -> Result<(), DownloaderError> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut remaining = len;
-    let mut buffer = vec![0u8; 65536];
+    let mut buffer = vec![0u8; 1024 * 1024];
     while remaining > 0 {
         let to_read = remaining.min(buffer.len() as u64) as usize;
         let n = file.read(&mut buffer[..to_read]).await?;

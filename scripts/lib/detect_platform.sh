@@ -12,7 +12,7 @@ nexus_detect_platform() {
   NEXUS_IS_PENRYN_SAFE=0
   NEXUS_PKG_MGR="none"
 
-  if [ -n "${PREFIX:-}" ] && [ -d "${PREFIX}/bin" ] && [ -x "${PREFIX}/bin/pkg" ]; then
+  if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux" ] || [ -x "/data/data/com.termux/files/usr/bin/pkg" ] || { [ -n "${PREFIX:-}" ] && [ -x "${PREFIX}/bin/pkg" ]; }; then
     NEXUS_IS_TERMUX=1
     NEXUS_DISTRO="termux"
     NEXUS_PKG_MGR="pkg"

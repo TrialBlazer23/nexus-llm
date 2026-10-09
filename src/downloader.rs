@@ -43,6 +43,12 @@ pub enum DownloaderError {
 
     #[error("download cancelled by operator")]
     Cancelled,
+
+    #[error("invalid binary format: {0}")]
+    InvalidBinaryFormat(String),
+
+    #[error("download completed with 0 bytes (empty response)")]
+    EmptyResponse,
 }
 
 impl DownloaderError {
@@ -199,6 +205,7 @@ impl ModelDownloader {
         let part_path = PathBuf::from(format!("{}.part", dest.display()));
         let sidecar_path = PathBuf::from(format!("{}.part.json", dest.display()));
         let expected = expected_sha256.map(|s| s.trim().to_lowercase());
+        let effective_url = normalize_download_url(url);
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -210,7 +217,7 @@ impl ModelDownloader {
             let rx = cancel_rx.clone();
             match self
                 .download_once(
-                    url,
+                    &effective_url,
                     dest,
                     &part_path,
                     &sidecar_path,
@@ -372,6 +379,7 @@ impl ModelDownloader {
         let mut last_emit = Instant::now();
         let mut bytes_since_emit = 0u64;
         let mut last_byte_at = Instant::now();
+        let mut first_chunk_checked = false;
 
         loop {
             if let Some(ref rx) = cancel_rx {
@@ -418,6 +426,35 @@ impl ModelDownloader {
                 }
                 continue;
             }
+
+            if !first_chunk_checked && downloaded == 0 {
+                first_chunk_checked = true;
+                let is_gguf_dest = dest
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(false);
+                let is_html = chunk.starts_with(b"<!DO")
+                    || chunk.starts_with(b"<!do")
+                    || chunk.starts_with(b"<htm")
+                    || chunk.starts_with(b"<HTM");
+                let starts_with_gguf = chunk.len() >= 4 && &chunk[..4] == b"GGUF";
+
+                if is_html || (is_gguf_dest && !starts_with_gguf) {
+                    writer.flush().await?;
+                    let file = writer.into_inner();
+                    drop(file);
+                    let _ = tokio::fs::remove_file(part_path).await;
+                    let _ = tokio::fs::remove_file(sidecar_path).await;
+                    let reason = if is_html {
+                        "server returned an HTML webpage instead of a model binary"
+                    } else {
+                        "binary header magic does not match GGUF ('GGUF')"
+                    };
+                    return Err(DownloaderError::InvalidBinaryFormat(reason.to_string()));
+                }
+            }
+
             last_byte_at = Instant::now();
             writer.write_all(&chunk).await?;
             hasher.update(&chunk);
@@ -449,6 +486,39 @@ impl ModelDownloader {
         let file = writer.into_inner();
         file.sync_all().await?;
         drop(file);
+
+        if downloaded == 0 {
+            let _ = tokio::fs::remove_file(part_path).await;
+            let _ = tokio::fs::remove_file(sidecar_path).await;
+            return Err(DownloaderError::EmptyResponse);
+        }
+
+        let meta = tokio::fs::metadata(part_path).await?;
+        if meta.len() == 0 {
+            let _ = tokio::fs::remove_file(part_path).await;
+            let _ = tokio::fs::remove_file(sidecar_path).await;
+            return Err(DownloaderError::EmptyResponse);
+        }
+
+        // Final verification of GGUF magic before promoting .part to destination
+        if dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+        {
+            let mut check_file = tokio::fs::File::open(part_path).await?;
+            let mut magic = [0u8; 4];
+            let n = check_file.read(&mut magic).await?;
+            if n < 4 || &magic != b"GGUF" {
+                drop(check_file);
+                let _ = tokio::fs::remove_file(part_path).await;
+                let _ = tokio::fs::remove_file(sidecar_path).await;
+                return Err(DownloaderError::InvalidBinaryFormat(
+                    "downloaded file does not begin with GGUF magic ('GGUF')".to_string(),
+                ));
+            }
+        }
 
         let actual_hash = format!("{:x}", hasher.finalize());
         if let Some(expected_hash) = expected {
@@ -500,6 +570,57 @@ pub fn is_huggingface_url(url: &str) -> bool {
     false
 }
 
+/// Normalize download URLs:
+/// - Replaces Hugging Face browser `/blob/` URLs with `/resolve/`
+/// - Normalizes `hf.co` domain to `huggingface.co`
+/// - Ensures scheme `https://` is present for bare `hf.co` or `huggingface.co` domains
+pub fn normalize_download_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let url_with_scheme = if trimmed.starts_with("hf.co/") || trimmed.starts_with("huggingface.co/")
+    {
+        format!("https://{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+
+    if let Ok(mut parsed) = reqwest::Url::parse(&url_with_scheme) {
+        let is_hf = parsed
+            .host_str()
+            .map(|h| {
+                let h = h.to_ascii_lowercase();
+                h == "hf.co"
+                    || h.ends_with(".hf.co")
+                    || h == "huggingface.co"
+                    || h.ends_with(".huggingface.co")
+            })
+            .unwrap_or(false);
+
+        if is_hf {
+            let path = parsed.path().to_string();
+            let segments: Vec<&str> = path.split('/').collect();
+            // Expected HF blob path: /owner/repo/blob/revision/path...
+            if segments.len() >= 5 && segments[3] == "blob" {
+                let mut new_segments = segments.clone();
+                new_segments[3] = "resolve";
+                let new_path = new_segments.join("/");
+                parsed.set_path(&new_path);
+            }
+            if let Some(host) = parsed.host_str() {
+                if host == "hf.co" || host.ends_with(".hf.co") {
+                    let _ = parsed.set_host(Some("huggingface.co"));
+                }
+            }
+            return parsed.to_string();
+        }
+    }
+
+    url_with_scheme
+}
+
 fn is_retryable(err: &DownloaderError) -> bool {
     match err {
         DownloaderError::Reqwest(_) | DownloaderError::Stalled(_) | DownloaderError::Io(_) => true,
@@ -509,7 +630,9 @@ fn is_retryable(err: &DownloaderError) -> bool {
         DownloaderError::ChecksumMismatch { .. }
         | DownloaderError::InsufficientDisk { .. }
         | DownloaderError::RetriesExhausted
-        | DownloaderError::Cancelled => false,
+        | DownloaderError::Cancelled
+        | DownloaderError::InvalidBinaryFormat(_)
+        | DownloaderError::EmptyResponse => false,
     }
 }
 
@@ -662,5 +785,35 @@ mod tests {
     fn test_downloader_with_hf_token() {
         let dl = ModelDownloader::new().with_hf_token(Some("hf_test_123456789".into()));
         assert_eq!(dl.hf_token.as_deref(), Some("hf_test_123456789"));
+    }
+
+    #[test]
+    fn test_normalize_download_url() {
+        let blob_url = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+        let expected = "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf";
+        assert_eq!(normalize_download_url(blob_url), expected);
+
+        let hf_co_blob = "https://hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/model.gguf";
+        let hf_co_expected =
+            "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/model.gguf";
+        assert_eq!(normalize_download_url(hf_co_blob), hf_co_expected);
+
+        let bare_hf = "hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/model.gguf";
+        assert_eq!(normalize_download_url(bare_hf), hf_co_expected);
+
+        let resolve_url = "https://huggingface.co/repo/model/resolve/main/model.gguf";
+        assert_eq!(normalize_download_url(resolve_url), resolve_url);
+
+        let other_url = "https://example.com/models/model.gguf";
+        assert_eq!(normalize_download_url(other_url), other_url);
+    }
+
+    #[test]
+    fn test_empty_and_invalid_binary_errors_not_retryable() {
+        let err_empty = DownloaderError::EmptyResponse;
+        assert!(!is_retryable(&err_empty));
+
+        let err_bad_magic = DownloaderError::InvalidBinaryFormat("HTML detected".into());
+        assert!(!is_retryable(&err_bad_magic));
     }
 }

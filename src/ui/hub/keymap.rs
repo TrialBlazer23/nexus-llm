@@ -32,6 +32,8 @@ pub enum HubAction {
     ModelsTransfer,
     ModelsPush,
     ModelsToggleExplorer,
+    ModelsImport,
+    CleanCorruptedModels,
     ClusterRefresh,
     Help,
 }
@@ -234,6 +236,20 @@ pub fn models_bindings() -> &'static [KeyBinding] {
             modifiers: KeyModifiers::NONE,
             action: HubAction::ModelsToggleExplorer,
             label: "E HF Explorer",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Char('i'),
+            modifiers: KeyModifiers::NONE,
+            action: HubAction::ModelsImport,
+            label: "I Import local",
+            scope: KeyScope::Models,
+        },
+        KeyBinding {
+            code: KeyCode::Char('X'),
+            modifiers: KeyModifiers::SHIFT,
+            action: HubAction::CleanCorruptedModels,
+            label: "Shift+X Clean corrupt",
             scope: KeyScope::Models,
         },
     ]

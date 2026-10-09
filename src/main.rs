@@ -100,6 +100,29 @@ enum Commands {
         sha256: Option<String>,
     },
 
+    /// Import a local GGUF model file or scan download folders into models directory
+    Import {
+        /// Path to GGUF file or directory to import
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+
+        /// Automatically scan standard download folders for models
+        #[arg(short, long)]
+        scan: bool,
+
+        /// Copy file instead of symlinking
+        #[arg(long)]
+        copy: bool,
+
+        /// Move file instead of symlinking
+        #[arg(long)]
+        mv: bool,
+
+        /// Scan and remove 0-byte or corrupted .gguf files
+        #[arg(long)]
+        clean: bool,
+    },
+
     /// Pair with a remote node using its 6-digit control-plane pairing code
     Pair {
         /// Control-plane base URL (e.g. http://192.168.1.50:9998)
@@ -629,6 +652,157 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
 
             println!("\nDownload finished.");
+        }
+
+        Commands::Import {
+            path,
+            scan,
+            copy,
+            mv,
+            clean,
+        } => {
+            let config = NexusConfig::load().unwrap_or_default();
+            let models_dir = &config.node.models_dir;
+            println!("=== Nexus Model Importer ===");
+            println!("Target Models Directory: {:?}", models_dir);
+
+            if clean {
+                let corrupted = nexus::import::find_corrupted_models(models_dir);
+                if corrupted.is_empty() {
+                    println!("No corrupted or 0-byte models found in models directory.");
+                } else {
+                    println!("Found {} corrupted or non-GGUF file(s):", corrupted.len());
+                    for c in &corrupted {
+                        println!("  - {:?}", c);
+                    }
+                    let count = nexus::import::delete_corrupted_models(&corrupted, models_dir)?;
+                    println!("Cleaned up {} corrupted file(s).", count);
+                }
+                return Ok(());
+            }
+
+            let mode = if copy {
+                nexus::import::ImportMode::Copy
+            } else if mv {
+                nexus::import::ImportMode::Move
+            } else {
+                nexus::import::ImportMode::Symlink
+            };
+
+            if let Some(src) = path {
+                if src.is_dir() {
+                    println!("Scanning directory {:?}...", src);
+                    let candidates = nexus::import::scan_directory(&src, models_dir);
+                    if candidates.is_empty() {
+                        println!("No .gguf files found in {:?}", src);
+                    } else {
+                        println!("Found {} candidate(s):", candidates.len());
+                        for cand in candidates {
+                            if !cand.is_valid_gguf {
+                                println!(
+                                    "  [INVALID] {} ({} MB) - {}",
+                                    cand.filename,
+                                    cand.size_mb,
+                                    cand.validation_error.as_deref().unwrap_or("unknown error")
+                                );
+                                continue;
+                            }
+                            match nexus::import::import_file(&cand.source_path, models_dir, mode) {
+                                Ok(outcome) => {
+                                    println!(
+                                        "  [OK] Imported {} ({} MB via {}) -> {:?}",
+                                        outcome.filename,
+                                        outcome.size_bytes / (1024 * 1024),
+                                        outcome.mode_used,
+                                        outcome.target
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("  [ERROR] Failed to import {}: {}", cand.filename, e);
+                                }
+                            }
+                        }
+                    }
+                } else if src.is_file() {
+                    match nexus::import::import_file(&src, models_dir, mode) {
+                        Ok(outcome) => {
+                            println!(
+                                "Successfully imported {} ({} MB via {}) -> {:?}",
+                                outcome.filename,
+                                outcome.size_bytes / (1024 * 1024),
+                                outcome.mode_used,
+                                outcome.target
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error importing file: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("Source path {:?} not found.", src);
+                    std::process::exit(1);
+                }
+            } else if scan || path.is_none() {
+                println!("Scanning platform storage & download locations...");
+                let candidates = nexus::import::scan_all_candidate_locations(models_dir);
+                if candidates.is_empty() {
+                    println!("No new GGUF models found in standard download folders.");
+                    println!("Scanned locations:");
+                    for loc in nexus::import::candidate_scan_locations() {
+                        println!("  - {:?}", loc);
+                    }
+                } else {
+                    println!("\nDiscovered Candidates ({}):", candidates.len());
+                    for cand in &candidates {
+                        let status_badge = if !cand.is_valid_gguf {
+                            "[INVALID]".to_string()
+                        } else {
+                            cand.fit_status.badge_text().to_string()
+                        };
+                        let imported_tag = if cand.already_in_models_dir {
+                            " (already imported)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  {} {} ({} MB) - {:?}{}",
+                            status_badge,
+                            cand.filename,
+                            cand.size_mb,
+                            cand.source_path,
+                            imported_tag
+                        );
+                    }
+
+                    let valid_to_import: Vec<&nexus::import::ImportCandidate> = candidates
+                        .iter()
+                        .filter(|c| c.is_valid_gguf && !c.already_in_models_dir)
+                        .collect();
+
+                    if valid_to_import.is_empty() {
+                        println!("\nAll valid candidates are already imported.");
+                    } else {
+                        println!(
+                            "\nImporting {} valid candidate(s)...",
+                            valid_to_import.len()
+                        );
+                        for cand in valid_to_import {
+                            match nexus::import::import_file(&cand.source_path, models_dir, mode) {
+                                Ok(outcome) => {
+                                    println!(
+                                        "  [OK] Imported {} via {}",
+                                        outcome.filename, outcome.mode_used
+                                    );
+                                }
+                                Err(e) => {
+                                    println!("  [ERROR] {}: {}", cand.filename, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Commands::Config { file } => {

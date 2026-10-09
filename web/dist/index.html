@@ -1693,7 +1693,8 @@
           state.models = data.data || [];
           renderModelsTable();
           if (state.models.length > 0 && state.activeModel === 'None') {
-            state.activeModel = state.models[0].id;
+            const friendly = state.models.find(m => !/^[0-9a-f]{64}$/i.test(m.id));
+            state.activeModel = friendly ? friendly.id : state.models[0].id;
             document.getElementById('headerModelName').textContent = state.activeModel;
           }
         }

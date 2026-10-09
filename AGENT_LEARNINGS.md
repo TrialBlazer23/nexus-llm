@@ -25,6 +25,42 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-09 — Android CPU Mode Vulkan Device Isolation, SSE Error Surfacing, and Gateway Digest Resolution
+- Category: bug
+- Context: Model inference failed on both TUI and WebUI in Android Termux (Adreno 740 / Snapdragon 8 Gen 2). In TUI, `(generating...)` vanished immediately with no tokens or errors; in WebUI, `/v1/chat/completions` returned `404 no active holder for model '<digest>'`.
+- Finding:
+  1. **Vulkan Device Leakage on CPU Mode**: In `llama-server` 0.6.0+, `-ngl 0` only stores 0 layers in VRAM, but `--op-offload` remains enabled by default. On Android Termux with Qualcomm's proprietary driver, `ggml-vulkan` compute pipeline creation fails (`vk::Device::createComputePipeline: ErrorUnknown`). Even after Nexus's supervisor initiated CPU fallback, `llama-server` still called Vulkan for host tensor ops on prompt decode, returning a 500 SSE error.
+  2. **SSE Error Swallowing**: In `NexusClient::stream_chat`, SSE lines containing `{"error": ...}` failed `serde_json::from_str::<ChatCompletionChunk>`, were debug-logged, and yielded `None`. The TUI interpreted this as stream completion, clearing `(generating...)` without displaying the error banner.
+  3. **Gateway Digest Resolution**: `/v1/models` in `src/gateway.rs` included raw 64-char SHA256 digests in `ids: BTreeSet<String>`. Lexicographical sorting put hex hashes before letter names, causing the WebUI to set `state.activeModel` to the digest. When sent to `/v1/chat/completions`, `resolve_model_upstream` only tested filename/stem equality, failing to resolve the digest to the active local model holder.
+- Action:
+  1. Updated `LlamaServerConfig::build_args` and `ProcessSupervisor::try_spawn` in `src/supervisor.rs` to set `LLAMA_ARG_DEVICE=none`, `GGML_VK_VISIBLE_DEVICES=""`, and `--device none` when `gpu_layers == 0`, ensuring 100% pure CPU execution with DotProd acceleration.
+  2. Updated `NexusClient::stream_chat` in `src/client.rs` to parse `SseErrorChunk` when choice parsing fails and yield `Some(Err(ClientError::ApiError))`.
+  3. Updated `src/gateway.rs` to resolve digests to catalog models in `resolve_model_upstream`, prioritized active models in `handle_models`, and updated `web/dist/index.html` to avoid raw hashes as default active model.
+- Verification: Tested live `llama-server` inference with `LLAMA_ARG_DEVICE=none`, confirming instant token generation at ~27 tok/s; added `gateway_resolves_model_by_sha256_digest` in `tests/test_gateway.rs` and `fake_llama_sse_error_chunk_surfaced` in `tests/test_fake_llama_client.rs`; verified all test suites pass with `cargo test --locked`.
+
+## 2026-10-08 — GGUF Header Specification: No 32-Byte Alignment Preceding Tensor Info
+- Category: bug
+- Context: Downloaded models were completely finishing, but immediately flagged with `[!] 1 corrupted / non-GGUF file(s) found — press [Shift+X] to clean` by `find_corrupted_models`.
+- Finding:
+  1. **GGUF Binary Layout**: According to the official GGML/GGUF specification:
+     `header -> metadata_kv[] -> tensor_infos[] -> padding (alignment) -> tensor_data[]`.
+     Alignment padding (typically 32 bytes, configured by `general.alignment`) is applied ONLY before `tensor_data` (the binary weight buffers), NOT between the metadata KV dictionary and `tensor_infos`.
+  2. **False Corruption Trigger**: An erroneous 32-byte alignment seek `(pos + 31) & !31` was placed between the metadata KV loop and the tensor info loop in `GgufMetadata::read()`. For any real-world GGUF file whose metadata KV section was not a multiple of 32 bytes, this seek jumped into the middle of the first tensor's string header, causing `read_string_bounded` to fail with `InvalidUtf8`. This caused `GgufMetadata::open(&path)` to fail on 100% valid, completed downloads, mistakenly classifying them as corrupted.
+- Action: Removed the bogus pre-tensor alignment seek in `src/gguf.rs`, added explicit failure reason logging in `src/import.rs` (`find_corrupted_models`), and added `test_unaligned_kv_metadata_with_tensors` unit test.
+- Verification: Tested with official 2GB `Llama-3.2-3B-Instruct-Q4_K_M.gguf` header, confirming all 255 tensors and metadata keys parsed cleanly with `test_unaligned_kv_metadata_with_tensors` and all 160+ unit and integration tests passing.
+
+## 2026-10-08 — Downloader Hardening, Zero-Byte Rejection, Curated Starters, & Local Storage Importer
+- Category: bug | design-decision
+- Context: Operators experienced 0-byte `.gguf` files when attempting to download models (due to Hugging Face `/blob/` HTML pages being saved or aborted streams being promoted), and lacked a way to import local GGUF models already stored on Android `/sdcard/Download` or host download folders.
+- Finding:
+  1. **Hugging Face /blob/ vs /resolve/ streams**: When operators paste Hugging Face URLs copied from a browser, the path typically contains `/blob/main/<file>.gguf`, which returns an HTML preview webpage instead of binary model weights. Normalizing `/blob/` to `/resolve/` and converting shortlinks (`hf.co/...` to `huggingface.co/...`) ensures the stream requests raw binary weights.
+  2. **First-chunk GGUF magic byte verification**: Checking `first_chunk.starts_with(b"GGUF")` and rejecting `<!DOCTYPE` or `<html` before writing payload data immediately aborts HTML responses before creating invalid files or wasting bandwidth. Non-binary or empty responses must return non-retryable errors (`DownloaderError::InvalidBinaryFormat`, `EmptyResponse`).
+  3. **Zero-byte promotion guard**: Verifying `downloaded > 0` and running `GgufMetadata::open()` prior to renaming `.part` files to destination `.gguf` guarantees no 0-byte or truncated files are ever promoted into the active model catalog.
+  4. **Cross-filesystem Symlink Fallback**: Symlinking models from Android shared storage (`/sdcard/Download`) into Termux private storage (`~/.nexus/models`) may fail due to Android FUSE/sdcardfs boundary restrictions. Catching `std::io::ErrorKind::Unsupported` or `CrossesDevices` and automatically falling back to file copying allows transparent imports across all storage layouts.
+  5. **Curated Starters & Cleanup Workflow**: Providing 1-click starter models (Qwen 2.5 Coder 1.5B, Llama 3.2 1B/3B, Gemma 2 2B, SmolLM2 1.7B) eliminates typing errors for beginners, while `find_corrupted_models()` / `delete_corrupted_models()` cleans up previous 0-byte/HTML files with `nexus import --clean` or TUI `[Shift+X]`.
+- Action: Updated `src/downloader.rs`, `src/hf.rs`, implemented `src/import.rs`, added `nexus import` CLI in `src/main.rs`, added Curated Starters and Local Importer modals to TUI in `src/ui/hub/mod.rs` and `src/ui/models_view.rs`.
+- Verification: `cargo test --lib`, `cargo test`, verified instant HTML rejection on `https://huggingface.co/`, verified `nexus import --clean` deleted corrupt test files, verified all 160+ unit and integration tests passed.
+
 ## 2026-10-08 — Web UI Superpowers (Track A) & Prompt Cache Slot Persistence (Track B)
 - Category: design-decision | bug
 - Context: Implementing Track A (Hugging Face Search & 1-Click Download, GGUF Header Inspection, Runtime Settings Editor) and Track B (Prompt Cache KV slot persistence `--slot-save-path` and disk quota eviction) with configurable options for inference and battery safety.

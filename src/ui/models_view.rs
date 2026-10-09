@@ -55,6 +55,7 @@ pub struct ModelsView {
     pub hf_search_query: String,
     pub hf_is_searching: bool,
     pub hf_loading: bool,
+    pub corrupted_models: Vec<PathBuf>,
 }
 
 impl ModelsView {
@@ -74,6 +75,7 @@ impl ModelsView {
             hf_search_query: String::new(),
             hf_is_searching: false,
             hf_loading: false,
+            corrupted_models: Vec::new(),
         };
         view.refresh();
         view
@@ -86,6 +88,7 @@ impl ModelsView {
     pub fn refresh(&mut self) {
         self.models = scan_models_dir(&self.models_dir);
         self.rebuild_catalog_local_only();
+        self.corrupted_models = crate::import::find_corrupted_models(&self.models_dir);
         self.refresh_profile();
         if self.selected_index >= self.catalog.len() && !self.catalog.is_empty() {
             self.selected_index = self.catalog.len() - 1;
@@ -295,12 +298,9 @@ impl ModelsView {
     }
 
     fn render_model_list(&self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = if self.catalog.is_empty() {
+        let mut items: Vec<ListItem> = if self.catalog.is_empty() {
             vec![ListItem::new(Line::from(vec![Span::styled(
-                format!(
-                    " No models — press [D] to download or use nexus download ({:?})",
-                    self.models_dir
-                ),
+                " No models — press [D] Download, [I] Import local, or [E] HF Explorer",
                 Style::default().fg(Color::DarkGray),
             )]))]
         } else {
@@ -353,6 +353,18 @@ impl ModelsView {
                 })
                 .collect()
         };
+
+        if !self.corrupted_models.is_empty() {
+            items.push(ListItem::new(Line::from(vec![Span::styled(
+                format!(
+                    " [!] {} corrupted / non-GGUF file(s) found — press [Shift+X] to clean",
+                    self.corrupted_models.len()
+                ),
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            )])));
+        }
 
         let list_title = format!(
             " [• Local Catalog]  [E: HF Explorer] | Mesh Models ({}) | Path: {:?} ",
@@ -510,7 +522,7 @@ impl ModelsView {
             let status_text = if let Some(msg) = &self.status_message {
                 msg.clone()
             } else {
-                " [Enter] Load  [E] HF Explorer  [D] Download  [X] Delete  [T] Pull  [S] Push  [+/-] Ctx  [R] Rescan "
+                " [Enter] Load  [E] HF Explorer  [D] Download  [I] Import  [X] Delete  [T] Pull  [S] Push  [+/-] Ctx  [R] Rescan "
                     .to_string()
             };
 

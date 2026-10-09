@@ -56,3 +56,69 @@ async fn fake_llama_canned_sse_stream() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn fake_llama_sse_error_chunk_surfaced() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use nexus::client::ClientError;
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server_handle = tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let io = TokioIo::new(stream);
+            let _ = http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(|_req| async {
+                        let sse = "data: {\"error\":{\"code\":500,\"message\":\"decode() failed: vk::Device::createComputePipeline: ErrorUnknown\",\"type\":\"server_error\"}}\n\n";
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .header("cache-control", "no-cache")
+                            .body(Full::new(Bytes::from(sse)))
+                            .unwrap();
+                        Ok::<_, Infallible>(resp)
+                    }),
+                )
+                .await;
+        }
+    });
+
+    let client = NexusClient::new(format!("http://{}", addr));
+    let mut stream = client
+        .stream_chat(ChatCompletionRequest {
+            model: "stub-7b".into(),
+            messages: vec![ChatMessage::user("hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(4),
+            stream: true,
+        })
+        .await
+        .expect("stream_chat");
+
+    let first = stream.next().await;
+    assert!(first.is_some(), "expected error item in stream");
+    match first.unwrap() {
+        Err(ClientError::ApiError { message, .. }) => {
+            assert!(
+                message.contains("decode() failed"),
+                "expected decode error in message: {message}"
+            );
+        }
+        other => panic!("expected ApiError, got {other:?}"),
+    }
+
+    server_handle.abort();
+}

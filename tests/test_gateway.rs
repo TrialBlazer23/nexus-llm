@@ -596,3 +596,46 @@ async fn gateway_serves_web_ui_and_api() {
 
     gw_handle.abort();
 }
+
+#[tokio::test]
+async fn gateway_resolves_model_by_sha256_digest() {
+    let cfg = gateway_test_config();
+    let models_dir = TempDir::new().expect("tmpdir");
+    let dummy_path = models_dir.path().join("dummy-llm.gguf");
+
+    let mut dummy_buf = Vec::new();
+    dummy_buf.extend_from_slice(&nexus::gguf::GGUF_MAGIC.to_le_bytes());
+    dummy_buf.extend_from_slice(&3u32.to_le_bytes());
+    dummy_buf.extend_from_slice(&0u64.to_le_bytes());
+    dummy_buf.extend_from_slice(&1u64.to_le_bytes());
+    let key = "general.architecture";
+    dummy_buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+    dummy_buf.extend_from_slice(key.as_bytes());
+    dummy_buf.extend_from_slice(&8u32.to_le_bytes());
+    let val = "llama";
+    dummy_buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+    dummy_buf.extend_from_slice(val.as_bytes());
+    std::fs::write(&dummy_path, &dummy_buf).expect("write dummy gguf");
+
+    let index = nexus::store::ModelIndex::reconcile_default(models_dir.path()).expect("index");
+    assert!(!index.models.is_empty(), "expected indexed model");
+    let digest = index.models[0].digest.clone();
+    assert!(!digest.is_empty(), "expected non-empty digest");
+
+    let discovery = Arc::new(DiscoveryService::new(cfg.clone(), None));
+    discovery.set_active_model("dummy-llm.gguf").await;
+    discovery.set_status_flags(StatusFlags::READY).await;
+
+    let ctx = GatewayContext::new(
+        SupervisorManager::new(),
+        cfg.network.api_port,
+        models_dir.path().to_path_buf(),
+        discovery.node_uuid(),
+        Arc::new(std::sync::RwLock::new(cfg)),
+    )
+    .with_discovery(discovery);
+
+    let resolved = resolve_model_upstream(&ctx, &digest).await;
+    assert!(resolved.is_some(), "expected digest {digest} to resolve");
+    assert_eq!(resolved.unwrap().model_id, "dummy-llm.gguf");
+}

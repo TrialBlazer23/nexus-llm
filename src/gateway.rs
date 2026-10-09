@@ -23,7 +23,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -170,9 +170,38 @@ fn is_default_model(model: &str) -> bool {
 
 /// Resolve `model` → OpenAI base URL using local supervisor / discovery peers.
 pub async fn resolve_model_upstream(ctx: &GatewayContext, model: &str) -> Option<ResolvedUpstream> {
+    let catalog = build_model_catalog(ctx.node_id, &ctx.models_dir);
+    let resolved_names: Vec<String> = catalog
+        .models
+        .iter()
+        .filter(|m| m.digest.eq_ignore_ascii_case(model) || model_matches(model, &m.filename))
+        .flat_map(|m| {
+            let mut names = vec![m.filename.clone()];
+            if let Some(stem) = std::path::Path::new(&m.filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                names.push(stem.to_string());
+            }
+            names
+        })
+        .collect();
+
+    let matches_candidate = |candidate: &str| -> bool {
+        if is_default_model(model) || model_matches(model, candidate) {
+            return true;
+        }
+        for name in &resolved_names {
+            if model_matches(name, candidate) {
+                return true;
+            }
+        }
+        false
+    };
+
     let local_model = local_active_model(ctx).await;
     if let Some(ref local) = local_model {
-        if is_default_model(model) || model_matches(model, local) {
+        if matches_candidate(local) {
             return Some(ResolvedUpstream {
                 base_url: ctx.local_upstream(),
                 model_id: local.clone(),
@@ -194,7 +223,7 @@ pub async fn resolve_model_upstream(ctx: &GatewayContext, model: &str) -> Option
             .collect();
 
         if !is_default_model(model) {
-            candidates.retain(|p| model_matches(model, &p.active_model));
+            candidates.retain(|p| matches_candidate(&p.active_model));
         }
 
         candidates.sort_by_key(|p| {
@@ -1242,32 +1271,37 @@ async fn proxy_upstream(base_url: &str, path: &str, body: Bytes) -> Response<Res
 }
 
 async fn handle_models(ctx: Arc<GatewayContext>) -> Response<RespBody> {
-    let mut ids: BTreeSet<String> = BTreeSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut add_id = |id: String| {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            ids.push(trimmed.to_string());
+        }
+    };
 
     if let Some(local) = local_active_model(&ctx).await {
-        ids.insert(local);
-    }
-
-    let catalog = build_model_catalog(ctx.node_id, &ctx.models_dir);
-    for entry in catalog.models {
-        if !entry.filename.is_empty() {
-            ids.insert(entry.filename.clone());
-            if let Some(stem) = std::path::Path::new(&entry.filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-            {
-                ids.insert(stem.to_string());
-            }
-        }
-        if !entry.digest.is_empty() {
-            ids.insert(entry.digest);
-        }
+        add_id(local);
     }
 
     if let Some(discovery) = &ctx.discovery {
         for peer in discovery.get_active_peers().await {
             if !peer.active_model.is_empty() {
-                ids.insert(peer.active_model);
+                add_id(peer.active_model);
+            }
+        }
+    }
+
+    let catalog = build_model_catalog(ctx.node_id, &ctx.models_dir);
+    for entry in catalog.models {
+        if !entry.filename.is_empty() {
+            add_id(entry.filename.clone());
+            if let Some(stem) = std::path::Path::new(&entry.filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                add_id(stem.to_string());
             }
         }
     }

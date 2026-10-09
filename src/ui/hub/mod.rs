@@ -78,6 +78,7 @@ pub enum PaletteAction {
     RefreshCluster,
     RefreshModels,
     DownloadModel,
+    ImportModel,
     ToggleLogTail,
     CycleLogFilter,
     ClearLogs,
@@ -216,6 +217,28 @@ pub struct HfAuthRecoveryState {
     pub input_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadModalMode {
+    Starters,
+    CustomUrl,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadModalState {
+    pub custom_url: String,
+    pub starters: Vec<crate::hf::CuratedModel>,
+    pub selected_starter_idx: usize,
+    pub mode: DownloadModalMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportModalState {
+    pub candidates: Vec<crate::import::ImportCandidate>,
+    pub selected_idx: usize,
+    pub custom_path: String,
+    pub in_custom_path_mode: bool,
+}
+
 pub struct HubApp {
     pub config: NexusConfig,
     pub discovery: Arc<DiscoveryService>,
@@ -242,8 +265,10 @@ pub struct HubApp {
     pub show_command_palette: bool,
     pub palette_input: String,
     pub palette_selected_idx: usize,
-    /// URL input modal for Models [D].
-    pub pending_download_url: Option<String>,
+    /// Enhanced model download modal state.
+    pub pending_download_modal: Option<DownloadModalState>,
+    /// Local model import modal state.
+    pub pending_import_modal: Option<ImportModalState>,
     /// Peer picker for [S] push (list of (label, endpoint)).
     pub pending_push_peers: Option<Vec<(String, String)>>,
     pub push_peer_idx: usize,
@@ -329,7 +354,8 @@ impl HubApp {
             show_command_palette: false,
             palette_input: String::new(),
             palette_selected_idx: 0,
-            pending_download_url: None,
+            pending_download_modal: None,
+            pending_import_modal: None,
             pending_push_peers: None,
             push_peer_idx: 0,
             download_progress: None,
@@ -766,24 +792,301 @@ impl HubApp {
             frame.render_widget(p, modal);
         }
 
-        if let Some(url) = &self.pending_download_url {
-            let modal = centered_rect(72, 20, area);
+        if let Some(modal_state) = &self.pending_download_modal {
+            let modal = centered_rect(82, 60, area);
             frame.render_widget(Clear, modal);
-            let p = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    " Enter GGUF URL or Hugging Face repo (e.g. bartowski/Llama-3.2-3B-Instruct-GGUF) ",
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(4),
+                    Constraint::Length(3),
+                ])
+                .margin(1)
+                .split(modal);
+
+            let header_block = Block::default()
+                .title(" Download Model / Hugging Face Resolve ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            frame.render_widget(header_block, modal);
+
+            let tab_starters = if modal_state.mode == DownloadModalMode::Starters {
+                Span::styled(
+                    " [1] Curated Starters (1-Click) ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    " [1] Curated Starters ",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let tab_custom = if modal_state.mode == DownloadModalMode::CustomUrl {
+                Span::styled(
+                    " [2] Custom URL / HF Repo ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    " [2] Custom URL / HF Repo ",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let tabs_line = Line::from(vec![
+                Span::raw(" Mode: "),
+                tab_starters,
+                Span::raw(" | "),
+                tab_custom,
+                Span::styled(
+                    "   (Press [Tab] to switch)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(tabs_line), chunks[0]);
+
+            match modal_state.mode {
+                DownloadModalMode::Starters => {
+                    let items: Vec<ListItem> = modal_state
+                        .starters
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            let is_sel = i == modal_state.selected_starter_idx;
+                            let cursor = if is_sel { "> " } else { "  " };
+                            let name_style = if is_sel {
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+                            let size_gb = format!("{:.1} GB", s.approx_size_mb as f64 / 1024.0);
+                            let line1 = Line::from(vec![
+                                Span::styled(cursor, Style::default().fg(Color::Yellow)),
+                                Span::styled(s.name, name_style),
+                                Span::styled(
+                                    format!(" [{}] ", s.quant_label),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                                Span::styled(
+                                    format!("({})", size_gb),
+                                    Style::default().fg(Color::Green),
+                                ),
+                            ]);
+                            let line2 = Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(s.description, Style::default().fg(Color::DarkGray)),
+                            ]);
+                            ListItem::new(vec![line1, line2])
+                        })
+                        .collect();
+                    let list = List::new(items).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(list, chunks[1]);
+
+                    let footer = Paragraph::new(Line::from(vec![
+                        Span::styled(" [↑/↓] Navigate   [Enter] Download Starter   [Tab] Custom URL   [Esc] Cancel ", Style::default().fg(Color::Yellow)),
+                    ])).alignment(Alignment::Center);
+                    frame.render_widget(footer, chunks[2]);
+                }
+                DownloadModalMode::CustomUrl => {
+                    let input_p = Paragraph::new(vec![
+                        Line::from(Span::styled(" Enter Hugging Face repo ID or direct GGUF URL:", Style::default().fg(Color::LightBlue))),
+                        Line::from(Span::styled("   e.g. bartowski/Llama-3.2-3B-Instruct-GGUF or https://hf.co/...", Style::default().fg(Color::DarkGray))),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::styled(&modal_state.custom_url, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            Span::styled("_", Style::default().fg(Color::Cyan)),
+                        ]),
+                        Line::from(""),
+                        Line::from(Span::styled(" • Hugging Face /blob/ URLs are automatically rewritten to direct /resolve/ streams.", Style::default().fg(Color::DarkGray))),
+                        Line::from(Span::styled(" • HTML pages or non-GGUF payloads are rejected immediately to prevent 0-byte models.", Style::default().fg(Color::DarkGray))),
+                    ]);
+                    frame.render_widget(input_p, chunks[1]);
+
+                    let footer = Paragraph::new(Line::from(vec![Span::styled(
+                        " [Enter] Download / Resolve   [Tab] Curated Starters   [Esc] Cancel ",
+                        Style::default().fg(Color::Yellow),
+                    )]))
+                    .alignment(Alignment::Center);
+                    frame.render_widget(footer, chunks[2]);
+                }
+            }
+        }
+
+        if let Some(modal_state) = &self.pending_import_modal {
+            let modal = centered_rect(84, 65, area);
+            frame.render_widget(Clear, modal);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(4),
+                    Constraint::Length(3),
+                ])
+                .margin(1)
+                .split(modal);
+
+            let header_block = Block::default()
+                .title(" Import Local Model from Storage ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green));
+            frame.render_widget(header_block, modal);
+
+            let tab_discovered = if !modal_state.in_custom_path_mode {
+                Span::styled(
+                    " [1] Discovered Files ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    " [1] Discovered Files ",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let tab_custom = if modal_state.in_custom_path_mode {
+                Span::styled(
+                    " [2] Custom Path Input ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    " [2] Custom Path Input ",
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let tabs_line = Line::from(vec![
+                Span::raw(" View: "),
+                tab_discovered,
+                Span::raw(" | "),
+                tab_custom,
+                Span::styled(
+                    "   (Press [Tab] to switch)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(tabs_line), chunks[0]);
+
+            if !modal_state.in_custom_path_mode {
+                if modal_state.candidates.is_empty() {
+                    let empty_msg = Paragraph::new(vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " No .gguf models found in standard download locations.",
+                            Style::default().fg(Color::Yellow),
+                        )),
+                        Line::from(Span::styled(
+                            " Scanned: /sdcard/Download, ~/Downloads, ~/storage/downloads",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            " Press [Tab] to type a custom file or directory path.",
+                            Style::default().fg(Color::Cyan),
+                        )),
+                    ])
+                    .alignment(Alignment::Center);
+                    frame.render_widget(empty_msg, chunks[1]);
+                } else {
+                    let items: Vec<ListItem> = modal_state
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let is_sel = i == modal_state.selected_idx;
+                            let cursor = if is_sel { "> " } else { "  " };
+                            let (badge_text, badge_color) = if !c.is_valid_gguf {
+                                ("[CORRUPT]", Color::Red)
+                            } else {
+                                match c.fit_status {
+                                    crate::hf::FitStatus::Fits => ("[OK]", Color::Green),
+                                    crate::hf::FitStatus::OffloadRequired => {
+                                        ("[RPC]", Color::Yellow)
+                                    }
+                                    crate::hf::FitStatus::Exceeds => ("[EXCEEDS]", Color::Red),
+                                }
+                            };
+                            let size_str = format!("{:.1} GB", c.size_mb as f64 / 1024.0);
+                            let exist_str = if c.already_in_models_dir {
+                                " (already in models)"
+                            } else {
+                                ""
+                            };
+                            let arch_str = c.architecture.as_deref().unwrap_or("unknown");
+                            let name_style = if is_sel {
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            };
+
+                            let line1 = Line::from(vec![
+                                Span::styled(cursor, Style::default().fg(Color::Yellow)),
+                                Span::styled(
+                                    badge_text,
+                                    Style::default()
+                                        .fg(badge_color)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(format!(" {} ", c.filename), name_style),
+                                Span::styled(
+                                    format!("({} | {})", size_str, arch_str),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(exist_str, Style::default().fg(Color::DarkGray)),
+                            ]);
+                            let line2 = Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(
+                                    c.source_path.to_string_lossy().to_string(),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]);
+                            ListItem::new(vec![line1, line2])
+                        })
+                        .collect();
+                    let list = List::new(items).block(Block::default().borders(Borders::NONE));
+                    frame.render_widget(list, chunks[1]);
+                }
+
+                let footer = Paragraph::new(Line::from(vec![Span::styled(
+                    " [↑/↓] Select   [Enter] Import Selected   [Tab] Custom Path   [Esc] Cancel ",
                     Style::default().fg(Color::Yellow),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(url.clone(), Style::default().fg(Color::White))),
-            ])
-            .block(
-                Block::default()
-                    .title(" Download / HF Resolve ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            );
-            frame.render_widget(p, modal);
+                )]))
+                .alignment(Alignment::Center);
+                frame.render_widget(footer, chunks[2]);
+            } else {
+                let input_p = Paragraph::new(vec![
+                    Line::from(Span::styled(" Enter absolute path to a .gguf file or directory to scan:", Style::default().fg(Color::LightBlue))),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" > ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(&modal_state.custom_path, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled("_", Style::default().fg(Color::Cyan)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(" • If pointing to a .gguf file, it will be imported directly (symlinked with copy fallback).", Style::default().fg(Color::DarkGray))),
+                    Line::from(Span::styled(" • If pointing to a directory, it will be scanned for GGUF candidates.", Style::default().fg(Color::DarkGray))),
+                ]);
+                frame.render_widget(input_p, chunks[1]);
+
+                let footer = Paragraph::new(Line::from(vec![Span::styled(
+                    " [Enter] Import / Scan   [Tab] Discovered Files   [Esc] Cancel ",
+                    Style::default().fg(Color::Yellow),
+                )]))
+                .alignment(Alignment::Center);
+                frame.render_widget(footer, chunks[2]);
+            }
         }
 
         if let Some(picker) = &self.pending_hf_quant_picker {
@@ -1294,6 +1597,12 @@ impl HubApp {
             action: PaletteAction::DownloadModel,
         });
         items.push(PaletteItem {
+            label: "Import Local Model".into(),
+            description: "Scan download folders or import custom GGUF model [i]".into(),
+            category: "Action",
+            action: PaletteAction::ImportModel,
+        });
+        items.push(PaletteItem {
             label: "Refresh Cluster Peers".into(),
             description: "Broadcast discovery probe and refresh peer list [r]".into(),
             category: "Action",
@@ -1438,7 +1747,23 @@ impl HubApp {
             }
             PaletteAction::DownloadModel => {
                 self.set_tab(HubTab::Models);
-                self.pending_download_url = Some(String::new());
+                self.pending_download_modal = Some(DownloadModalState {
+                    custom_url: String::new(),
+                    starters: crate::hf::curated_starter_models(),
+                    selected_starter_idx: 0,
+                    mode: DownloadModalMode::Starters,
+                });
+            }
+            PaletteAction::ImportModel => {
+                self.set_tab(HubTab::Models);
+                let candidates =
+                    crate::import::scan_all_candidate_locations(&self.models_view.models_dir);
+                self.pending_import_modal = Some(ImportModalState {
+                    candidates,
+                    selected_idx: 0,
+                    custom_path: String::new(),
+                    in_custom_path_mode: false,
+                });
             }
             PaletteAction::ToggleLogTail => {
                 self.set_tab(HubTab::Logs);
@@ -1817,8 +2142,14 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
             Some(event_res) = event_stream.next() => {
                 if let Ok(Event::Paste(text)) = &event_res {
-                    if let Some(buf) = &mut hub.pending_download_url {
-                        buf.push_str(text.trim());
+                    if let Some(modal) = &mut hub.pending_download_modal {
+                        modal.custom_url.push_str(text.trim());
+                        modal.mode = DownloadModalMode::CustomUrl;
+                        continue;
+                    }
+                    if let Some(modal) = &mut hub.pending_import_modal {
+                        modal.custom_path.push_str(text.trim());
+                        modal.in_custom_path_mode = true;
                         continue;
                     }
                 }
@@ -1901,37 +2232,172 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                         continue;
                     }
 
-                    // Download URL modal
-                    if hub.pending_download_url.is_some() {
+                    // Download modal (Curated starters / Custom URL)
+                    if let Some(modal) = &mut hub.pending_download_modal {
                         match key.code {
                             KeyCode::Esc => {
-                                hub.pending_download_url = None;
+                                hub.pending_download_modal = None;
+                            }
+                            KeyCode::Tab => {
+                                modal.mode = match modal.mode {
+                                    DownloadModalMode::Starters => DownloadModalMode::CustomUrl,
+                                    DownloadModalMode::CustomUrl => DownloadModalMode::Starters,
+                                };
+                            }
+                            KeyCode::Up | KeyCode::Char('k') if modal.mode == DownloadModalMode::Starters => {
+                                if modal.selected_starter_idx > 0 {
+                                    modal.selected_starter_idx -= 1;
+                                } else if !modal.starters.is_empty() {
+                                    modal.selected_starter_idx = modal.starters.len() - 1;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') if modal.mode == DownloadModalMode::Starters => {
+                                if !modal.starters.is_empty() {
+                                    modal.selected_starter_idx =
+                                        (modal.selected_starter_idx + 1) % modal.starters.len();
+                                }
                             }
                             KeyCode::Enter => {
-                                if let Some(url) = hub.pending_download_url.take() {
-                                    let url = url.trim().to_string();
-                                    if !url.is_empty() {
-                                        if let Some(repo_id) = crate::hf::HfClient::parse_repo_id(&url) {
+                                match modal.mode {
+                                    DownloadModalMode::Starters => {
+                                        if let Some(starter) = modal.starters.get(modal.selected_starter_idx) {
+                                            let url = starter.download_url.to_string();
                                             hub.status_message = Some((
-                                                format!("Resolving Hugging Face repo '{repo_id}'..."),
-                                                Color::Yellow,
+                                                format!("Starting download: {}...", starter.name),
+                                                Color::Cyan,
                                             ));
-                                            let _ = cmd_tx.try_send(HubCommand::ResolveHfRepo { repo_id });
-                                        } else {
                                             let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                            hub.pending_download_modal = None;
+                                        }
+                                    }
+                                    DownloadModalMode::CustomUrl => {
+                                        let url = modal.custom_url.trim().to_string();
+                                        if !url.is_empty() {
+                                            if let Some(repo_id) = crate::hf::HfClient::parse_repo_id(&url) {
+                                                hub.status_message = Some((
+                                                    format!("Resolving Hugging Face repo '{repo_id}'..."),
+                                                    Color::Yellow,
+                                                ));
+                                                let _ = cmd_tx.try_send(HubCommand::ResolveHfRepo { repo_id });
+                                            } else {
+                                                let _ = cmd_tx.try_send(HubCommand::StartDownload { url });
+                                            }
+                                            hub.pending_download_modal = None;
                                         }
                                     }
                                 }
                             }
-                            KeyCode::Backspace => {
-                                if let Some(buf) = &mut hub.pending_download_url {
-                                    buf.pop();
+                            KeyCode::Backspace if modal.mode == DownloadModalMode::CustomUrl => {
+                                modal.custom_url.pop();
+                            }
+                            KeyCode::Char(c) if modal.mode == DownloadModalMode::CustomUrl => {
+                                modal.custom_url.push(c);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Local model import modal
+                    if let Some(modal) = &mut hub.pending_import_modal {
+                        match key.code {
+                            KeyCode::Esc => {
+                                hub.pending_import_modal = None;
+                            }
+                            KeyCode::Tab => {
+                                modal.in_custom_path_mode = !modal.in_custom_path_mode;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') if !modal.in_custom_path_mode => {
+                                if modal.selected_idx > 0 {
+                                    modal.selected_idx -= 1;
+                                } else if !modal.candidates.is_empty() {
+                                    modal.selected_idx = modal.candidates.len() - 1;
                                 }
                             }
-                            KeyCode::Char(c) => {
-                                if let Some(buf) = &mut hub.pending_download_url {
-                                    buf.push(c);
+                            KeyCode::Down | KeyCode::Char('j') if !modal.in_custom_path_mode => {
+                                if !modal.candidates.is_empty() {
+                                    modal.selected_idx =
+                                        (modal.selected_idx + 1) % modal.candidates.len();
                                 }
+                            }
+                            KeyCode::Enter => {
+                                if modal.in_custom_path_mode {
+                                    let input_str = modal.custom_path.trim().to_string();
+                                    if !input_str.is_empty() {
+                                        let path = PathBuf::from(&input_str);
+                                        if path.is_dir() {
+                                            let candidates = crate::import::scan_directory(&path, &hub.config.node.models_dir);
+                                            if candidates.is_empty() {
+                                                hub.status_message = Some((
+                                                    format!("No .gguf models found in '{}'", path.display()),
+                                                    Color::Yellow,
+                                                ));
+                                            } else {
+                                                let count = candidates.len();
+                                                modal.candidates = candidates;
+                                                modal.selected_idx = 0;
+                                                modal.in_custom_path_mode = false;
+                                                hub.status_message = Some((
+                                                    format!("Found {count} model(s) in '{}'", path.display()),
+                                                    Color::Green,
+                                                ));
+                                            }
+                                        } else if path.is_file() {
+                                            match crate::import::import_file(&path, &hub.config.node.models_dir, crate::import::ImportMode::Symlink) {
+                                                Ok(outcome) => {
+                                                    hub.status_message = Some((
+                                                        format!("Imported '{}' ({})", outcome.filename, outcome.mode_used),
+                                                        Color::Green,
+                                                    ));
+                                                    hub.models_view.refresh();
+                                                    hub.pending_import_modal = None;
+                                                }
+                                                Err(e) => {
+                                                    hub.status_message = Some((
+                                                        format!("Failed to import: {e}"),
+                                                        Color::Red,
+                                                    ));
+                                                }
+                                            }
+                                        } else {
+                                            hub.status_message = Some((
+                                                format!("Path does not exist: '{}'", path.display()),
+                                                Color::Red,
+                                            ));
+                                        }
+                                    }
+                                } else if let Some(cand) = modal.candidates.get(modal.selected_idx) {
+                                    if !cand.is_valid_gguf {
+                                        hub.status_message = Some((
+                                            format!("Cannot import corrupt model: {}", cand.validation_error.as_deref().unwrap_or("invalid")),
+                                            Color::Red,
+                                        ));
+                                    } else {
+                                        let src = cand.source_path.clone();
+                                        match crate::import::import_file(&src, &hub.config.node.models_dir, crate::import::ImportMode::Symlink) {
+                                            Ok(outcome) => {
+                                                hub.status_message = Some((
+                                                    format!("Imported '{}' ({})", outcome.filename, outcome.mode_used),
+                                                    Color::Green,
+                                                ));
+                                                hub.models_view.refresh();
+                                                hub.pending_import_modal = None;
+                                            }
+                                            Err(e) => {
+                                                hub.status_message = Some((
+                                                    format!("Failed to import: {e}"),
+                                                    Color::Red,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace if modal.in_custom_path_mode => {
+                                modal.custom_path.pop();
+                            }
+                            KeyCode::Char(c) if modal.in_custom_path_mode => {
+                                modal.custom_path.push(c);
                             }
                             _ => {}
                         }
@@ -2410,7 +2876,49 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             HubAction::ModelsContextInc => hub.models_view.adjust_context(1),
                             HubAction::ModelsContextDec => hub.models_view.adjust_context(-1),
                             HubAction::ModelsDownload => {
-                                hub.pending_download_url = Some(String::new());
+                                hub.pending_download_modal = Some(DownloadModalState {
+                                    custom_url: String::new(),
+                                    starters: crate::hf::curated_starter_models(),
+                                    selected_starter_idx: 0,
+                                    mode: DownloadModalMode::Starters,
+                                });
+                            }
+                            HubAction::ModelsImport => {
+                                let candidates = crate::import::scan_all_candidate_locations(&hub.models_view.models_dir);
+                                hub.pending_import_modal = Some(ImportModalState {
+                                    candidates,
+                                    selected_idx: 0,
+                                    custom_path: String::new(),
+                                    in_custom_path_mode: false,
+                                });
+                            }
+                            HubAction::CleanCorruptedModels => {
+                                let corrupted = if hub.models_view.corrupted_models.is_empty() {
+                                    crate::import::find_corrupted_models(&hub.models_view.models_dir)
+                                } else {
+                                    hub.models_view.corrupted_models.clone()
+                                };
+                                match crate::import::delete_corrupted_models(&corrupted, &hub.models_view.models_dir) {
+                                    Ok(deleted) if deleted > 0 => {
+                                        hub.status_message = Some((
+                                            format!("Cleaned up {deleted} corrupted model file(s)"),
+                                            Color::Green,
+                                        ));
+                                        hub.models_view.refresh();
+                                    }
+                                    Ok(_) => {
+                                        hub.status_message = Some((
+                                            "No corrupted model files found".into(),
+                                            Color::DarkGray,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        hub.status_message = Some((
+                                            format!("Failed to clean corrupted models: {e}"),
+                                            Color::Red,
+                                        ));
+                                    }
+                                }
                             }
                             HubAction::ModelsDelete => {
                                 if let Some(row) = hub.models_view.selected_row() {
@@ -2977,7 +3485,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 }
             }
             _ = refresh_interval.tick() => {
-                let modal_open = hub.pending_download_url.is_some()
+                let modal_open = hub.pending_download_modal.is_some()
+                    || hub.pending_import_modal.is_some()
                     || hub.pending_delete_model.is_some()
                     || hub.download_progress.is_some()
                     || hub.pending_hf_quant_picker.is_some()

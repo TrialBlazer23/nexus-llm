@@ -122,6 +122,73 @@ pub struct HfGgufFile {
     pub download_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CuratedModel {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub repo_id: &'static str,
+    pub filename: &'static str,
+    pub quant_label: &'static str,
+    pub approx_size_mb: u64,
+    pub min_ram_mb: u64,
+    pub download_url: &'static str,
+}
+
+pub fn curated_starter_models() -> Vec<CuratedModel> {
+    vec![
+        CuratedModel {
+            name: "Qwen 2.5 Coder 1.5B Instruct",
+            description: "Fast code & general assistant. Great for low-memory devices.",
+            repo_id: "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+            filename: "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+            quant_label: "Q4_K_M",
+            approx_size_mb: 986,
+            min_ram_mb: 1800,
+            download_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        },
+        CuratedModel {
+            name: "Llama 3.2 1B Instruct",
+            description: "Ultra-compact Meta conversational model for edge devices.",
+            repo_id: "bartowski/Llama-3.2-1B-Instruct-GGUF",
+            filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+            quant_label: "Q4_K_M",
+            approx_size_mb: 808,
+            min_ram_mb: 1500,
+            download_url: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        },
+        CuratedModel {
+            name: "Llama 3.2 3B Instruct",
+            description: "High quality lightweight assistant. Ideal balance for phones & laptops.",
+            repo_id: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+            filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+            quant_label: "Q4_K_M",
+            approx_size_mb: 2018,
+            min_ram_mb: 3200,
+            download_url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        },
+        CuratedModel {
+            name: "Gemma 2 2B Instruct",
+            description: "Google edge model with strong reasoning for its size.",
+            repo_id: "bartowski/gemma-2-2b-it-GGUF",
+            filename: "gemma-2-2b-it-Q4_K_M.gguf",
+            quant_label: "Q4_K_M",
+            approx_size_mb: 1630,
+            min_ram_mb: 2600,
+            download_url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
+        },
+        CuratedModel {
+            name: "SmolLM2 1.7B Instruct",
+            description: "Hugging Face ultra-efficient small LM for on-device chat.",
+            repo_id: "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF",
+            filename: "smollm2-1.7b-instruct-q4_k_m.gguf",
+            quant_label: "Q4_K_M",
+            approx_size_mb: 1060,
+            min_ram_mb: 2000,
+            download_url: "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf",
+        },
+    ]
+}
+
 pub struct HfClient {
     client: reqwest::Client,
     token: Option<String>,
@@ -159,10 +226,14 @@ impl HfClient {
             return None;
         }
 
-        // Handle full URLs: https://huggingface.co/{owner}/{repo}
+        // Handle full URLs: https://huggingface.co/{owner}/{repo} or https://hf.co/{owner}/{repo}
         if let Some(stripped) = trimmed
             .strip_prefix("https://huggingface.co/")
             .or_else(|| trimmed.strip_prefix("http://huggingface.co/"))
+            .or_else(|| trimmed.strip_prefix("https://hf.co/"))
+            .or_else(|| trimmed.strip_prefix("http://hf.co/"))
+            .or_else(|| trimmed.strip_prefix("huggingface.co/"))
+            .or_else(|| trimmed.strip_prefix("hf.co/"))
         {
             let stripped = stripped.trim_end_matches('/');
             let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
@@ -469,10 +540,25 @@ mod tests {
             None
         );
         assert_eq!(
+            HfClient::parse_repo_id("https://hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF"),
+            Some("bartowski/Llama-3.2-3B-Instruct-GGUF".to_string())
+        );
+        assert_eq!(
+            HfClient::parse_repo_id("hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF"),
+            Some("bartowski/Llama-3.2-3B-Instruct-GGUF".to_string())
+        );
+        assert_eq!(
+            HfClient::parse_repo_id(
+                "https://hf.co/bartowski/Llama-3.2-3B-Instruct-GGUF/blob/main/model.gguf"
+            ),
+            None
+        );
+        assert_eq!(
             HfClient::parse_repo_id("https://example.com/other/model.gguf"),
             None
         );
         assert_eq!(HfClient::parse_repo_id("local-file.gguf"), None);
+        assert!(!curated_starter_models().is_empty());
     }
 
     #[test]

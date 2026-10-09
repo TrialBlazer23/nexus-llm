@@ -167,6 +167,15 @@ impl LlamaServerConfig {
             "-ngl".to_string(),
             effective_gpu_layers.to_string(),
         ];
+        if effective_gpu_layers == 0
+            && !self
+                .extra_args
+                .iter()
+                .any(|a| a == "--device" || a == "-dev")
+        {
+            args.push("--device".to_string());
+            args.push("none".to_string());
+        }
         if self.cpu_threads_batch > 0 {
             args.push("-tb".to_string());
             args.push(self.cpu_threads_batch.to_string());
@@ -483,6 +492,11 @@ impl ProcessSupervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        if gpu_layers == 0 {
+            cmd.env("LLAMA_ARG_DEVICE", "none");
+            cmd.env("GGML_VK_VISIBLE_DEVICES", "");
+        }
 
         let mut child = cmd
             .spawn()

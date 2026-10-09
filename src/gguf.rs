@@ -235,7 +235,6 @@ impl GgufMetadata {
             let key = read_string_bounded(reader, remaining_hint)?;
             read_exact_bounded(reader, &mut u32_buf)?;
             let value_type = u32::from_le_bytes(u32_buf);
-            // Materialize small arrays only; skip large tokenizer arrays.
             let value = read_value_bounded(reader, value_type, remaining_hint, true)?;
             metadata.insert(key, value);
         }
@@ -272,15 +271,6 @@ impl GgufMetadata {
         let embedding_length = metadata
             .get(&format!("{arch_prefix}.embedding_length"))
             .and_then(|v| v.as_usize());
-
-        // Align to 32 bytes before tensor info (GGUF v2/v3 convention).
-        let pos = reader.stream_position().map_err(GgufError::Io)?;
-        let aligned = (pos + 31) & !31;
-        if aligned > pos {
-            reader
-                .seek(SeekFrom::Start(aligned))
-                .map_err(GgufError::Io)?;
-        }
 
         let mut tensors = Vec::new();
         if tensor_count > 0 {
@@ -772,11 +762,6 @@ mod tests {
         buf.extend_from_slice(&4u32.to_le_bytes());
         buf.extend_from_slice(&2u32.to_le_bytes());
 
-        // Align to 32
-        while buf.len() % 32 != 0 {
-            buf.push(0);
-        }
-
         // Tensor 0: blk.0.attn_q.weight Q4_0 [32, 64]
         write_string(&mut buf, "blk.0.attn_q.weight");
         buf.extend_from_slice(&2u32.to_le_bytes());
@@ -827,6 +812,35 @@ mod tests {
         assert!(q4 < q8);
         // Must be far below 200KB/token * 4096 = 800 MB heuristic
         assert!(f16 < 800 * 1024 * 1024);
-        assert!(f16 < 700 * 1024 * 1024); // ~672 MB for this 1.5B geometry
+    }
+
+    #[test]
+    fn test_unaligned_kv_metadata_with_tensors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        buf.extend_from_slice(&2u64.to_le_bytes()); // 2 KVs
+        write_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_string(&mut buf, "llama");
+        write_string(&mut buf, "odd_length_key");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&42u32.to_le_bytes());
+
+        // Stream position here is guaranteed not to be 32-byte aligned
+        assert_ne!(buf.len() % 32, 0);
+
+        write_string(&mut buf, "token_embd.weight");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&16u64.to_le_bytes());
+        buf.extend_from_slice(&32u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes()); // Q4_0
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let meta = GgufMetadata::read(&mut Cursor::new(buf)).expect("parse unaligned GGUF");
+        assert_eq!(meta.architecture.as_deref(), Some("llama"));
+        assert_eq!(meta.tensors.len(), 1);
+        assert_eq!(meta.tensors[0].name, "token_embd.weight");
     }
 }

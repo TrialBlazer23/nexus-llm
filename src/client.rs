@@ -114,7 +114,9 @@ pub struct ChatCompletionChunk {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionChunkChoice {
-    pub index: usize,
+    #[serde(default)]
+    pub index: Option<usize>,
+    #[serde(default)]
     pub delta: ChatCompletionChunkDelta,
     pub finish_reason: Option<String>,
 }
@@ -123,6 +125,21 @@ pub struct ChatCompletionChunkChoice {
 pub struct ChatCompletionChunkDelta {
     pub role: Option<String>,
     pub content: Option<String>,
+    pub reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SseErrorChunk {
+    pub error: SseErrorDetail,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SseErrorDetail {
+    pub message: String,
+    #[serde(default)]
+    pub code: Option<serde_json::Value>,
+    #[serde(rename = "type", default)]
+    pub error_type: Option<String>,
 }
 
 /// OpenAI-compatible HTTP REST and SSE streaming client for Nexus-LLM.
@@ -305,10 +322,25 @@ impl NexusClient {
                                                 return Some(Ok(content.clone()));
                                             }
                                         }
+                                        if let Some(reasoning) =
+                                            &first_choice.delta.reasoning_content
+                                        {
+                                            if !reasoning.is_empty() {
+                                                return Some(Ok(reasoning.clone()));
+                                            }
+                                        }
                                     }
                                     None
                                 }
                                 Err(e) => {
+                                    if let Ok(err_chunk) =
+                                        serde_json::from_str::<SseErrorChunk>(data)
+                                    {
+                                        return Some(Err(ClientError::ApiError {
+                                            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                                            message: err_chunk.error.message,
+                                        }));
+                                    }
                                     debug!("Failed to parse SSE chunk: {} (data: {})", e, data);
                                     None
                                 }

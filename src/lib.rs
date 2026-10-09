@@ -10,6 +10,7 @@ pub mod downloader;
 pub mod gateway;
 pub mod gguf;
 pub mod hf;
+pub mod import;
 pub mod kb;
 pub mod logging;
 pub mod mdns;

@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-09 — Unified setup installs backends under ~/.nexus/bin (no C++ in crate)
+- Category: design-decision
+- Context: Operators needed one clone→ready path for Nexus + llama.cpp + bmoe-cli across Termux, Penryn Linux, WSL, and macOS.
+- Finding: Bundling via Cargo `build.rs` / FFI would violate the subprocess rule and break Penryn/Termux baselines. Prebuilt llama/bmoe blobs often ship AVX and are unsafe as the only install path. BigMoe vendors its own Helldez llama.cpp fork; stock `llama-server`/`rpc-server` need a separate tree. Modern llama.cpp may emit `ggml-rpc-server` — install/symlink as `rpc-server` for Nexus config.
+- Action: Ship `scripts/setup.sh` (+ `setup.ps1` → WSL) with pinned refs in `scripts/versions.env`; install to `~/.nexus/bin`; `nexus setup __write_bins` rewrites config paths and can set `inference.moe.enabled`. Cloud/CI may use `--skip-llama --skip-moe`. Keep advanced MoE knobs out of the primary Settings surface.
+- Verification: `bash scripts/setup.sh --dry-run`; `cargo test --locked --lib setup::`; full backend builds are operator/hardware soak (long compile).
+
 ## 2026-10-09 — BigMoeOnEdge integration: external bmoe-cli, stream LMK, no RPC+stream
 - Category: design-decision
 - Context: Integrating Helldez/BigMoeOnEdge flash-streaming MoE into nexus-llm orchestration.

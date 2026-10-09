@@ -218,6 +218,17 @@ enum Commands {
     /// Diagnose mesh / inference preconditions (binaries, ports, config, profile)
     Doctor,
 
+    /// Bootstrap local toolchain (llama-server, rpc-server, bmoe-cli, nexus)
+    ///
+    /// Runs `scripts/setup.sh` from the repo (or `$NEXUS_ROOT`). Pass-through flags:
+    /// `--skip-moe`, `--skip-llama`, `--prefix DIR`, `--dry-run`, `--model URL`, …
+    /// Internal: `nexus setup __write_bins --prefix DIR [--enable-moe]` updates config paths.
+    Setup {
+        /// Arguments forwarded to scripts/setup.sh (or internal __write_bins)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Measure prompt/gen throughput and persist to ~/.nexus/bench.json (Phase 12 §5.5)
     Bench {
         /// OpenAI-compatible base URL (gateway, api_port, or fake llama)
@@ -1185,6 +1196,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Log file: {}", path.display());
             }
             std::process::exit(report.exit_code());
+        }
+        Commands::Setup { args } => {
+            if args.first().map(|s| s.as_str()) == Some("__write_bins") {
+                let update = nexus::setup::BinPathUpdate::parse(&args[1..])?;
+                let cfg = nexus::setup::apply_bin_paths(&update)?;
+                println!(
+                    "Updated config binaries:\n  llama-server = {}\n  rpc-server    = {}\n  bmoe-cli      = {}\n  moe.enabled   = {}",
+                    cfg.node.llama_server_binary,
+                    cfg.node.rpc_server_binary,
+                    cfg.inference.moe.bmoe_binary,
+                    cfg.inference.moe.enabled
+                );
+            } else {
+                match nexus::setup::run_setup_script(&args) {
+                    Ok(()) => {}
+                    Err(nexus::setup::SetupError::ScriptNotFound) => {
+                        eprintln!(
+                            "setup script not found. From a nexus-llm clone run:\n  bash scripts/setup.sh {}\nOr set NEXUS_ROOT to the repository root.",
+                            args.join(" ")
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
         Commands::Bench {
             endpoint,

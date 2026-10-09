@@ -382,18 +382,20 @@ pub enum MoeQualityMode {
 /// Distinct from [`PromptCacheConfig::max_cache_mb`] (prompt-slot *disk* quota).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MoeConfig {
+    // --- Operator knobs (setup defaults are enough for most nodes) ---
     /// When true, prefer `bmoe-cli --moe-stream` for streamable MoE GGUFs that exceed dense RAM.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Path or PATH name of the BigMoeOnEdge CLI binary.
+    /// Path or PATH name of the BigMoeOnEdge CLI binary (`scripts/setup.sh` writes `~/.nexus/bin/bmoe-cli`).
     #[serde(default = "default_bmoe_binary")]
     pub bmoe_binary: String,
 
-    /// Expert LRU cache budget: `"auto"`, `"0"`, or an integer MiB string (≥2000 when set).
+    /// Expert LRU cache budget: `"auto"`, `"0"`, or an integer MiB string (≥1500 when set).
     #[serde(default = "default_moe_cache_mb")]
     pub cache_mb: String,
 
+    // --- Expert knobs (TOML-only; leave at defaults unless tuning) ---
     /// RAM left free under `auto` cache sizing (MiB).
     #[serde(default = "default_moe_cache_floor_mb")]
     pub cache_floor_mb: u64,

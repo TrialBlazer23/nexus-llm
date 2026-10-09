@@ -177,17 +177,19 @@ slot_save_path = "~/.nexus/slots"
 max_cache_mb = 2048
 
 # Phase 16 — BigMoeOnEdge expert flash streaming (RAM cache for active experts)
+# Operator knobs: enabled + cache_mb (defaults after scripts/setup.sh are enough).
+# Expert knobs below: leave at defaults unless tuning flash I/O or lossy quality.
 [inference.moe]
 enabled = true
-bmoe_binary = "bmoe-cli"
-cache_mb = "auto"                   # auto | 0 | >=1500
-cache_floor_mb = 1536
-cache_ceil_mb = 0                   # 0 = derive from SystemProfile (~45% of LMK budget)
-io_threads = 4
-dense_weights = "anon"
-overlap = false                     # needs Helldez expert-ready llama.cpp inside bmoe build
-quality_mode = "lossless"           # lossy unlocks drop/substitute/route-ahead
-# drop_cold_experts = "0.75"        # only with quality_mode = "lossy"
+bmoe_binary = "~/.nexus/bin/bmoe-cli"  # setup writes absolute paths under ~/.nexus/bin
+cache_mb = "auto"                   # operator: auto | 0 | >=1500
+cache_floor_mb = 1536               # expert
+cache_ceil_mb = 0                   # expert: 0 = derive from SystemProfile (~45% of LMK budget)
+io_threads = 4                      # expert: 1–8
+dense_weights = "anon"              # expert: mmap|warm|anon|ahwb
+overlap = false                     # expert: needs Helldez expert-ready llama.cpp inside bmoe build
+quality_mode = "lossless"           # expert: lossy unlocks drop/substitute/route-ahead
+# drop_cold_experts = "0.75"        # expert: only with quality_mode = "lossy"
 # expert_substitute = "0.1"
 # route_ahead = 2
 

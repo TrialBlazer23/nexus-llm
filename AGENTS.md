@@ -62,6 +62,9 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 ├── CAPABILITY_REVIEW.md
 ├── NETWORK_EXPANSION_FINDINGS.md
 ├── scripts/
+│   ├── setup.sh                  # Unified bootstrap → ~/.nexus/bin (+ setup.ps1 for Windows/WSL)
+│   ├── versions.env              # Pinned llama.cpp + BigMoeOnEdge refs
+│   ├── lib/                      # setup helpers (detect/deps/build/config)
 │   ├── check_penryn_opcodes.sh   # CI: fail on AVX/AVX2/FMA/SSE4.2 in release binary
 │   └── verify_review_findings.sh
 ├── .github/workflows/ci.yml      # Continuous: fmt, clippy, test, Android best-effort, Penryn scan
@@ -132,7 +135,7 @@ Checks that do not need a GGUF file or an external `llama-server` binary:
 - `cargo run --locked --bin nexus -- check -m <file> -c 2048` evaluates the 75% memory guard.
 - `cargo run --locked --bin nexusd` starts the headless discovery daemon with no model loaded.
 
-`llama-server` and `rpc-server` are external llama.cpp binaries. `nexus host` and `nexusd --model` need those binaries plus a GGUF file, which are not in this repository.
+`llama-server`, `rpc-server`, and optional `bmoe-cli` are external binaries (not vendored into the Rust crate). Operators install them with `bash scripts/setup.sh` into `~/.nexus/bin` (pinned refs in `scripts/versions.env`). Cloud Agents that only need Rust tests may use `bash scripts/setup.sh --skip-llama --skip-moe` or skip setup entirely. `nexus host` and `nexusd --model` still need those backends plus a GGUF file.
 
 ---
 

@@ -19,6 +19,7 @@ pub enum SettingType {
     PresetsDir,
     LlamaServerBinary,
     RpcServerBinary,
+    BmoeBinary,
     // Model Registry & Auth
     HfToken,
     // Network & Transport
@@ -92,6 +93,12 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "rpc-server Binary Path",
         description: "Path or executable name for llama.cpp distributed rpc-server",
         setting_type: SettingType::RpcServerBinary,
+    },
+    SettingItem {
+        category: "Paths & Binaries",
+        name: "bmoe-cli Binary Path",
+        description: "Path or executable name for BigMoeOnEdge MoE flash-stream CLI",
+        setting_type: SettingType::BmoeBinary,
     },
     // Model Registry & Auth
     SettingItem {
@@ -265,6 +272,7 @@ impl SettingsView {
                 | SettingType::PresetsDir
                 | SettingType::LlamaServerBinary
                 | SettingType::RpcServerBinary
+                | SettingType::BmoeBinary
                 | SettingType::HfToken
                 | SettingType::DefaultHost
                 | SettingType::StaticPeers
@@ -281,6 +289,7 @@ impl SettingsView {
             SettingType::PresetsDir => self.config.node.presets_dir.to_string_lossy().to_string(),
             SettingType::LlamaServerBinary => self.config.node.llama_server_binary.clone(),
             SettingType::RpcServerBinary => self.config.node.rpc_server_binary.clone(),
+            SettingType::BmoeBinary => self.config.inference.moe.bmoe_binary.clone(),
             SettingType::HfToken => self.config.huggingface.token.clone().unwrap_or_default(),
             SettingType::DefaultHost => {
                 self.config.network.default_host.clone().unwrap_or_default()
@@ -325,6 +334,11 @@ impl SettingsView {
             SettingType::RpcServerBinary => {
                 if !val.is_empty() {
                     self.config.node.rpc_server_binary = val;
+                }
+            }
+            SettingType::BmoeBinary => {
+                if !val.is_empty() {
+                    self.config.inference.moe.bmoe_binary = val;
                 }
             }
             SettingType::HfToken => {
@@ -384,6 +398,7 @@ impl SettingsView {
             | SettingType::PresetsDir
             | SettingType::LlamaServerBinary
             | SettingType::RpcServerBinary
+            | SettingType::BmoeBinary
             | SettingType::HfToken
             | SettingType::DefaultHost
             | SettingType::StaticPeers => {
@@ -604,6 +619,9 @@ impl SettingsView {
                     }
                     SettingType::RpcServerBinary => {
                         format!("[ {} ]", self.config.node.rpc_server_binary)
+                    }
+                    SettingType::BmoeBinary => {
+                        format!("[ {} ]", self.config.inference.moe.bmoe_binary)
                     }
                     SettingType::HfToken => match &self.config.huggingface.token {
                         None => "[ none ]".to_string(),

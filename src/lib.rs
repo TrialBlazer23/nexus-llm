@@ -20,6 +20,7 @@ pub mod peer_registry;
 pub mod preset;
 pub mod registry_runtime;
 pub mod router;
+pub mod setup;
 pub mod store;
 pub mod supervisor;
 pub mod sysinfo;

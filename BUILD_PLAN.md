@@ -155,6 +155,28 @@ cargo test --locked
 
 ---
 
+## Phase 17: Unified Bootstrap (setup.sh)
+**Status:** Complete
+
+### Objectives
+- One operator entrypoint: `bash scripts/setup.sh` (Windows: `scripts/setup.ps1` → WSL).
+- Platform detect (Linux / macOS / Termux / WSL) + best-effort dep install (apt/dnf/pacman/pkg/brew + rustup).
+- Build **stock** llama.cpp → `llama-server` + `rpc-server` with Penryn-safe or Snapdragon flags; install to `~/.nexus/bin`.
+- Build or fetch BigMoeOnEdge `bmoe-cli` (separate Helldez llama.cpp tree); never merge into the Nexus Cargo crate.
+- `cargo build --release --locked` for `nexus` / `nexusd`; write absolute binary paths into config; optional `--model` download; run `nexus doctor`.
+- `nexus setup` CLI forwards to the script; `nexus setup __write_bins` applies paths; Settings exposes `bmoe_binary`.
+- Keep MoE operator surface simple: `enabled` + `cache_mb = "auto"`; advanced knobs stay TOML-only.
+
+### Verification Command
+```bash
+bash scripts/setup.sh --dry-run
+cargo test --locked --lib setup::
+cargo test --locked
+# Optional full toolchain (long): bash scripts/setup.sh --jobs 4
+```
+
+---
+
 ## Full Regression Suite
 ```bash
 wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"

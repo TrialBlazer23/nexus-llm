@@ -75,96 +75,65 @@ flowchart TD
 
 ---
 
-## Setup Across Different Systems
+## Setup (one command)
 
-### 1. Android (Samsung Galaxy S23 Ultra / Termux ARM64)
+Nexus is a Rust orchestrator. Inference backends (`llama-server`, `rpc-server`, and optional `bmoe-cli`) stay **external subprocesses** — not linked into the crate. The bootstrap script detects your platform, installs build deps, builds those backends with safe CPU flags, builds Nexus, installs everything under `~/.nexus/bin`, and wires `~/.nexus/config.toml`.
 
-#### Prerequisites
-Install the required toolchains inside Termux:
 ```bash
-pkg update && pkg install -y rust clang git libllvm vulkan-tools
-```
-
-#### Build & Run
-```bash
-# Clone the repository
 git clone https://github.com/<YOUR_USER>/nexus-llm.git ~/nexus-llm
 cd ~/nexus-llm
+bash scripts/setup.sh
+export PATH="$HOME/.nexus/bin:$PATH"
+nexus doctor
+nexus
+```
 
-# Build release binaries
-cargo build --release
+Windows (PowerShell) — prefers WSL:
 
-# Download a model (e.g. Qwen 2.5 Coder 1.5B or 7B)
-./target/release/nexus download \
+```powershell
+git clone https://github.com/<YOUR_USER>/nexus-llm.git C:\nexus-llm
+cd C:\nexus-llm
+.\scripts\setup.ps1
+```
+
+Useful flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--dry-run` | Detect platform / print plan only |
+| `--skip-moe` | Skip BigMoeOnEdge / `bmoe-cli` |
+| `--skip-llama` | Skip stock llama.cpp servers |
+| `--jobs N` | Parallel build jobs |
+| `--prefix DIR` | Install root (default `~/.nexus`) |
+| `--model URL` | Download a GGUF after install |
+
+Pinned third-party versions live in [`scripts/versions.env`](scripts/versions.env). After setup you can also run `nexus setup --dry-run` (forwards to the same script when `scripts/setup.sh` is visible via cwd or `$NEXUS_ROOT`).
+
+**Operator MoE knobs** in `~/.nexus/config.toml` (defaults are enough for most nodes):
+
+```toml
+[inference.moe]
+enabled = true
+cache_mb = "auto"          # expert RAM cache governor
+# Advanced (leave alone unless you know you need them):
+# dense_weights, overlap, quality_mode, drop_cold_experts, …
+```
+
+Optional model download (or pass `--model` to setup):
+
+```bash
+nexus download \
   "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf" \
-  -o ~/nexus-models/qwen2.5-coder-1.5b.gguf
-
-# Option A: Run the interactive Unified Hub TUI
-./target/release/nexus
-
-# Option B: Run as a headless daemon ready to accept remote model launches
-./target/release/nexusd
-
-# Option C: Run as an RPC compute worker
-./target/release/nexus rpc --port 50052
+  -o ~/.nexus/models/qwen2.5-coder-1.5b.gguf
 ```
 
----
+### Platform notes / troubleshooting
 
-### 2. Linux / Legacy x86 Workstations (e.g. Apple MacBook / Debian 13)
-
-The build configuration in `.cargo/config.toml` automatically configures rustflags to disable AVX, AVX2, FMA, and SSE4.2, guaranteeing clean execution on older Intel Core 2 Duo (Penryn) processors.
-
-#### Prerequisites
-```bash
-sudo apt update && sudo apt install -y cargo rustc git build-essential
-```
-
-#### Build & Run
-```bash
-# Clone the repository
-git clone https://github.com/<YOUR_USER>/nexus-llm.git ~/nexus-llm
-cd ~/nexus-llm
-
-# Build release binaries (guarded by Penryn baseline flags)
-cargo build --release
-
-# Option A: Launch the full Unified Hub TUI
-./target/release/nexus
-
-# Option B: Launch directly into streaming chat
-./target/release/nexus client
-
-# Option C: Join the cluster as an RPC compute worker
-./target/release/nexus rpc --port 50052
-```
-
----
-
-### 3. Windows & Windows Subsystem for Linux (WSL2)
-
-> [!IMPORTANT]
-> **Windows Host Environment Note**: Native Windows PowerShell typically lacks Rust/Cargo in its system PATH. All Cargo building, linting, and testing should be run inside **WSL2** using a login shell.
-
-#### Building & Running in WSL2
-From PowerShell:
-```powershell
-# Open WSL bash in the repo directory
-wsl bash -l -c "cd /mnt/c/nexus-llm && cargo build --release"
-
-# Run tests
-wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"
-
-# Launch the Unified Hub inside WSL terminal
-wsl bash -l -c "cd /mnt/c/nexus-llm && ./target/release/nexus"
-```
-
-#### Direct Native Windows Execution
-If you have a native Rust toolchain installed on Windows:
-```powershell
-cargo build --release
-.\target\release\nexus.exe
-```
+- **Termux (Android ARM64):** `bash scripts/setup.sh` (do not rely on a broken shebang). Setup uses `pkg` for clang/cmake/rust and Snapdragon-oriented ggml flags.
+- **Legacy x86 (Penryn / Core 2 Duo):** `.cargo/config.toml` and the llama.cpp CMake flags disable AVX/AVX2/FMA/SSE4.2. Prefer source builds over random prebuilt `llama-server` blobs.
+- **Windows:** use `scripts/setup.ps1` → WSL. Native PowerShell usually has no Cargo; `-Native` is only for machines that already have MSVC + CMake + Rust.
+- **Cloud / CI Rust-only:** `bash scripts/setup.sh --skip-llama --skip-moe` or plain `cargo test --locked`.
+- **Manual cargo-only** (backends already on `PATH`): `cargo build --release && ./target/release/nexus`.
 
 ---
 

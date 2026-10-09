@@ -1014,6 +1014,7 @@ pub async fn handle_load_model(
 }
 
 /// Load a model, selecting llama-server or bmoe-cli based on GGUF + MoE policy.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_load_model_with_moe(
     manager: &crate::supervisor::SupervisorManager,
     request: &ModelLoadRequest,

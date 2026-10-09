@@ -122,6 +122,7 @@ impl BmoeSessionConfig {
     }
 
     /// Build config from Nexus MoE settings + probed profile.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_profile(
         binary: impl Into<PathBuf>,
         model: impl Into<PathBuf>,
@@ -873,11 +874,13 @@ mod tests {
 
     #[test]
     fn build_args_lossy_when_enabled() {
-        let mut moe = MoeConfig::default();
-        moe.quality_mode = MoeQualityMode::Lossy;
-        moe.drop_cold_experts = Some("0.75".into());
-        moe.route_ahead = Some(2);
-        moe.overlap = true;
+        let moe = MoeConfig {
+            quality_mode: MoeQualityMode::Lossy,
+            drop_cold_experts: Some("0.75".into()),
+            route_ahead: Some(2),
+            overlap: true,
+            ..MoeConfig::default()
+        };
         let cfg = BmoeSessionConfig {
             binary_path: PathBuf::from("bmoe-cli"),
             model_path: PathBuf::from("m.gguf"),

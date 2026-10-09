@@ -34,6 +34,7 @@ pub struct BinPathUpdate {
     pub rpc_server: Option<PathBuf>,
     pub bmoe_cli: Option<PathBuf>,
     pub enable_moe: bool,
+    pub disable_moe: bool,
 }
 
 impl BinPathUpdate {
@@ -71,16 +72,24 @@ impl BinPathUpdate {
                     out.bmoe_cli = Some(PathBuf::from(v));
                 }
                 "--enable-moe" => out.enable_moe = true,
+                "--disable-moe" => out.disable_moe = true,
                 other => {
                     return Err(SetupError::InvalidArgs(format!("unknown flag: {other}")));
                 }
             }
             i += 1;
         }
+        if out.enable_moe && out.disable_moe {
+            return Err(SetupError::InvalidArgs(
+                "--enable-moe and --disable-moe are mutually exclusive".into(),
+            ));
+        }
         if out.prefix.is_none()
             && out.llama_server.is_none()
             && out.rpc_server.is_none()
             && out.bmoe_cli.is_none()
+            && !out.enable_moe
+            && !out.disable_moe
         {
             return Err(SetupError::InvalidArgs(
                 "provide --prefix and/or explicit binary paths".into(),
@@ -117,6 +126,8 @@ pub fn apply_bin_paths(update: &BinPathUpdate) -> Result<NexusConfig, SetupError
     }
     if update.enable_moe {
         cfg.inference.moe.enabled = true;
+    } else if update.disable_moe {
+        cfg.inference.moe.enabled = false;
     }
 
     // Prefer models under the install prefix when still at the default location.
@@ -230,6 +241,7 @@ mod tests {
             rpc_server: None,
             bmoe_cli: None,
             enable_moe: true,
+            disable_moe: false,
         };
         let cfg = apply_bin_paths(&update).unwrap();
         assert!(cfg.node.llama_server_binary.ends_with("bin/llama-server"));

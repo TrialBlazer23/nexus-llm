@@ -1202,11 +1202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let update = nexus::setup::BinPathUpdate::parse(&args[1..])?;
                 let cfg = nexus::setup::apply_bin_paths(&update)?;
                 println!(
-                    "Updated config binaries:\n  llama-server = {}\n  rpc-server    = {}\n  bmoe-cli      = {}\n  moe.enabled   = {}",
+                    "Updated config binaries:\n  llama-server = {}\n  rpc-server    = {}\n  bmoe-cli      = {}\n  moe.enabled   = {}\n  models_dir    = {}",
                     cfg.node.llama_server_binary,
                     cfg.node.rpc_server_binary,
                     cfg.inference.moe.bmoe_binary,
-                    cfg.inference.moe.enabled
+                    cfg.inference.moe.enabled,
+                    cfg.node.models_dir.display()
                 );
             } else {
                 match nexus::setup::run_setup_script(&args) {

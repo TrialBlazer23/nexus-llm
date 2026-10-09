@@ -21,6 +21,9 @@ nexus_write_config() {
   local args=(setup __write_bins --prefix "$prefix")
   if [ "$enable_moe" = "1" ] && [ -x "${prefix}/bin/bmoe-cli" ]; then
     args+=(--enable-moe)
+  elif [ ! -x "${prefix}/bin/bmoe-cli" ]; then
+    # Avoid doctor WARNs for a missing bmoe-cli after --skip-moe installs.
+    args+=(--disable-moe)
   fi
   if [ -x "${prefix}/bin/llama-server" ]; then
     args+=(--llama-server "${prefix}/bin/llama-server")

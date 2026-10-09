@@ -31,6 +31,8 @@ fn gguf_1p5b() -> GgufMetadata {
         head_count: Some(12),
         head_count_kv: Some(12),
         embedding_length: Some(1536),
+        expert_count: None,
+        expert_used_count: None,
         file_size_bytes: 900_000_000,
         tensors: vec![],
         quant_label: Some("Q4_K".into()),
@@ -158,6 +160,8 @@ fn ranker_prefers_measured_tok_s_over_heuristic() {
         enable_rpc: false,
         candidates: vec![],
         bench: Some(&store),
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 0,
     };
     let plans = rank_execution_plans(&req).expect("plans");
     let local = plans
@@ -195,6 +199,9 @@ fn ranker_without_bench_stays_heuristic() {
         local_name: "local".into(),
         local_gpu_layers: 99,
         enable_rpc: true,
+        bench: None,
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 0,
         candidates: vec![PlacementCandidate {
             name: "desktop".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "desktop", 24_000),
@@ -203,8 +210,8 @@ fn ranker_without_bench_stays_heuristic() {
             link: LinkQuality::unknown(),
             is_local: false,
             thermal_index: 20,
+            moe_stream: false,
         }],
-        bench: None,
     };
     let plans = rank_execution_plans(&req).expect("plans");
     assert!(!plans.is_empty());

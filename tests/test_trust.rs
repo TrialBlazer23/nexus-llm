@@ -179,6 +179,7 @@ async fn control_plane_rejects_unsigned_load_when_pairing_enforced() {
             rpc_workers: vec![],
             tags: vec![],
             target_port: None,
+            backend: "auto".to_string(),
         },
     )
     .await
@@ -236,6 +237,7 @@ async fn pairing_grants_remote_load() {
         rpc_workers: vec![],
         tags: vec![],
         target_port: None,
+        backend: "auto".to_string(),
     };
     let load = dispatch_load_model_signed(&client, &base, &load_req, &client_trust.identity)
         .await
@@ -277,6 +279,8 @@ async fn forged_beacon_does_not_enable_trusted_connect() {
             thermal_index: 0,
             active_model: String::new(),
             display_name: "forged".into(),
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
             last_seen: Instant::now(),
         },
     );

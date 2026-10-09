@@ -864,6 +864,7 @@ pub(crate) async fn build_target_selection(
                 link,
                 is_local: false,
                 thermal_index: p.thermal_index,
+                moe_stream: p.moe_stream,
             });
         }
     }
@@ -886,6 +887,11 @@ pub(crate) async fn build_target_selection(
             candidates: placement_candidates,
             enable_rpc: ctx.config.cluster.enable_rpc && ctx.config.cluster.auto_offload,
             bench: bench_store.as_ref(),
+            moe_stream_enabled: ctx.config.inference.moe.enabled,
+            moe_cache_ceil_mb: ctx.config.inference.moe.derive_cache_ceil_mb(
+                profile.available_ram_mb,
+                ctx.config.hardware.safety.max_ram_usage_percent,
+            ),
         };
         if let Ok(plans) = rank_execution_plans(&req) {
             for plan in plans {
@@ -904,6 +910,14 @@ pub(crate) async fn build_target_selection(
                             allocatable_mb: local_cap_mb,
                             backend: "CPU Fallback".into(),
                             threads: profile.recommended_threads,
+                            predicted_label: label,
+                        });
+                    }
+                    PlanTarget::LocalMoeStream { cache_mb, ceil_mb } => {
+                        candidates.push(TargetExecutionNode::LocalMoeStream {
+                            allocatable_mb: local_cap_mb,
+                            cache_mb,
+                            ceil_mb,
                             predicted_label: label,
                         });
                     }
@@ -1017,6 +1031,7 @@ async fn run_remote_load(
         rpc_workers: Vec::new(),
         tags: Vec::new(),
         target_port: None,
+        backend: "auto".to_string(),
     };
 
     info!("Dispatching remote model load to {endpoint}: {req:?}");
@@ -1130,6 +1145,71 @@ async fn run_local_load(
     };
 
     let mut extra_args = precomputed_extra_args;
+
+    // Prefer local BigMoe flash streaming over fragile dense RPC for oversize MoE GGUFs.
+    if let Ok(gguf) = crate::gguf::GgufMetadata::open(&model_path) {
+        if crate::bmoe_client::should_use_bmoe(
+            &gguf,
+            &profile,
+            &ctx.config.inference.moe,
+            context_size,
+            ctx.config.hardware.safety.max_ram_usage_percent,
+        ) {
+            let _ = evt_tx
+                .send(HubEvent::ModelLoadProgress {
+                    phase: "Selecting BigMoe flash-stream backend (local MoE)…".to_string(),
+                })
+                .await;
+            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
+                PathBuf::from(&ctx.config.inference.moe.bmoe_binary),
+                model_path.clone(),
+                ctx.config.network.api_host.clone(),
+                ctx.config.network.api_port,
+                context_size,
+                threads,
+                ctx.config.inference.moe.clone(),
+                &profile,
+                ctx.config.hardware.safety.max_ram_usage_percent,
+                Vec::new(),
+            );
+            let _ = evt_tx
+                .send(HubEvent::ModelLoadProgress {
+                    phase: format!(
+                        "Spawning bmoe-cli --session (cache-ceil {} MB)…",
+                        bmoe_cfg.cache_ceil_mb
+                    ),
+                })
+                .await;
+            match ctx.supervisor.spawn_bmoe(bmoe_cfg).await {
+                Ok(_) => {
+                    ctx.discovery.set_active_model(&model_name).await;
+                    ctx.discovery.set_status_flags(StatusFlags::READY).await;
+                    let endpoint = format!(
+                        "http://{}:{}",
+                        ctx.config.network.api_host, ctx.config.network.api_port
+                    );
+                    let _ = evt_tx
+                        .send(HubEvent::ModelLoaded {
+                            model_name: model_name.clone(),
+                            endpoint,
+                            backend_label: "Local MoE flash-stream (bmoe-cli)".to_string(),
+                            notice: format!(
+                                "Model '{model_name}' loaded via BigMoeOnEdge and ready for inference."
+                            ),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = evt_tx
+                        .send(HubEvent::ModelFailed {
+                            message: format!("bmoe-cli spawn failed: {e}"),
+                        })
+                        .await;
+                }
+            }
+            return;
+        }
+    }
 
     if extra_args.is_empty() && ctx.config.cluster.enable_rpc {
         let host_cap_mb = profile

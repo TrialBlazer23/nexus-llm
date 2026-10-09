@@ -148,6 +148,8 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         thermal_index: 20,
         active_model: String::new(),
         display_name: String::new(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: now,
     };
     discovery
@@ -215,6 +217,8 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             thermal_index: 0,
             active_model: String::new(),
             display_name: String::new(),
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
             last_seen: Instant::now(),
         },
     );
@@ -241,6 +245,7 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
         rpc_workers: vec!["192.168.1.50:50052".to_string()],
         tags: vec!["general".to_string()],
         target_port: Some(8081),
+        backend: "auto".to_string(),
     };
 
     // Serialize and deserialize round-trip

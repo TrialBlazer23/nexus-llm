@@ -103,6 +103,7 @@ async fn control_plane_http_load_fails_without_binary_and_unload_succeeds() {
             rpc_workers: Vec::new(),
             tags: Vec::new(),
             target_port: None,
+            backend: "auto".to_string(),
         },
     )
     .await

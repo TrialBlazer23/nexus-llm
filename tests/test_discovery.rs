@@ -192,6 +192,8 @@ async fn test_peer_cache_expiry_and_pruning() {
                 thermal_index: 30,
                 active_model: "llama-3".to_string(),
                 display_name: String::new(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );
@@ -244,6 +246,8 @@ async fn test_find_best_host_scoring() {
                 thermal_index: 50,
                 active_model: "qwen".to_string(),
                 display_name: String::new(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );
@@ -265,6 +269,8 @@ async fn test_find_best_host_scoring() {
                 thermal_index: 25,
                 active_model: "llama".to_string(),
                 display_name: String::new(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );
@@ -286,6 +292,8 @@ async fn test_find_best_host_scoring() {
                 thermal_index: 10,
                 active_model: "".to_string(),
                 display_name: String::new(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );
@@ -464,6 +472,8 @@ fn test_peer_label_prefers_display_name() {
         thermal_index: 0,
         active_model: String::new(),
         display_name: String::new(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: Instant::now(),
     };
     assert_eq!(peer.label(), "Node-aaaaaaaa");
@@ -505,6 +515,8 @@ async fn test_resolve_from_discovery_falls_back_to_best_host() {
             thermal_index: 10,
             active_model: "demo".to_string(),
             display_name: "lan-host".to_string(),
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
             last_seen: Instant::now(),
         },
     );

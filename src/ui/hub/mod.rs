@@ -111,6 +111,12 @@ pub enum TargetExecutionNode {
         threads: usize,
         predicted_label: String,
     },
+    LocalMoeStream {
+        allocatable_mb: u64,
+        cache_mb: u64,
+        ceil_mb: u64,
+        predicted_label: String,
+    },
     Remote {
         uuid: Uuid,
         name: String,
@@ -152,6 +158,17 @@ impl TargetExecutionNode {
                 format!(
                     "🛡️  Local CPU (0 GPU layers, {} threads) - {} MB | {} | {}",
                     threads, allocatable_mb, backend, predicted_label
+                )
+            }
+            Self::LocalMoeStream {
+                allocatable_mb,
+                cache_mb,
+                ceil_mb,
+                predicted_label,
+            } => {
+                format!(
+                    "💾 Local MoE stream (cache {} / ceil {} MB) - {} MB LMK | {}",
+                    cache_mb, ceil_mb, allocatable_mb, predicted_label
                 )
             }
             Self::Distributed {
@@ -2622,6 +2639,32 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                 {
                                                     Ok(cmd) => {
                                                         hub.load_phase = Some("Queued CPU-safe load…".into());
+                                                        let _ = cmd_tx.try_send(cmd);
+                                                    }
+                                                    Err(intent) => {
+                                                        hub.pending_hot_swap = Some(intent);
+                                                    }
+                                                }
+                                            }
+                                            TargetExecutionNode::LocalMoeStream { ceil_mb, .. } => {
+                                                hub.chat.set_target_hardware(
+                                                    "Local Host",
+                                                    format!(
+                                                        "Local MoE flash-stream (ceil {} MB)",
+                                                        ceil_mb
+                                                    ),
+                                                );
+                                                match request_load_or_hot_swap(
+                                                    &hub.supervisor,
+                                                    state.model_path.clone(),
+                                                    Some(0),
+                                                    ctx_size,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(cmd) => {
+                                                        hub.load_phase =
+                                                            Some("Queued MoE stream load…".into());
                                                         let _ = cmd_tx.try_send(cmd);
                                                     }
                                                     Err(intent) => {

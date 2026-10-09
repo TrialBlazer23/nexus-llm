@@ -680,7 +680,7 @@ async fn handle_api_model_load(
         std::path::PathBuf::from(&payload.model_path)
     };
 
-    let (threads, binary, use_mmap, budget_percent, slot_save_path) = {
+    let (threads, binary, use_mmap, budget_percent, slot_save_path, moe) = {
         let cfg_lock = ctx.config.read().unwrap();
         let slot_path = if cfg_lock.inference.cache.prompt_cache_enabled {
             Some(PathBuf::from(&cfg_lock.inference.cache.slot_save_path))
@@ -693,8 +693,56 @@ async fn handle_api_model_load(
             cfg_lock.hardware.safety.mmap,
             cfg_lock.hardware.safety.max_ram_usage_percent,
             slot_path,
+            cfg_lock.inference.moe.clone(),
         )
     };
+
+    let profile = SystemProfile::probe();
+    if let Ok(gguf) = crate::gguf::GgufMetadata::open(&resolved_path) {
+        if crate::bmoe_client::should_use_bmoe(
+            &gguf,
+            &profile,
+            &moe,
+            payload.context_size,
+            budget_percent,
+        ) {
+            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
+                PathBuf::from(&moe.bmoe_binary),
+                resolved_path.clone(),
+                "127.0.0.1",
+                ctx.api_port,
+                payload.context_size,
+                threads,
+                moe,
+                &profile,
+                budget_percent,
+                Vec::new(),
+            );
+            return match ctx.supervisor.spawn_bmoe(bmoe_cfg).await {
+                Ok(_) => {
+                    if let Some(ref d) = ctx.discovery {
+                        d.set_active_model(&filename).await;
+                    }
+                    json_response(
+                        StatusCode::OK,
+                        &json!({
+                            "success": true,
+                            "message": format!("Model '{filename}' loaded via bmoe-cli"),
+                            "active_model": filename,
+                            "backend": "bmoe"
+                        }),
+                    )
+                }
+                Err(e) => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "success": false,
+                        "error": e.to_string()
+                    }),
+                ),
+            };
+        }
+    }
 
     let server_config = crate::supervisor::LlamaServerConfig {
         binary_path: PathBuf::from(binary),
@@ -726,7 +774,8 @@ async fn handle_api_model_load(
                 &json!({
                     "success": true,
                     "message": format!("Model '{filename}' loaded successfully"),
-                    "active_model": filename
+                    "active_model": filename,
+                    "backend": "llama-server"
                 }),
             )
         }
@@ -1045,6 +1094,10 @@ async fn handle_model_inspect(model_id: &str, ctx: Arc<GatewayContext>) -> Respo
                 "head_count": meta.head_count,
                 "head_count_kv": meta.head_count_kv,
                 "embedding_length": meta.embedding_length,
+                "expert_count": meta.expert_count,
+                "expert_used_count": meta.expert_used_count,
+                "is_moe": meta.is_moe(),
+                "streamable_moe": meta.streamable_moe(),
                 "tensor_count": meta.tensor_count,
                 "kv_count": meta.kv_count,
                 "file_size_bytes": meta.file_size_bytes,
@@ -1066,6 +1119,14 @@ struct ConfigUpdateRequest {
     pub battery_floor_percent: Option<u8>,
     pub battery_action: Option<String>,
     pub max_ram_usage_percent: Option<u8>,
+    pub moe_enabled: Option<bool>,
+    pub moe_cache_mb: Option<String>,
+    pub moe_cache_ceil_mb: Option<u64>,
+    pub moe_quality_mode: Option<String>,
+    pub moe_overlap: Option<bool>,
+    pub moe_drop_cold_experts: Option<String>,
+    pub moe_expert_substitute: Option<String>,
+    pub moe_route_ahead: Option<u32>,
 }
 
 async fn handle_config_get(ctx: Arc<GatewayContext>) -> Response<RespBody> {
@@ -1077,6 +1138,20 @@ async fn handle_config_get(ctx: Arc<GatewayContext>) -> Response<RespBody> {
                 "prompt_cache_enabled": cfg.inference.cache.prompt_cache_enabled,
                 "slot_save_path": cfg.inference.cache.slot_save_path,
                 "max_cache_mb": cfg.inference.cache.max_cache_mb,
+                "moe": {
+                    "enabled": cfg.inference.moe.enabled,
+                    "bmoe_binary": cfg.inference.moe.bmoe_binary,
+                    "cache_mb": cfg.inference.moe.cache_mb,
+                    "cache_floor_mb": cfg.inference.moe.cache_floor_mb,
+                    "cache_ceil_mb": cfg.inference.moe.cache_ceil_mb,
+                    "io_threads": cfg.inference.moe.io_threads,
+                    "dense_weights": cfg.inference.moe.dense_weights,
+                    "overlap": cfg.inference.moe.overlap,
+                    "quality_mode": cfg.inference.moe.quality_mode,
+                    "drop_cold_experts": cfg.inference.moe.drop_cold_experts,
+                    "expert_substitute": cfg.inference.moe.expert_substitute,
+                    "route_ahead": cfg.inference.moe.route_ahead,
+                }
             },
             "safety": {
                 "battery_floor_percent": cfg.hardware.safety.battery_floor_percent,
@@ -1125,6 +1200,37 @@ async fn handle_config_update(
     if let Some(ram) = payload.max_ram_usage_percent {
         cfg.hardware.safety.max_ram_usage_percent = ram;
     }
+    if let Some(enabled) = payload.moe_enabled {
+        cfg.inference.moe.enabled = enabled;
+    }
+    if let Some(cache_mb) = payload.moe_cache_mb {
+        cfg.inference.moe.cache_mb = cache_mb;
+    }
+    if let Some(ceil) = payload.moe_cache_ceil_mb {
+        cfg.inference.moe.cache_ceil_mb = ceil;
+    }
+    if let Some(mode) = payload.moe_quality_mode {
+        match mode.to_ascii_lowercase().as_str() {
+            "lossy" => cfg.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossy,
+            "lossless" => cfg.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossless,
+            _ => {}
+        }
+    }
+    if let Some(overlap) = payload.moe_overlap {
+        cfg.inference.moe.overlap = overlap;
+    }
+    if let Some(drop) = payload.moe_drop_cold_experts {
+        cfg.inference.moe.drop_cold_experts = if drop.is_empty() { None } else { Some(drop) };
+    }
+    if let Some(sub) = payload.moe_expert_substitute {
+        cfg.inference.moe.expert_substitute = if sub.is_empty() { None } else { Some(sub) };
+    }
+    if let Some(n) = payload.moe_route_ahead {
+        cfg.inference.moe.route_ahead = if n == 0 { None } else { Some(n) };
+    }
+    if let Err(e) = cfg.inference.moe.validate() {
+        return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()}));
+    }
 
     if let Err(e) = cfg.save() {
         warn!("Failed to persist config to disk: {}", e);
@@ -1138,6 +1244,13 @@ async fn handle_config_update(
                 "prompt_cache_enabled": cfg.inference.cache.prompt_cache_enabled,
                 "slot_save_path": cfg.inference.cache.slot_save_path,
                 "max_cache_mb": cfg.inference.cache.max_cache_mb,
+                "moe": {
+                    "enabled": cfg.inference.moe.enabled,
+                    "cache_mb": cfg.inference.moe.cache_mb,
+                    "cache_ceil_mb": cfg.inference.moe.cache_ceil_mb,
+                    "quality_mode": cfg.inference.moe.quality_mode,
+                    "overlap": cfg.inference.moe.overlap,
+                }
             },
             "safety": {
                 "battery_floor_percent": cfg.hardware.safety.battery_floor_percent,

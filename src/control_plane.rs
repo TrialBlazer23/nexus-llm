@@ -446,6 +446,13 @@ pub struct ModelLoadRequest {
     pub tags: Vec<String>,
     #[serde(default)]
     pub target_port: Option<u16>,
+    /// Force inference backend: `"auto"` (default), `"llama"`, or `"bmoe"`.
+    #[serde(default = "default_backend_auto")]
+    pub backend: String,
+}
+
+fn default_backend_auto() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -993,6 +1000,30 @@ pub async fn handle_load_model(
     use_mmap: bool,
     memory_budget_percent: u8,
 ) -> ModelLoadResponse {
+    handle_load_model_with_moe(
+        manager,
+        request,
+        api_host,
+        api_port,
+        binary_path,
+        use_mmap,
+        memory_budget_percent,
+        &crate::config::MoeConfig::default(),
+    )
+    .await
+}
+
+/// Load a model, selecting llama-server or bmoe-cli based on GGUF + MoE policy.
+pub async fn handle_load_model_with_moe(
+    manager: &crate::supervisor::SupervisorManager,
+    request: &ModelLoadRequest,
+    api_host: &str,
+    api_port: u16,
+    binary_path: &std::path::Path,
+    use_mmap: bool,
+    memory_budget_percent: u8,
+    moe: &crate::config::MoeConfig,
+) -> ModelLoadResponse {
     if request.protocol_version != CONTROL_PLANE_VERSION {
         return ModelLoadResponse {
             protocol_version: CONTROL_PLANE_VERSION,
@@ -1026,6 +1057,61 @@ pub async fn handle_load_model(
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| request.model_path.clone());
 
+    let port = request.target_port.unwrap_or(api_port);
+    let profile = crate::sysinfo::SystemProfile::probe();
+    let gguf = crate::gguf::GgufMetadata::open(&model_path).ok();
+    let backend_pref = request.backend.trim().to_ascii_lowercase();
+    let force_bmoe = backend_pref == "bmoe";
+    let force_llama = backend_pref == "llama" || backend_pref == "llama-server";
+    // Never inject RPC workers into a bmoe stream session.
+    let want_bmoe = if force_llama {
+        false
+    } else if force_bmoe {
+        true
+    } else if let Some(ref meta) = gguf {
+        request.rpc_workers.is_empty()
+            && crate::bmoe_client::should_use_bmoe(
+                meta,
+                &profile,
+                moe,
+                request.context_size,
+                memory_budget_percent,
+            )
+    } else {
+        false
+    };
+
+    if want_bmoe {
+        let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
+            std::path::PathBuf::from(&moe.bmoe_binary),
+            model_path.clone(),
+            api_host,
+            port,
+            request.context_size,
+            request.threads,
+            moe.clone(),
+            &profile,
+            memory_budget_percent,
+            request.tags.clone(),
+        );
+        return match manager.spawn_bmoe(bmoe_cfg).await {
+            Ok(slot_port) => ModelLoadResponse {
+                protocol_version: CONTROL_PLANE_VERSION,
+                success: true,
+                active_model: model_name,
+                api_endpoint: format!("http://{}:{}", api_host, slot_port),
+                error_message: None,
+            },
+            Err(e) => ModelLoadResponse {
+                protocol_version: CONTROL_PLANE_VERSION,
+                success: false,
+                active_model: String::new(),
+                api_endpoint: String::new(),
+                error_message: Some(e.to_string()),
+            },
+        };
+    }
+
     let mut extra_args = Vec::new();
     for worker in &request.rpc_workers {
         extra_args.push("--rpc".to_string());
@@ -1034,7 +1120,6 @@ pub async fn handle_load_model(
         extra_args.push("layer".to_string());
     }
 
-    let port = request.target_port.unwrap_or(api_port);
     let config = crate::supervisor::LlamaServerConfig {
         binary_path: binary_path.to_path_buf(),
         model_path,

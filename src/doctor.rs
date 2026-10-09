@@ -75,7 +75,7 @@ impl DoctorReport {
 
 /// Run diagnostic probes against `config`. External binaries missing → WARN (not FAIL).
 pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
-    let checks = vec![
+    let mut checks = vec![
         check_config(config),
         check_binary_on_path("llama-server", &config.node.llama_server_binary),
         check_binary_on_path("rpc-server", &config.node.rpc_server_binary),
@@ -89,8 +89,40 @@ pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
         check_log_dir(),
         check_display_name(config),
     ];
+    if config.inference.moe.enabled {
+        checks.push(check_binary_on_path(
+            "bmoe-cli",
+            &config.inference.moe.bmoe_binary,
+        ));
+        checks.push(check_moe_config(config));
+    }
 
     DoctorReport { checks }
+}
+
+fn check_moe_config(config: &NexusConfig) -> DoctorCheck {
+    match config.inference.moe.validate() {
+        Ok(()) => {
+            let profile = SystemProfile::probe();
+            let ceil = config.inference.moe.derive_cache_ceil_mb(
+                profile.available_ram_mb,
+                config.hardware.safety.max_ram_usage_percent,
+            );
+            DoctorCheck {
+                name: "moe-stream",
+                severity: CheckSeverity::Ok,
+                detail: format!(
+                    "enabled (cache_mb={}, derived_ceil_mb={}, quality={:?})",
+                    config.inference.moe.cache_mb, ceil, config.inference.moe.quality_mode
+                ),
+            }
+        }
+        Err(e) => DoctorCheck {
+            name: "moe-stream",
+            severity: CheckSeverity::Fail,
+            detail: e.to_string(),
+        },
+    }
 }
 
 fn check_config(config: &NexusConfig) -> DoctorCheck {

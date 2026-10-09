@@ -656,6 +656,8 @@ async fn test_cluster_view_interactions() {
         thermal_index: 45,
         active_model: "llama-3.2-3b.gguf".to_string(),
         display_name: String::new(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: std::time::Instant::now(),
     };
     let peer2 = PeerNode {
@@ -672,6 +674,8 @@ async fn test_cluster_view_interactions() {
         thermal_index: 30,
         active_model: String::new(),
         display_name: String::new(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: std::time::Instant::now(),
     };
 
@@ -873,6 +877,8 @@ async fn test_cluster_view_link_quality_visuals() {
         thermal_index: 25,
         active_model: "phi-4-mini".to_string(),
         display_name: String::new(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: std::time::Instant::now(),
     };
     cluster.peers.push(peer);

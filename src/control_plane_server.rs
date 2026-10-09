@@ -6,10 +6,9 @@
 
 use crate::config::NexusConfig;
 use crate::control_plane::{
-    blob_url, build_control_plane_state_with_host, build_model_catalog, handle_load_model,
-    handle_unload_model, BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest,
-    ModelLoadRequest, ModelUnloadRequest, PairRequest, PairResponse, CONTROL_PLANE_VERSION,
-    MAX_CONTROL_RESPONSE_BYTES,
+    blob_url, build_control_plane_state_with_host, build_model_catalog, handle_unload_model,
+    BlobFetchRequest, BlobFetchResponse, ControlPlaneRequest, ModelLoadRequest, ModelUnloadRequest,
+    PairRequest, PairResponse, CONTROL_PLANE_VERSION, MAX_CONTROL_RESPONSE_BYTES,
 };
 use crate::discovery::{DiscoveryService, NodeRole, StatusFlags};
 use crate::downloader::{DownloadAuth, ModelDownloader};
@@ -98,13 +97,23 @@ impl ControlPlaneContext {
         Self {
             node_id,
             role,
-            capabilities: vec![
-                "inference".to_string(),
-                "catalog".to_string(),
-                "blob".to_string(),
-                "embeddings".to_string(),
-                "kb".to_string(),
-            ],
+            capabilities: {
+                let mut caps = vec![
+                    "inference".to_string(),
+                    "catalog".to_string(),
+                    "blob".to_string(),
+                    "embeddings".to_string(),
+                    "kb".to_string(),
+                ];
+                if config
+                    .read()
+                    .map(|c| c.inference.moe.enabled)
+                    .unwrap_or(true)
+                {
+                    caps.push("moe_stream".to_string());
+                }
+                caps
+            },
             supervisor,
             api_host: api_host.into(),
             api_port,
@@ -658,7 +667,12 @@ async fn handle_load(
         }
     };
 
-    let response = handle_load_model(
+    let moe = ctx
+        .config
+        .read()
+        .map(|c| c.inference.moe.clone())
+        .unwrap_or_default();
+    let response = crate::control_plane::handle_load_model_with_moe(
         &ctx.supervisor,
         &request,
         &ctx.api_host,
@@ -666,6 +680,7 @@ async fn handle_load(
         &ctx.binary_path,
         ctx.use_mmap,
         ctx.memory_budget_percent,
+        &moe,
     )
     .await;
 

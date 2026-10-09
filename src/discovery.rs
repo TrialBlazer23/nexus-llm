@@ -322,6 +322,12 @@ pub struct PeerNode {
     /// From mDNS TXT `name=` when available; empty for UDP-only peers.
     #[serde(default)]
     pub display_name: String,
+    /// Peer can host BigMoeOnEdge flash-streaming MoE sessions.
+    #[serde(default)]
+    pub moe_stream: bool,
+    /// Optional advertised MoE expert-cache ceiling (MiB); 0 = unknown.
+    #[serde(default)]
+    pub moe_cache_ceil_mb: u32,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
 }
@@ -890,6 +896,10 @@ impl DiscoveryService {
                                         thermal_index: beacon.thermal_index,
                                         active_model: beacon.active_model,
                                         display_name,
+                                        moe_stream: existing.map(|p| p.moe_stream).unwrap_or(false),
+                                        moe_cache_ceil_mb: existing
+                                            .map(|p| p.moe_cache_ceil_mb)
+                                            .unwrap_or(0),
                                         last_seen: Instant::now(),
                                     };
 
@@ -1242,6 +1252,11 @@ impl DiscoveryService {
                 thermal_index: 0,
                 active_model: String::new(),
                 display_name: endpoint.display_name.clone(),
+                moe_stream: endpoint
+                    .capabilities
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case("moe_stream")),
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             };
             peers.insert(endpoint.node_id, peer.clone());

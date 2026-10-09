@@ -116,6 +116,8 @@ async fn gateway_routes_stream_to_matching_peer() {
         thermal_index: 20,
         active_model: "model-a".into(),
         display_name: "peer-a".into(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: Instant::now(),
     };
     let peer_b = PeerNode {
@@ -132,6 +134,8 @@ async fn gateway_routes_stream_to_matching_peer() {
         thermal_index: 30,
         active_model: "model-b".into(),
         display_name: "peer-b".into(),
+        moe_stream: false,
+        moe_cache_ceil_mb: 0,
         last_seen: Instant::now(),
     };
 
@@ -240,6 +244,8 @@ async fn gateway_prefers_local_over_peer() {
                 thermal_index: 10,
                 active_model: "shared-model".into(),
                 display_name: "remote".into(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );
@@ -366,6 +372,8 @@ async fn gateway_skips_untrusted_peer_when_pairing_enforced() {
                 thermal_index: 10,
                 active_model: "secret-model".into(),
                 display_name: "untrusted".into(),
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
                 last_seen: Instant::now(),
             },
         );

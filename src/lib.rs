@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod bmoe_client;
 pub mod client;
 pub mod cluster;
 pub mod config;

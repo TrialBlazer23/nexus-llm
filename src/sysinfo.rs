@@ -276,6 +276,131 @@ impl SystemProfile {
         }
         safe
     }
+
+    /// LMK guard for MoE flash-streaming: resident weights + expert cache + KV.
+    ///
+    /// Does **not** refuse solely because the full GGUF file exceeds RAM.
+    pub fn can_safely_moe_stream(
+        &self,
+        gguf: &crate::gguf::GgufMetadata,
+        context_size: usize,
+        cache_mb: u64,
+    ) -> bool {
+        self.can_safely_moe_stream_pct(gguf, context_size, cache_mb, 75)
+    }
+
+    pub fn can_safely_moe_stream_pct(
+        &self,
+        gguf: &crate::gguf::GgufMetadata,
+        context_size: usize,
+        cache_mb: u64,
+        percent: u8,
+    ) -> bool {
+        let total_required = gguf.moe_stream_footprint_bytes(context_size, cache_mb);
+        let max_allowed = self.max_allowed_memory_bytes_pct(percent);
+        let safe = total_required <= max_allowed;
+        if !safe {
+            warn!(
+                "MoE stream LMK Guard tripped! Required: {} MB (resident+cache+KV), Max Allowed ({}% of Avail {} MB): {} MB",
+                total_required / (1024 * 1024),
+                percent.clamp(1, 100),
+                self.available_ram_mb,
+                max_allowed / (1024 * 1024)
+            );
+        }
+        safe
+    }
+
+    /// Prefer MoE stream when the model is streamable, dense load fails LMK, and stream fits.
+    pub fn should_prefer_moe_stream(
+        &self,
+        gguf: &crate::gguf::GgufMetadata,
+        context_size: usize,
+        cache_mb: u64,
+        percent: u8,
+        moe_enabled: bool,
+    ) -> bool {
+        if !moe_enabled || !gguf.streamable_moe() {
+            return false;
+        }
+        if self.can_safely_load_gguf_pct(gguf, context_size, percent) {
+            return false; // dense/resident path is fine
+        }
+        self.can_safely_moe_stream_pct(gguf, context_size, cache_mb, percent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::{GgufMetadata, GgufTensorInfo};
+    use std::collections::HashMap;
+
+    fn streamable_moe_gguf(file_gb: u64) -> GgufMetadata {
+        let expert = GgufTensorInfo {
+            name: "blk.0.ffn_gate_exps.weight".into(),
+            n_dims: 2,
+            dims: [32, 64, 0, 0],
+            ggml_type: 2,
+            offset: 0,
+            nbytes: file_gb.saturating_mul(700) * 1024 * 1024 / 1000, // ~70% experts
+            layer_index: Some(0),
+        };
+        let dense = GgufTensorInfo {
+            name: "blk.0.attn_q.weight".into(),
+            n_dims: 2,
+            dims: [32, 64, 0, 0],
+            ggml_type: 2,
+            offset: 100,
+            nbytes: file_gb.saturating_mul(300) * 1024 * 1024 / 1000, // ~30% dense
+            layer_index: Some(0),
+        };
+        GgufMetadata {
+            version: 3,
+            tensor_count: 2,
+            kv_count: 0,
+            metadata: HashMap::new(),
+            architecture: Some("qwen3moe".into()),
+            model_name: Some("big-moe".into()),
+            context_length: Some(4096),
+            block_count: Some(1),
+            head_count: Some(8),
+            head_count_kv: Some(8),
+            embedding_length: Some(512),
+            expert_count: Some(128),
+            expert_used_count: Some(8),
+            file_size_bytes: file_gb * 1024 * 1024 * 1024,
+            tensors: vec![expert, dense],
+            quant_label: Some("Q4_0".into()),
+        }
+    }
+
+    #[test]
+    fn moe_stream_guard_accepts_oversize_file_when_resident_fits() {
+        let profile = SystemProfile {
+            total_ram_mb: 12_000,
+            available_ram_mb: 10_000,
+            detected_backend: AccelerationBackend::ArmCpuDotProd,
+            recommended_threads: 4,
+        };
+        let gguf = streamable_moe_gguf(18); // 18 GB file on 12 GB phone
+        assert!(!profile.can_safely_load_gguf_pct(&gguf, 2048, 75));
+        assert!(profile.can_safely_moe_stream_pct(&gguf, 2048, 2000, 75));
+        assert!(profile.should_prefer_moe_stream(&gguf, 2048, 2000, 75, true));
+        assert!(!profile.should_prefer_moe_stream(&gguf, 2048, 2000, 75, false));
+    }
+
+    #[test]
+    fn moe_stream_guard_rejects_when_cache_too_large() {
+        let profile = SystemProfile {
+            total_ram_mb: 4_000,
+            available_ram_mb: 2_000,
+            detected_backend: AccelerationBackend::GenericCpu,
+            recommended_threads: 2,
+        };
+        let gguf = streamable_moe_gguf(18);
+        assert!(!profile.can_safely_moe_stream_pct(&gguf, 4096, 8000, 75));
+    }
 }
 
 /// Free disk bytes available on the filesystem that contains `path` (Linux/`statvfs`, Bionic-safe).

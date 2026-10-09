@@ -146,10 +146,38 @@ impl GgufTensorInfo {
         self.layer_index.is_some()
     }
 
+    /// True for MoE expert weight tensors (routed experts BigMoe streams from flash).
+    pub fn is_expert_tensor(&self) -> bool {
+        let n = self.name.as_str();
+        n.contains("ffn_gate_exps")
+            || n.contains("ffn_up_exps")
+            || n.contains("ffn_down_exps")
+            || n.contains("ffn_gate_up_exps")
+            || n.contains("_exps.weight")
+            || n.contains(".exps.")
+    }
+
     pub fn quant_label(&self) -> &'static str {
         ggml_type_name(self.ggml_type)
     }
 }
+
+/// Architectures known to stream via BigMoeOnEdge (registry families).
+pub const STREAMABLE_MOE_ARCHITECTURES: &[&str] = &[
+    "qwen3moe",
+    "qwen35moe",
+    "qwen2moe",
+    "gemma4",
+    "gpt-oss",
+    "gpt_oss",
+    "nemotron_h_moe",
+    "lfm2moe",
+    "deepseek4",
+    "bailingmoe3",
+    "qwen4exp",
+    "deepseek2",
+    "deepseek3",
+];
 
 /// Parsed metadata extracted from a GGUF file header without loading weights into RAM.
 #[derive(Debug, Clone)]
@@ -165,6 +193,10 @@ pub struct GgufMetadata {
     pub head_count: Option<usize>,
     pub head_count_kv: Option<usize>,
     pub embedding_length: Option<usize>,
+    /// Total routed experts per MoE layer (`{arch}.expert_count`), when present.
+    pub expert_count: Option<usize>,
+    /// Top-k experts used per token (`{arch}.expert_used_count`), when present.
+    pub expert_used_count: Option<usize>,
     pub file_size_bytes: u64,
     /// Tensor info section (empty if parse stopped early / no tensors requested).
     pub tensors: Vec<GgufTensorInfo>,
@@ -272,6 +304,17 @@ impl GgufMetadata {
             .get(&format!("{arch_prefix}.embedding_length"))
             .and_then(|v| v.as_usize());
 
+        let expert_count = metadata
+            .get(&format!("{arch_prefix}.expert_count"))
+            .or_else(|| metadata.get(&format!("{arch_prefix}.expert_count_per_tok")))
+            .and_then(|v| v.as_usize());
+
+        let expert_used_count = metadata
+            .get(&format!("{arch_prefix}.expert_used_count"))
+            .or_else(|| metadata.get(&format!("{arch_prefix}.expert_used_count_per_tok")))
+            .and_then(|v| v.as_usize());
+
+        // Tensor info follows KV metadata immediately (no forced 32-byte align in this parser).
         let mut tensors = Vec::new();
         if tensor_count > 0 {
             tensors.reserve(tensor_count.min(65_536) as usize);
@@ -321,6 +364,8 @@ impl GgufMetadata {
             head_count,
             head_count_kv,
             embedding_length,
+            expert_count,
+            expert_used_count,
             file_size_bytes: 0,
             tensors,
             quant_label,
@@ -392,6 +437,70 @@ impl GgufMetadata {
         self.block_count.is_some_and(|n| n > 0)
             && self.head_count.is_some_and(|n| n > 0)
             && self.embedding_length.is_some_and(|n| n > 0)
+    }
+
+    /// True when this GGUF looks like a Mixture-of-Experts model.
+    pub fn is_moe(&self) -> bool {
+        if self.expert_count.is_some_and(|n| n > 1) {
+            return true;
+        }
+        if let Some(arch) = self.architecture.as_deref() {
+            let lower = arch.to_ascii_lowercase();
+            if STREAMABLE_MOE_ARCHITECTURES
+                .iter()
+                .any(|a| lower == *a || lower.contains("moe"))
+            {
+                return true;
+            }
+        }
+        self.tensors.iter().any(|t| t.is_expert_tensor())
+    }
+
+    /// True when BigMoeOnEdge can stream this architecture's experts from flash.
+    pub fn streamable_moe(&self) -> bool {
+        if !self.is_moe() {
+            return false;
+        }
+        let Some(arch) = self.architecture.as_deref() else {
+            // Expert tensors present but unknown arch — allow stream attempt.
+            return self.tensors.iter().any(|t| t.is_expert_tensor());
+        };
+        let lower = arch.to_ascii_lowercase();
+        STREAMABLE_MOE_ARCHITECTURES.iter().any(|a| lower == *a)
+            || lower.contains("moe")
+            || self.tensors.iter().any(|t| t.is_expert_tensor())
+    }
+
+    /// Bytes in routed expert weight tensors (flash-backed under `--moe-stream`).
+    pub fn expert_weight_bytes(&self) -> u64 {
+        self.tensors
+            .iter()
+            .filter(|t| t.is_expert_tensor())
+            .map(|t| t.nbytes)
+            .sum()
+    }
+
+    /// Bytes that remain RAM-resident under MoE flash streaming (non-expert weights).
+    ///
+    /// Shared / leading-dense / attention / embeddings stay resident; expert banks stream.
+    pub fn moe_resident_weight_bytes(&self) -> u64 {
+        if self.tensors.is_empty() {
+            // Without tensor info, assume ~35% of file is dense/shared (conservative).
+            return self.file_size_bytes.saturating_mul(35) / 100;
+        }
+        self.tensors
+            .iter()
+            .filter(|t| !t.is_expert_tensor())
+            .map(|t| t.nbytes)
+            .sum()
+    }
+
+    /// Estimated anonymous RAM for MoE stream mode: resident weights + expert cache + KV.
+    pub fn moe_stream_footprint_bytes(&self, context_size: usize, cache_mb: u64) -> u64 {
+        let resident = self.moe_resident_weight_bytes();
+        let cache_bytes = cache_mb.saturating_mul(1024 * 1024);
+        let kv = self.exact_kv_cache_bytes(context_size);
+        resident.saturating_add(cache_bytes).saturating_add(kv)
     }
 }
 
@@ -801,6 +910,8 @@ mod tests {
             head_count: Some(12),
             head_count_kv: Some(12),
             embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
             file_size_bytes: 0,
             tensors: vec![],
             quant_label: None,
@@ -842,5 +953,79 @@ mod tests {
         assert_eq!(meta.architecture.as_deref(), Some("llama"));
         assert_eq!(meta.tensors.len(), 1);
         assert_eq!(meta.tensors[0].name, "token_embd.weight");
+    }
+
+    #[test]
+    fn parses_moe_expert_metadata() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes()); // 2 tensors
+        buf.extend_from_slice(&3u64.to_le_bytes()); // 3 KVs
+        write_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_string(&mut buf, "qwen3moe");
+        write_string(&mut buf, "qwen3moe.expert_count");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&128u32.to_le_bytes());
+        write_string(&mut buf, "qwen3moe.expert_used_count");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        write_string(&mut buf, "blk.0.ffn_gate_exps.weight");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&32u64.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        write_string(&mut buf, "blk.0.attn_q.weight");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&32u64.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&100u64.to_le_bytes());
+
+        let meta = GgufMetadata::read(&mut Cursor::new(buf)).expect("parse moe");
+        assert_eq!(meta.architecture.as_deref(), Some("qwen3moe"));
+        assert_eq!(meta.expert_count, Some(128));
+        assert_eq!(meta.expert_used_count, Some(8));
+        assert!(meta.is_moe());
+        assert!(meta.streamable_moe());
+        assert!(meta.tensors[0].is_expert_tensor());
+        assert!(!meta.tensors[1].is_expert_tensor());
+        assert_eq!(meta.expert_weight_bytes(), meta.tensors[0].nbytes);
+        assert_eq!(meta.moe_resident_weight_bytes(), meta.tensors[1].nbytes);
+        let footprint = meta.moe_stream_footprint_bytes(2048, 2000);
+        // Stream footprint uses resident (non-expert) weights + cache, not full file.
+        assert_eq!(
+            footprint,
+            meta.moe_resident_weight_bytes() + 2000 * 1024 * 1024 + meta.exact_kv_cache_bytes(2048)
+        );
+        assert!(meta.moe_resident_weight_bytes() < meta.weights_bytes());
+    }
+
+    #[test]
+    fn dense_arch_not_streamable_moe() {
+        let meta = GgufMetadata {
+            version: 3,
+            tensor_count: 0,
+            kv_count: 0,
+            metadata: HashMap::new(),
+            architecture: Some("llama".into()),
+            model_name: None,
+            context_length: Some(4096),
+            block_count: Some(28),
+            head_count: Some(12),
+            head_count_kv: Some(12),
+            embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
+            file_size_bytes: 10_000_000_000,
+            tensors: vec![],
+            quant_label: None,
+        };
+        assert!(!meta.is_moe());
+        assert!(!meta.streamable_moe());
     }
 }

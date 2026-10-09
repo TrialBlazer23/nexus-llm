@@ -46,10 +46,21 @@ impl LinkQuality {
 /// Where / how a model would run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanTarget {
-    LocalGpu { ngl: u32 },
+    LocalGpu {
+        ngl: u32,
+    },
     LocalCpu,
-    Remote { peer_name: String },
-    Distributed { worker_names: Vec<String> },
+    /// Local BigMoeOnEdge flash-streaming MoE session.
+    LocalMoeStream {
+        cache_mb: u64,
+        ceil_mb: u64,
+    },
+    Remote {
+        peer_name: String,
+    },
+    Distributed {
+        worker_names: Vec<String>,
+    },
 }
 
 /// Ranked execution option for the operator.
@@ -75,6 +86,8 @@ pub struct PlacementCandidate {
     pub link: LinkQuality,
     pub is_local: bool,
     pub thermal_index: u8,
+    /// Peer advertises BigMoe flash-stream capability.
+    pub moe_stream: bool,
 }
 
 /// Inputs to the placement planner.
@@ -89,6 +102,10 @@ pub struct PlacementRequest<'a> {
     pub enable_rpc: bool,
     /// Optional Phase 12 §5.5 measured throughput store.
     pub bench: Option<&'a BenchStore>,
+    /// When true, consider LocalMoeStream for streamable MoE GGUFs.
+    pub moe_stream_enabled: bool,
+    /// Expert cache ceiling (MiB) for MoE stream plans (`0` = derive ~45% of local LMK budget).
+    pub moe_cache_ceil_mb: u64,
 }
 
 /// Rank execution plans by predicted tokens/sec (descending).
@@ -199,6 +216,57 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 llama_extra_args: vec![],
                 gpu_layers: 0,
             });
+        }
+    }
+
+    // --- Local MoE flash-stream (prefer over dense RPC for streamable MoE) ---
+    if req.moe_stream_enabled && req.gguf.streamable_moe() {
+        let ceil = if req.moe_cache_ceil_mb > 0 {
+            req.moe_cache_ceil_mb
+        } else {
+            ((local_budget_mb.saturating_mul(45)) / 100)
+                .max(2000)
+                .min(local_budget_mb)
+        };
+        let cache_mb = if ceil >= 2000 { ceil } else { 0 };
+        let stream_ok = req.local_profile.can_safely_moe_stream_pct(
+            req.gguf,
+            req.policy.context_size,
+            cache_mb.max(2000),
+            req.policy.max_ram_usage_percent,
+        );
+        if stream_ok {
+            let dense_fits = req.local_profile.can_safely_load_gguf_pct(
+                req.gguf,
+                req.policy.context_size,
+                req.policy.max_ram_usage_percent,
+            );
+            // Only advertise MoE stream when dense local would fail LMK.
+            if !dense_fits {
+                let mut mem =
+                    MemoryPlan::from_gguf(req.gguf, &req.local_profile, &req.policy, false);
+                mem.remediations.insert(
+                    0,
+                    super::memory::Remediation::EnableMoeStream {
+                        cache_ceil_mb: ceil,
+                    },
+                );
+                // Flash-I/O-bound phone baseline (~1–3 tok/s class); prefer over RPC.
+                let tok = 2.2_f32;
+                plans.push(ExecutionPlan {
+                    target: PlanTarget::LocalMoeStream {
+                        cache_mb,
+                        ceil_mb: ceil,
+                    },
+                    memory: mem,
+                    split: None,
+                    context_size: req.policy.context_size,
+                    predicted_tok_s: tok,
+                    link_notes: vec![format!("moe-stream cache-ceil={ceil}MB")],
+                    llama_extra_args: vec![],
+                    gpu_layers: 0,
+                });
+            }
         }
     }
 
@@ -352,6 +420,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
             std::cmp::Ordering::Equal => {
                 let score = |t: &PlanTarget| match t {
                     PlanTarget::LocalGpu { .. } => 3,
+                    PlanTarget::LocalMoeStream { .. } => 3,
                     PlanTarget::LocalCpu => 2,
                     PlanTarget::Remote { .. } => 1,
                     PlanTarget::Distributed { .. } => 0,
@@ -473,6 +542,8 @@ mod tests {
             head_count: Some(12),
             head_count_kv: Some(12),
             embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
             file_size_bytes: 900_000_000,
             tensors: vec![],
             quant_label: Some("Q4_K".into()),
@@ -502,6 +573,9 @@ mod tests {
             local_name: "local".into(),
             local_gpu_layers: 99,
             enable_rpc: true,
+            bench: None,
+            moe_stream_enabled: true,
+            moe_cache_ceil_mb: 0,
             candidates: vec![PlacementCandidate {
                 name: "desktop".into(),
                 budget: NodeBudget::new(Uuid::new_v4(), "desktop", 24_000),
@@ -510,8 +584,8 @@ mod tests {
                 link: LinkQuality::unknown(),
                 is_local: false,
                 thermal_index: 20,
+                moe_stream: false,
             }],
-            bench: None,
         };
         let plans = rank_execution_plans(&req).expect("plans");
         assert!(!plans.is_empty());

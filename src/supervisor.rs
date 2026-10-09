@@ -1,3 +1,4 @@
+use crate::bmoe_client::{BmoeError, BmoeRuntime, BmoeSessionConfig};
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,16 @@ pub enum SupervisorError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("bmoe session error: {0}")]
+    Bmoe(#[from] BmoeError),
+}
+
+/// Which inference engine currently owns a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceBackendKind {
+    LlamaServer,
+    BmoeSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -700,6 +711,8 @@ pub struct SupervisorSlotInfo {
 #[derive(Clone)]
 pub struct SupervisorManager {
     inner: std::sync::Arc<tokio::sync::Mutex<HashMap<SlotId, ProcessSupervisor>>>,
+    /// Optional BigMoeOnEdge flash-streaming session (at most one for v1).
+    bmoe: std::sync::Arc<tokio::sync::Mutex<Option<BmoeRuntime>>>,
     base_port: u16,
     policy: SupervisorPolicy,
     restart_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -721,6 +734,7 @@ impl SupervisorManager {
     pub fn with_base_port(base_port: u16) -> Self {
         Self {
             inner: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bmoe: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             base_port,
             policy: SupervisorPolicy::default(),
             restart_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -743,12 +757,22 @@ impl SupervisorManager {
 
     /// True when any supervisor child process slot is occupied (may still be starting).
     pub async fn is_running(&self) -> bool {
+        if self.bmoe.lock().await.is_some() {
+            return true;
+        }
         let lock = self.inner.lock().await;
         !lock.is_empty()
     }
 
     /// Non-async check for UI rendering (best-effort; treats a held lock as running).
     pub fn is_running_blocking(&self) -> bool {
+        if let Ok(guard) = self.bmoe.try_lock() {
+            if guard.is_some() {
+                return true;
+            }
+        } else {
+            return true;
+        }
         match self.inner.try_lock() {
             Ok(guard) => !guard.is_empty(),
             Err(_) => true,
@@ -757,6 +781,11 @@ impl SupervisorManager {
 
     /// Check if at least one supervisor child process is currently running and healthy.
     pub async fn is_healthy(&self) -> bool {
+        if let Some(bmoe) = self.bmoe.lock().await.as_ref() {
+            if bmoe.is_ready() {
+                return true;
+            }
+        }
         let lock = self.inner.lock().await;
         if lock.is_empty() {
             return false;
@@ -767,6 +796,27 @@ impl SupervisorManager {
             }
         }
         false
+    }
+
+    /// True when the active inference backend is BigMoe flash streaming.
+    pub async fn is_bmoe_active(&self) -> bool {
+        self.bmoe
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|b| b.is_ready())
+    }
+
+    pub async fn active_backend_kind(&self) -> Option<InferenceBackendKind> {
+        if self.is_bmoe_active().await {
+            return Some(InferenceBackendKind::BmoeSession);
+        }
+        let lock = self.inner.lock().await;
+        if lock.is_empty() {
+            None
+        } else {
+            Some(InferenceBackendKind::LlamaServer)
+        }
     }
 
     /// Check if a specific supervisor slot is healthy.
@@ -781,6 +831,9 @@ impl SupervisorManager {
 
     /// Return the active model path/name if currently running (primary/first slot).
     pub async fn active_model(&self) -> Option<String> {
+        if let Some(bmoe) = self.bmoe.lock().await.as_ref() {
+            return Some(bmoe.model_name());
+        }
         let lock = self.inner.lock().await;
         lock.values().next().map(|sup| {
             sup.config()
@@ -793,44 +846,64 @@ impl SupervisorManager {
 
     /// Return all active model names mapped by their slot/port ID.
     pub async fn active_models(&self) -> Vec<(SlotId, String)> {
+        let mut out = Vec::new();
+        if let Some(bmoe) = self.bmoe.lock().await.as_ref() {
+            out.push((bmoe.config.port, bmoe.model_name()));
+        }
         let lock = self.inner.lock().await;
-        lock.iter()
-            .map(|(&slot, sup)| {
-                let name = sup
-                    .config()
-                    .model_path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "active_model".to_string());
-                (slot, name)
-            })
-            .collect()
+        out.extend(lock.iter().map(|(&slot, sup)| {
+            let name = sup
+                .config()
+                .model_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "active_model".to_string());
+            (slot, name)
+        }));
+        out
     }
 
     /// Return structured information about all loaded supervisor slots.
     pub async fn slots_info(&self) -> Vec<SupervisorSlotInfo> {
+        let mut out = Vec::new();
+        if let Some(bmoe) = self.bmoe.lock().await.as_ref() {
+            out.push(SupervisorSlotInfo {
+                slot: bmoe.config.port,
+                model_name: bmoe.model_name(),
+                model_path: bmoe.config.model_path.clone(),
+                port: bmoe.config.port,
+                tags: bmoe.config.tags.clone(),
+                context_size: bmoe.config.context_size,
+                state: if bmoe.is_ready() {
+                    SupervisorState::Ready
+                } else {
+                    SupervisorState::Starting
+                },
+                backend: AccelerationBackend::ArmCpuDotProd,
+                memory_bytes: bmoe.config.cache_ceil_mb.saturating_mul(1024 * 1024),
+            });
+        }
         let lock = self.inner.lock().await;
-        lock.iter()
-            .map(|(&slot, sup)| {
-                let model_name = sup
-                    .config()
-                    .model_path
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "active_model".to_string());
-                SupervisorSlotInfo {
-                    slot,
-                    model_name,
-                    model_path: sup.config().model_path.clone(),
-                    port: sup.config().port,
-                    tags: sup.config().tags.clone(),
-                    context_size: sup.config().context_size,
-                    state: sup.state(),
-                    backend: sup.active_backend(),
-                    memory_bytes: sup.estimated_memory_bytes(),
-                }
-            })
-            .collect()
+        out.extend(lock.iter().map(|(&slot, sup)| {
+            let model_name = sup
+                .config()
+                .model_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "active_model".to_string());
+            SupervisorSlotInfo {
+                slot,
+                model_name,
+                model_path: sup.config().model_path.clone(),
+                port: sup.config().port,
+                tags: sup.config().tags.clone(),
+                context_size: sup.config().context_size,
+                state: sup.state(),
+                backend: sup.active_backend(),
+                memory_bytes: sup.estimated_memory_bytes(),
+            }
+        }));
+        out
     }
 
     /// Total memory in megabytes committed across all loaded models.
@@ -942,6 +1015,39 @@ impl SupervisorManager {
         Ok(target_port)
     }
 
+    /// Spawn a BigMoeOnEdge flash-streaming session (replaces any prior bmoe or llama slot on port).
+    pub async fn spawn_bmoe(&self, config: BmoeSessionConfig) -> Result<SlotId, SupervisorError> {
+        // Stop prior bmoe session.
+        {
+            let mut bmoe = self.bmoe.lock().await;
+            if let Some(mut prev) = bmoe.take() {
+                let _ = prev.stop().await;
+            }
+        }
+        // Stop llama-server on the same port if present (single active holder).
+        {
+            let mut lock = self.inner.lock().await;
+            if let Some(mut existing) = lock.remove(&config.port) {
+                let _ = existing.stop().await;
+            }
+            // Also clear other llama slots so gateway has one clear holder.
+            for (_, mut sup) in lock.drain() {
+                let _ = sup.stop().await;
+            }
+        }
+        {
+            let mut configs = self.last_configs.lock().await;
+            configs.clear();
+        }
+
+        let port = config.port;
+        let runtime = BmoeRuntime::spawn(config).await?;
+        *self.bmoe.lock().await = Some(runtime);
+        self.restart_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        Ok(port)
+    }
+
     /// Restart the last config with backoff; demote GPU after repeated Vulkan failures.
     pub async fn restart_with_backoff(&self) -> Result<(), SupervisorError> {
         let attempt = self
@@ -979,8 +1085,14 @@ impl SupervisorManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Stop all active model supervisors.
+    /// Stop all active model supervisors (llama-server slots and bmoe session).
     pub async fn stop(&self) -> Result<(), SupervisorError> {
+        {
+            let mut bmoe = self.bmoe.lock().await;
+            if let Some(mut runtime) = bmoe.take() {
+                let _ = runtime.stop().await;
+            }
+        }
         let mut lock = self.inner.lock().await;
         for (_, mut existing) in lock.drain() {
             let _ = existing.stop().await;
@@ -1003,6 +1115,20 @@ impl SupervisorManager {
 
     /// Stop a model matching a model name, path, or port string.
     pub async fn stop_model(&self, target: &str) -> Result<bool, SupervisorError> {
+        {
+            let mut bmoe = self.bmoe.lock().await;
+            if let Some(runtime) = bmoe.as_ref() {
+                let name = runtime.model_name();
+                let path = runtime.config.model_path.to_string_lossy();
+                let port = runtime.config.port.to_string();
+                if name == target || path == target || port == target || target.ends_with(&name) {
+                    if let Some(mut runtime) = bmoe.take() {
+                        runtime.stop().await?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
         let mut lock = self.inner.lock().await;
         let matched_slot = lock.iter().find_map(|(&slot, sup)| {
             let model_name = sup

@@ -197,6 +197,7 @@ impl NexusConfig {
             ));
         }
         // No global 1800 MB ceiling — worker caps are per-node (Phase 11 §3.3).
+        self.inference.moe.validate()?;
         Ok(())
     }
 
@@ -359,6 +360,198 @@ fn default_battery_action() -> String {
 pub struct InferenceConfig {
     #[serde(default)]
     pub cache: PromptCacheConfig,
+
+    /// MoE flash-streaming backend (BigMoeOnEdge `bmoe-cli`). Phase 16.
+    #[serde(default)]
+    pub moe: MoeConfig,
+}
+
+/// Quality mode for MoE streaming knobs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MoeQualityMode {
+    /// Lossless: byte-identical to fully resident inference.
+    #[default]
+    Lossless,
+    /// Allows lossy / experimental knobs (non-reproducible).
+    Lossy,
+}
+
+/// BigMoeOnEdge expert-streaming configuration (`[inference.moe]`).
+///
+/// Distinct from [`PromptCacheConfig::max_cache_mb`] (prompt-slot *disk* quota).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MoeConfig {
+    /// When true, prefer `bmoe-cli --moe-stream` for streamable MoE GGUFs that exceed dense RAM.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Path or PATH name of the BigMoeOnEdge CLI binary.
+    #[serde(default = "default_bmoe_binary")]
+    pub bmoe_binary: String,
+
+    /// Expert LRU cache budget: `"auto"`, `"0"`, or an integer MiB string (≥2000 when set).
+    #[serde(default = "default_moe_cache_mb")]
+    pub cache_mb: String,
+
+    /// RAM left free under `auto` cache sizing (MiB).
+    #[serde(default = "default_moe_cache_floor_mb")]
+    pub cache_floor_mb: u64,
+
+    /// Cap for `auto` cache (MiB). `0` = derive from SystemProfile at load time.
+    #[serde(default)]
+    pub cache_ceil_mb: u64,
+
+    /// Parallel O_DIRECT read lanes (1–8).
+    #[serde(default = "default_moe_io_threads")]
+    pub io_threads: u8,
+
+    /// Dense weight residency: `mmap` | `warm` | `anon` | `ahwb`.
+    #[serde(default = "default_moe_dense_weights")]
+    pub dense_weights: String,
+
+    /// Overlap expert I/O with FFN compute (requires Helldez expert-ready llama.cpp build).
+    #[serde(default)]
+    pub overlap: bool,
+
+    /// Lossy: skip cold cache-miss experts below threshold (0.0–1.0 as percent*100 stored? use string).
+    /// Stored as basis points of the BigMoe `F` factor ×1000 for serde-eq friendliness; prefer string.
+    #[serde(default)]
+    pub drop_cold_experts: Option<String>,
+
+    /// Lossy: prefer cached experts within margin L.
+    #[serde(default)]
+    pub expert_substitute: Option<String>,
+
+    /// Lossy/experimental: commit routing N layers early.
+    #[serde(default)]
+    pub route_ahead: Option<u32>,
+
+    #[serde(default)]
+    pub quality_mode: MoeQualityMode,
+}
+
+impl Default for MoeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bmoe_binary: default_bmoe_binary(),
+            cache_mb: default_moe_cache_mb(),
+            cache_floor_mb: default_moe_cache_floor_mb(),
+            cache_ceil_mb: 0,
+            io_threads: default_moe_io_threads(),
+            dense_weights: default_moe_dense_weights(),
+            overlap: false,
+            drop_cold_experts: None,
+            expert_substitute: None,
+            route_ahead: None,
+            quality_mode: MoeQualityMode::Lossless,
+        }
+    }
+}
+
+impl MoeConfig {
+    /// Derive an effective cache ceiling (MiB) from the probed profile and LMK percent.
+    ///
+    /// Leaves headroom for OS / dense resident weights: roughly
+    /// `0.45 * max_allowed_mb` clamped to a sensible phone range when unset.
+    pub fn derive_cache_ceil_mb(&self, available_ram_mb: u64, max_ram_usage_percent: u8) -> u64 {
+        if self.cache_ceil_mb > 0 {
+            return self.cache_ceil_mb;
+        }
+        let pct = u64::from(max_ram_usage_percent.clamp(1, 100));
+        let max_allowed = available_ram_mb.saturating_mul(pct) / 100;
+        // Leave floor + dense working set; expert cache gets ~45% of LMK budget.
+        let derived = (max_allowed.saturating_mul(45) / 100)
+            .saturating_sub(self.cache_floor_mb.min(max_allowed / 4));
+        // BigMoe rejects 1..1499 unless forced; keep ceil at 0 or ≥2000.
+        if derived < 2000 {
+            if max_allowed >= 2500 {
+                2000
+            } else {
+                0 // cache off / auto will decide
+            }
+        } else {
+            derived.min(max_allowed.saturating_sub(self.cache_floor_mb))
+        }
+    }
+
+    /// Resolve `--cache-mb` CLI value (passes through `auto` / `0` / integer).
+    pub fn resolved_cache_mb_arg(&self) -> String {
+        let trimmed = self.cache_mb.trim();
+        if trimmed.is_empty() {
+            "auto".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// Whether lossy MoE knobs may be applied.
+    pub fn lossy_allowed(&self) -> bool {
+        matches!(self.quality_mode, MoeQualityMode::Lossy)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.bmoe_binary.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "inference.moe.bmoe_binary must not be empty".into(),
+            ));
+        }
+        if !(1..=8).contains(&self.io_threads) {
+            return Err(ConfigError::Invalid(
+                "inference.moe.io_threads must be 1..=8".into(),
+            ));
+        }
+        let dense = self.dense_weights.as_str();
+        if !matches!(dense, "mmap" | "warm" | "anon" | "ahwb") {
+            return Err(ConfigError::Invalid(format!(
+                "inference.moe.dense_weights must be mmap|warm|anon|ahwb (got {dense})"
+            )));
+        }
+        let cache = self.cache_mb.trim();
+        if cache != "auto" && cache != "0" {
+            let n: u64 = cache.parse().map_err(|_| {
+                ConfigError::Invalid(
+                    "inference.moe.cache_mb must be auto, 0, or an integer MiB".into(),
+                )
+            })?;
+            if (1..1500).contains(&n) {
+                return Err(ConfigError::Invalid(
+                    "inference.moe.cache_mb must be 0 or >= 1500 (BigMoe cache rule)".into(),
+                ));
+            }
+        }
+        if matches!(self.quality_mode, MoeQualityMode::Lossless)
+            && (self.drop_cold_experts.is_some()
+                || self.expert_substitute.is_some()
+                || self.route_ahead.is_some_and(|n| n > 0))
+        {
+            return Err(ConfigError::Invalid(
+                "lossy MoE knobs require inference.moe.quality_mode = \"lossy\"".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_bmoe_binary() -> String {
+    "bmoe-cli".to_string()
+}
+
+fn default_moe_cache_mb() -> String {
+    "auto".to_string()
+}
+
+fn default_moe_cache_floor_mb() -> u64 {
+    1536
+}
+
+fn default_moe_io_threads() -> u8 {
+    4
+}
+
+fn default_moe_dense_weights() -> String {
+    "anon".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -538,6 +731,8 @@ pub enum NodeCapability {
     Client,
     RpcWorker,
     Discovery,
+    /// Node can host BigMoeOnEdge flash-streaming MoE sessions.
+    MoeStream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -16,9 +16,20 @@ pub enum Verdict {
 /// Suggested remediation when a plan does not fit cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Remediation {
-    ReduceCtx { to: usize },
-    QuantizeKv { dtype: String },
-    OffloadLayers { n: u32, peer_hint: String },
+    ReduceCtx {
+        to: usize,
+    },
+    QuantizeKv {
+        dtype: String,
+    },
+    OffloadLayers {
+        n: u32,
+        peer_hint: String,
+    },
+    /// Prefer BigMoeOnEdge flash streaming with the given expert-cache ceiling (MiB).
+    EnableMoeStream {
+        cache_ceil_mb: u64,
+    },
 }
 
 /// Operator / config policy that drives MemoryPlan arithmetic.
@@ -175,6 +186,14 @@ impl MemoryPlan {
                     dtype: "q8_0".into(),
                 });
                 Verdict::FitsIfQuantizedKv
+            } else if gguf.streamable_moe() {
+                let cache_ceil = ((budget_mb.saturating_mul(45)) / 100)
+                    .max(2000)
+                    .min(budget_mb);
+                remediations.push(Remediation::EnableMoeStream {
+                    cache_ceil_mb: cache_ceil,
+                });
+                Verdict::Exceeds
             } else if cluster_offload_available {
                 remediations.push(Remediation::OffloadLayers {
                     n: 0,
@@ -187,6 +206,14 @@ impl MemoryPlan {
             } else {
                 Verdict::Exceeds
             }
+        } else if gguf.streamable_moe() {
+            let cache_ceil = ((budget_mb.saturating_mul(45)) / 100)
+                .max(2000)
+                .min(budget_mb);
+            remediations.push(Remediation::EnableMoeStream {
+                cache_ceil_mb: cache_ceil,
+            });
+            Verdict::Exceeds
         } else if cluster_offload_available {
             remediations.push(Remediation::OffloadLayers {
                 n: 0,
@@ -229,7 +256,17 @@ impl MemoryPlan {
         match self.verdict {
             Verdict::Fits => "[OK]",
             Verdict::FitsWithOffload | Verdict::FitsIfQuantizedKv => "[RPC]",
-            Verdict::Exceeds => "[OOM]",
+            Verdict::Exceeds => {
+                if self
+                    .remediations
+                    .iter()
+                    .any(|r| matches!(r, Remediation::EnableMoeStream { .. }))
+                {
+                    "[MOE]"
+                } else {
+                    "[OOM]"
+                }
+            }
         }
     }
 }
@@ -287,6 +324,8 @@ mod tests {
             head_count: Some(12),
             head_count_kv: Some(12),
             embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
             file_size_bytes: 1_000_000_000, // ~953 MB Q4 weights
             tensors: vec![],
             quant_label: Some("Q4_K".into()),

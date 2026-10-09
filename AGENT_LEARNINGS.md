@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-09 — BigMoeOnEdge integration: external bmoe-cli, stream LMK, no RPC+stream
+- Category: design-decision
+- Context: Integrating Helldez/BigMoeOnEdge flash-streaming MoE into nexus-llm orchestration.
+- Finding: Nexus has no llama.cpp submodule and must not bind C++. BigMoeOnEdge is a separate `bmoe-cli` binary with `--session` JSON (`BMOE_*` stdout), not a `llama-server` fork; it has no multi-node RPC and streamed experts are CPU-only. Dense LMK (`file + KV`) would wrongly reject >RAM MoEs. `inference.cache.max_cache_mb` is prompt-slot disk quota and must not be overloaded as expert RAM cache.
+- Action: Supervise `bmoe-cli --session` with an OpenAI adapter on `api_port`; budget via `moe_resident + cache_ceil + KV`; add `[inference.moe]`; prefer `PlanTarget::LocalMoeStream` over dense `--rpc` for streamable MoE; never combine MoE stream with layer RPC in v1. Lossy knobs require `quality_mode = lossy`.
+- Verification: `cargo test --locked --lib` (gguf/sysinfo/bmoe_client/cluster) and `cargo test --locked --test test_placement`; hardware soak with real `bmoe-cli` + MoE GGUF remains operator-side.
+
 ## 2026-10-09 — Android CPU Mode Vulkan Device Isolation, SSE Error Surfacing, and Gateway Digest Resolution
 - Category: bug
 - Context: Model inference failed on both TUI and WebUI in Android Termux (Adreno 740 / Snapdragon 8 Gen 2). In TUI, `(generating...)` vanished immediately with no tokens or errors; in WebUI, `/v1/chat/completions` returned `404 no active holder for model '<digest>'`.

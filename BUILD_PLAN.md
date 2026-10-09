@@ -133,6 +133,28 @@ cargo test --locked --test test_phase10_store
 
 ---
 
+## Phase 16: MoE Flash Streaming Backend (BigMoeOnEdge)
+**Status:** Complete (v1 single-node); Phase D mesh research deferred
+
+### Objectives
+- Treat Helldez/BigMoeOnEdge `bmoe-cli` as a third supervised inference backend (no C++ bindings, no llama.cpp submodule in Nexus).
+- Parse MoE GGUF metadata (`expert_count`, expert tensors) and budget RAM as resident weights + expert cache + KV (stream LMK), not full file size.
+- Add `[inference.moe]` config (cache governor, lossless/lossy knobs) distinct from prompt-slot `inference.cache.max_cache_mb`.
+- Spawn `bmoe-cli --session --moe-stream` with an OpenAI/SSE adapter on `api_port` so gateway/Hub chat keep working.
+- Prefer local MoE stream over dense RPC layer-split for streamable oversize MoE GGUFs (`PlanTarget::LocalMoeStream`).
+- Advertise `moe_stream` capability; doctor checks `bmoe-cli`; gateway config PATCH exposes MoE levers.
+- **Do not** combine MoE flash streaming with `--rpc --split-mode layer` in v1.
+- **Phase D (research only):** networked route-ahead prefetch hints, distributed expert-cache affinity, Vulkan expert path — see DESIGN_SPEC §3.1.
+
+### Verification Command
+```bash
+cargo test --locked --lib bmoe_client::
+cargo test --locked --test test_placement
+cargo test --locked
+```
+
+---
+
 ## Full Regression Suite
 ```bash
 wsl bash -l -c "cd /mnt/c/nexus-llm && cargo test"

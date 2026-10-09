@@ -67,6 +67,14 @@ Nexus-LLM enforces an explicit acceleration and memory waterfall whenever a mode
 [Model Execution Request (Local or Remote)]
                  │
                  ▼
+[GGUF MoE? streamable + dense LMK fails?]
+                 │
+                 ├───► YES + [inference.moe] enabled:
+                 │         Stream LMK: resident + cache_ceil + KV < 0.75 * MemAvailable
+                 │         ├───► OK: Launch bmoe-cli --session --moe-stream (+ OpenAI adapter on api_port)
+                 │         └───► FAIL: Reject (do not mix with --rpc layer split)
+                 │
+                 ▼ Dense / non-stream path
 [Memory Safety Check: Model Size + KV Cache < 0.75 * MemAvailable (or configured cap)]
                  │
                  ├───► INSUFFICIENT RAM:
@@ -86,6 +94,14 @@ Nexus-LLM enforces an explicit acceleration and memory waterfall whenever a mode
                  └───► CPU Only:
                            Launch llama-server with -ngl 0 and recommended thread count
 ```
+
+### 3.1 Phase D — Mesh MoE research (not implemented in v1)
+
+BigMoeOnEdge is single-node flash streaming (CPU experts). These Nexus-edge ideas require new protocol or upstream hooks; each needs a go/no-go spike after Phase 16 soak:
+
+1. **Networked route-ahead:** Early-layer node sends compact expert-id predictions over control-plane before activation tensors. Receiving `bmoe-cli` needs an external route-hint API (does not exist today). Gate: measure Wi-Fi RTT vs UFS read latency; only prototype if hint window is profitable.
+2. **Distributed expert-cache affinity:** Advertise hot `(layer, expert)` sets; steer whole sessions to warmer nodes (session migration), not per-token cross-device expert execution.
+3. **Vulkan / Adreno expert path:** Track BigMoe upstream; do not build a Nexus Vulkan expert pipeline until streamed experts can land in device buffers. Keep Vulkan for dense `llama-server` only.
 
 ---
 
@@ -153,6 +169,27 @@ cpu_threads = 6                     # Node-specific thread count
 max_ram_usage_percent = 75          # Dynamic LMK ceiling on Android
 mmap = true
 mlock = false
+
+# Phase 12 §5.2 — prompt cache *disk* slots (not MoE expert RAM)
+[inference.cache]
+prompt_cache_enabled = true
+slot_save_path = "~/.nexus/slots"
+max_cache_mb = 2048
+
+# Phase 16 — BigMoeOnEdge expert flash streaming (RAM cache for active experts)
+[inference.moe]
+enabled = true
+bmoe_binary = "bmoe-cli"
+cache_mb = "auto"                   # auto | 0 | >=1500
+cache_floor_mb = 1536
+cache_ceil_mb = 0                   # 0 = derive from SystemProfile (~45% of LMK budget)
+io_threads = 4
+dense_weights = "anon"
+overlap = false                     # needs Helldez expert-ready llama.cpp inside bmoe build
+quality_mode = "lossless"           # lossy unlocks drop/substitute/route-ahead
+# drop_cold_experts = "0.75"        # only with quality_mode = "lossy"
+# expert_substitute = "0.1"
+# route_ahead = 2
 
 [network]
 api_host = "0.0.0.0"

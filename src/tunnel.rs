@@ -22,6 +22,9 @@ pub enum TunnelError {
     #[error("ADB command failed: {0}")]
     CommandFailed(String),
 
+    #[error("invalid ADB host port config: {0}")]
+    InvalidConfig(String),
+
     #[error("I/O error executing ADB: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -117,13 +120,14 @@ impl AdbTunnelSupervisor {
     /// host ports from config). No authorized device returns `NoDeviceConnected`.
     /// Device API/control ports come from the serial cache, otherwise `api_port` and
     /// the configured control port. RPC reverse stays on this one serial.
+    /// An on-disk config that fails `NexusConfig::validate` is refused before `adb` runs.
     pub fn setup_tunnel(
         api_port: u16,
         rpc_port: u16,
         specific_serial: Option<&str>,
     ) -> Result<TunnelStatus, TunnelError> {
+        let (host_port_base, max_devices, control_port) = adb_host_settings()?;
         let devices = Self::list_devices()?;
-        let (host_port_base, max_devices, control_port) = adb_host_settings();
         let forward = select_one_forward(&devices, host_port_base, max_devices, specific_serial)?;
         let device = devices.into_iter().find(|d| d.serial == forward.serial);
 
@@ -223,6 +227,7 @@ impl AdbTunnelSupervisor {
     /// `adb forward --remove` is always `adb -s <serial> forward --remove tcp:<host_port>`
     /// for both host ports. An unscoped `forward --remove` would drop every phone.
     pub fn teardown_tunnel(api_port: u16, rpc_port: u16) -> Result<(), TunnelError> {
+        let (host_port_base, max_devices, _) = adb_host_settings()?;
         let devices = match Self::list_devices() {
             Ok(devices) => devices,
             Err(err) => {
@@ -230,7 +235,6 @@ impl AdbTunnelSupervisor {
                 return Ok(());
             }
         };
-        let (host_port_base, max_devices, _) = adb_host_settings();
         let (forwards, _) = allocate_forwards(&devices, host_port_base, max_devices);
         let cache = load_link_cache();
         for forward in &forwards {
@@ -320,17 +324,40 @@ fn select_one_forward(
     chosen.ok_or(TunnelError::NoDeviceConnected)
 }
 
-/// Host-port block and control-port fallback without writing config or identity files.
-fn adb_host_settings() -> (u16, u8, u16) {
+/// Host-port block from config without calling `NexusConfig::load`.
+///
+/// A missing file uses `AdbConfig` defaults (base 18080, 8 devices). A file that parses
+/// must pass `NexusConfig::validate`, including the reserved host-port rule.
+fn adb_host_settings() -> Result<(u16, u8, u16), TunnelError> {
     let path = std::env::var("NEXUS_CONFIG")
         .ok()
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(crate::config::NexusConfig::default_config_path);
-    let cfg = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| toml::from_str::<crate::config::NexusConfig>(&content).ok())
-        .unwrap_or_default();
+    adb_host_settings_at(&path)
+}
+
+fn adb_host_settings_at(path: &std::path::Path) -> Result<(u16, u8, u16), TunnelError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_adb_host_settings());
+        }
+        Err(err) => return Err(TunnelError::Io(err)),
+    };
+    let cfg: crate::config::NexusConfig = toml::from_str(&content)
+        .map_err(|err| TunnelError::InvalidConfig(format!("could not parse {path:?}: {err}")))?;
+    cfg.validate()
+        .map_err(|err| TunnelError::InvalidConfig(err.to_string()))?;
+    Ok((
+        cfg.cluster.adb.host_port_base,
+        cfg.cluster.adb.max_devices,
+        cfg.network.control_port,
+    ))
+}
+
+fn default_adb_host_settings() -> (u16, u8, u16) {
+    let cfg = crate::config::NexusConfig::default();
     (
         cfg.cluster.adb.host_port_base,
         cfg.cluster.adb.max_devices,
@@ -515,6 +542,35 @@ serial-c device
         let serial_at = remove.iter().position(|part| part == "-s").unwrap();
         let forward_at = remove.iter().position(|part| part == "forward").unwrap();
         assert!(serial_at < forward_at);
+    }
+
+    #[test]
+    fn adb_host_settings_rejects_gateway_collision_and_defaults_when_missing() {
+        let missing = std::env::temp_dir().join(format!(
+            "nexus-adb-settings-missing-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let (base, max_devices, _) = adb_host_settings_at(&missing).unwrap();
+        assert_eq!(base, 18080);
+        assert_eq!(max_devices, 8);
+        assert!(!missing.exists());
+
+        let collision = std::env::temp_dir().join(format!(
+            "nexus-adb-settings-collision-{}.toml",
+            std::process::id()
+        ));
+        let mut cfg = crate::config::NexusConfig::default();
+        cfg.cluster.adb.host_port_base = 8090;
+        cfg.save_to_path(&collision).unwrap();
+        let err = adb_host_settings_at(&collision).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("8090"), "{msg}");
+        assert!(
+            msg.contains("collides") || msg.contains("reserved"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_file(&collision);
     }
 
     #[test]

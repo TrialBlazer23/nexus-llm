@@ -170,17 +170,22 @@ fn check_security(config: &NexusConfig) -> Vec<DoctorCheck> {
 fn check_moe_config(config: &NexusConfig) -> DoctorCheck {
     match config.inference.moe.validate() {
         Ok(()) => {
-            let profile = SystemProfile::probe();
-            let ceil = config.inference.moe.derive_cache_ceil_mb(
-                profile.available_ram_mb,
-                config.hardware.safety.max_ram_usage_percent,
-            );
+            let cap = if config.inference.moe.cache_ceil_mb == 0 {
+                "no operator cap".to_string()
+            } else {
+                format!("operator cap {} MiB", config.inference.moe.cache_ceil_mb)
+            };
             DoctorCheck {
                 name: "moe-stream",
                 severity: CheckSeverity::Ok,
                 detail: format!(
-                    "enabled (cache_mb={}, derived_ceil_mb={}, quality={:?})",
-                    config.inference.moe.cache_mb, ceil, config.inference.moe.quality_mode
+                    "enabled (cache_mb={}, {}, min_cache_mb={}, prefer={:?}, adapt={}, quality={:?})",
+                    config.inference.moe.cache_mb,
+                    cap,
+                    config.inference.moe.min_cache_mb,
+                    config.inference.moe.prefer,
+                    config.inference.moe.adapt,
+                    config.inference.moe.quality_mode
                 ),
             }
         }

@@ -649,6 +649,7 @@ impl ChatApp {
                         ttft_ms: metrics.ttft_ms,
                         prompt_tok_s,
                         cache_hit_pct: None,
+                        cache_mb: None,
                         measured_at: crate::bench::unix_now(),
                     },
                 );

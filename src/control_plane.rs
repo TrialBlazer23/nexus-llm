@@ -1110,28 +1110,19 @@ pub async fn handle_load_model_with_moe(
                 };
             }
         };
-        let model_key = meta
-            .model_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| meta.quant_label.clone())
-            .unwrap_or_else(|| model_name.clone());
-        let default_ceil = request
-            .moe_cache_ceil_mb
-            .filter(|&c| c > 0)
-            .unwrap_or_else(|| {
-                moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent)
-            });
+        let model_key = crate::cluster::moe_model_key(meta);
         let bench = crate::bench::BenchStore::load_default().ok();
-        let knobs = match crate::cluster::plan_moe_stream_knobs(
+        let extra_cap = crate::cluster::MoeCacheCap::from_optional_mb(request.moe_cache_ceil_mb);
+        let knobs = match crate::cluster::plan_moe_spawn(
             meta,
             &profile,
+            moe,
             memory_budget_percent,
             request.context_size,
-            default_ceil,
             bench.as_ref(),
             &model_key,
             "local",
+            extra_cap,
         ) {
             Some(k) => k,
             None => {
@@ -1146,32 +1137,22 @@ pub async fn handle_load_model_with_moe(
                 };
             }
         };
-        let mut moe_cfg = moe.clone();
-        let lmk_budget_mb =
-            profile.max_allowed_memory_bytes_pct(memory_budget_percent) / (1024 * 1024);
-        let gov_notes = crate::cluster::apply_moe_governor_to_config(
-            &mut moe_cfg,
-            bench.as_ref(),
-            &model_key,
-            "local",
-            knobs.context_size,
-            lmk_budget_mb,
-        );
-        for note in &gov_notes {
+        for note in &knobs.notes {
             info!("{note}");
         }
+        let binary = std::path::PathBuf::from(&knobs.moe.bmoe_binary);
         let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
-            std::path::PathBuf::from(&moe.bmoe_binary),
+            binary,
             model_path.clone(),
             api_host,
             port,
             knobs.context_size,
             request.threads,
-            moe_cfg,
+            knobs.moe,
             &profile,
             memory_budget_percent,
             request.tags.clone(),
-            Some(knobs.cache_ceil_mb),
+            Some(knobs.cache_mb),
         );
         return match manager.spawn_bmoe(bmoe_cfg).await {
             Ok(slot_port) => ModelLoadResponse {

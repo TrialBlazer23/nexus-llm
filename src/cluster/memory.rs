@@ -187,12 +187,7 @@ impl MemoryPlan {
                 });
                 Verdict::FitsIfQuantizedKv
             } else if gguf.streamable_moe() {
-                let cache_ceil = ((budget_mb.saturating_mul(45)) / 100)
-                    .max(2000)
-                    .min(budget_mb);
-                remediations.push(Remediation::EnableMoeStream {
-                    cache_ceil_mb: cache_ceil,
-                });
+                remediations.push(Remediation::EnableMoeStream { cache_ceil_mb: 0 });
                 Verdict::Exceeds
             } else if cluster_offload_available {
                 remediations.push(Remediation::OffloadLayers {
@@ -207,12 +202,7 @@ impl MemoryPlan {
                 Verdict::Exceeds
             }
         } else if gguf.streamable_moe() {
-            let cache_ceil = ((budget_mb.saturating_mul(45)) / 100)
-                .max(2000)
-                .min(budget_mb);
-            remediations.push(Remediation::EnableMoeStream {
-                cache_ceil_mb: cache_ceil,
-            });
+            remediations.push(Remediation::EnableMoeStream { cache_ceil_mb: 0 });
             Verdict::Exceeds
         } else if cluster_offload_available {
             remediations.push(Remediation::OffloadLayers {

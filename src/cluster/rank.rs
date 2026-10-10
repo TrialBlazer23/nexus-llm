@@ -1,13 +1,15 @@
 //! Link-quality probing and predicted-throughput ranking (Phase 11 §3.6 / §3.8).
 
 use crate::bench::BenchStore;
+use crate::config::MoeConfig;
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use std::time::{Duration, Instant};
 
 use super::memory::{MemoryPlan, MemoryPolicy, Verdict};
+use super::moe_plan::{plan_moe_spawn, MoeCacheCap};
 use super::split::{plan_tensor_byte_split, MultiWorkerSplit, SplitError};
-use super::{ModelFit, NodeBudget};
+use super::{moe_model_key, ModelFit, NodeBudget};
 
 /// Cached link measurement for a peer.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,10 +114,8 @@ pub struct PlacementRequest<'a> {
     pub enable_rpc: bool,
     /// Optional Phase 12 §5.5 measured throughput store.
     pub bench: Option<&'a BenchStore>,
-    /// When true, consider LocalMoeStream for streamable MoE GGUFs.
-    pub moe_stream_enabled: bool,
-    /// Expert cache ceiling (MiB) for MoE stream plans (`0` = derive ~45% of local LMK budget).
-    pub moe_cache_ceil_mb: u64,
+    /// Operator MoE policy. Stream plans are considered when `enabled` and the GGUF can stream.
+    pub moe: &'a MoeConfig,
 }
 
 /// Rank execution plans by predicted tokens/sec (descending).
@@ -153,7 +153,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
         .collect();
 
     let offload_available = req.enable_rpc && !rpc_workers.is_empty();
-    let model_key = placement_model_key(req.gguf);
+    let model_key = moe_model_key(req.gguf);
 
     // --- Local GPU ---
     if req.local_gpu_layers > 0 {
@@ -230,62 +230,29 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
     }
 
     // --- Local MoE flash-stream (prefer over dense RPC for streamable MoE) ---
-    if req.moe_stream_enabled && req.gguf.streamable_moe() {
-        let default_ceil = if req.moe_cache_ceil_mb > 0 {
-            req.moe_cache_ceil_mb
-        } else {
-            ((local_budget_mb.saturating_mul(45)) / 100)
-                .max(2000)
-                .min(local_budget_mb)
-        };
-        // Only advertise MoE stream when dense local would fail LMK at the desired ctx.
+    if req.moe.enabled && req.gguf.streamable_moe() {
         let dense_fits = req.local_profile.can_safely_load_gguf_pct(
             req.gguf,
             req.policy.context_size,
             req.policy.max_ram_usage_percent,
         );
         if !dense_fits {
-            if let Some(knobs) = super::plan_moe_stream_knobs(
-                req.gguf,
+            if let Some(plan) = moe_stream_execution(
+                req,
                 &req.local_profile,
-                req.policy.max_ram_usage_percent,
-                req.policy.context_size,
-                default_ceil,
-                req.bench,
-                &model_key,
                 &req.local_name,
+                &model_key,
+                MoeCacheCap::None,
+                None,
+                false,
             ) {
-                let mut policy = req.policy.clone();
-                policy.context_size = knobs.context_size;
-                let mut mem = MemoryPlan::from_gguf(req.gguf, &req.local_profile, &policy, false);
-                mem.remediations.insert(
-                    0,
-                    super::memory::Remediation::EnableMoeStream {
-                        cache_ceil_mb: knobs.cache_ceil_mb,
-                    },
-                );
-                plans.push(ExecutionPlan {
-                    target: PlanTarget::LocalMoeStream {
-                        cache_mb: knobs.cache_mb,
-                        ceil_mb: knobs.cache_ceil_mb,
-                    },
-                    memory: mem,
-                    split: None,
-                    context_size: knobs.context_size,
-                    predicted_tok_s: knobs.predicted_tok_s,
-                    link_notes: vec![format!(
-                        "moe-stream ctx={} cache-ceil={}MB",
-                        knobs.context_size, knobs.cache_ceil_mb
-                    )],
-                    llama_extra_args: vec![],
-                    gpu_layers: 0,
-                });
+                plans.push(plan);
             }
         }
     }
 
     // --- Remote MoE flash-stream (peers advertising moe_stream) ---
-    if req.moe_stream_enabled && req.gguf.streamable_moe() {
+    if req.moe.enabled && req.gguf.streamable_moe() {
         for c in req
             .candidates
             .iter()
@@ -301,57 +268,21 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
             ) {
                 continue;
             }
-            let peer_budget_mb = peer_profile
-                .max_allowed_memory_bytes_pct(req.policy.max_ram_usage_percent)
-                / (1024 * 1024);
-            let default_ceil = if c.moe_cache_ceil_mb > 0 {
-                c.moe_cache_ceil_mb
+            let extra = if c.moe_cache_ceil_mb > 0 {
+                MoeCacheCap::Max(c.moe_cache_ceil_mb)
             } else {
-                ((peer_budget_mb.saturating_mul(45)) / 100)
-                    .max(2000)
-                    .min(peer_budget_mb)
+                MoeCacheCap::None
             };
-            if let Some(knobs) = super::plan_moe_stream_knobs(
-                req.gguf,
+            if let Some(plan) = moe_stream_execution(
+                req,
                 &peer_profile,
-                req.policy.max_ram_usage_percent,
-                req.policy.context_size,
-                default_ceil,
-                req.bench,
-                &model_key,
                 &c.name,
+                &model_key,
+                extra,
+                Some(&c.link),
+                true,
             ) {
-                let mut notes = vec![format!("remote moe-stream {}", c.name)];
-                let mut tok = knobs.predicted_tok_s;
-                if c.link.unknown {
-                    tok *= 0.85;
-                    notes.push("link quality unknown — demoted".into());
-                } else {
-                    notes.push(format!("RTT {:.0}ms", c.link.rtt_ms));
-                }
-                let mut policy = req.policy.clone();
-                policy.context_size = knobs.context_size;
-                let mut mem = MemoryPlan::from_gguf(req.gguf, &peer_profile, &policy, false);
-                mem.remediations.insert(
-                    0,
-                    super::memory::Remediation::EnableMoeStream {
-                        cache_ceil_mb: knobs.cache_ceil_mb,
-                    },
-                );
-                plans.push(ExecutionPlan {
-                    target: PlanTarget::RemoteMoeStream {
-                        peer_name: c.name.clone(),
-                        cache_mb: knobs.cache_mb,
-                        ceil_mb: knobs.cache_ceil_mb,
-                    },
-                    memory: mem,
-                    split: None,
-                    context_size: knobs.context_size,
-                    predicted_tok_s: tok,
-                    link_notes: notes,
-                    llama_extra_args: vec![],
-                    gpu_layers: 0,
-                });
+                plans.push(plan);
             }
         }
     }
@@ -534,12 +465,72 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
     Ok(plans)
 }
 
-fn placement_model_key(gguf: &GgufMetadata) -> String {
-    gguf.model_name
-        .clone()
-        .filter(|s| !s.is_empty())
-        .or_else(|| gguf.quant_label.clone())
-        .unwrap_or_else(|| "unknown".into())
+fn moe_stream_execution(
+    req: &PlacementRequest<'_>,
+    profile: &SystemProfile,
+    node_name: &str,
+    model_key: &str,
+    extra_cap: MoeCacheCap,
+    link: Option<&LinkQuality>,
+    remote: bool,
+) -> Option<ExecutionPlan> {
+    let spawn = plan_moe_spawn(
+        req.gguf,
+        profile,
+        req.moe,
+        req.policy.max_ram_usage_percent,
+        req.policy.context_size,
+        req.bench,
+        model_key,
+        node_name,
+        extra_cap,
+    )?;
+    let mut policy = req.policy.clone();
+    policy.context_size = spawn.context_size;
+    let mut mem = MemoryPlan::from_gguf(req.gguf, profile, &policy, false);
+    mem.remediations.insert(
+        0,
+        super::memory::Remediation::EnableMoeStream {
+            cache_ceil_mb: spawn.cache_mb,
+        },
+    );
+    let mut notes = if remote {
+        vec![format!("remote moe-stream {node_name}")]
+    } else {
+        Vec::new()
+    };
+    notes.extend(spawn.notes);
+    let mut tok = spawn.predicted_tok_s;
+    if let Some(link) = link {
+        if link.unknown {
+            tok *= 0.85;
+            notes.push("link quality unknown — demoted".into());
+        } else {
+            notes.push(format!("RTT {:.0}ms", link.rtt_ms));
+        }
+    }
+    let target = if remote {
+        PlanTarget::RemoteMoeStream {
+            peer_name: node_name.to_string(),
+            cache_mb: spawn.cache_mb,
+            ceil_mb: spawn.cache_mb,
+        }
+    } else {
+        PlanTarget::LocalMoeStream {
+            cache_mb: spawn.cache_mb,
+            ceil_mb: spawn.cache_mb,
+        }
+    };
+    Some(ExecutionPlan {
+        target,
+        memory: mem,
+        split: None,
+        context_size: spawn.context_size,
+        predicted_tok_s: tok,
+        link_notes: notes,
+        llama_extra_args: vec![],
+        gpu_layers: 0,
+    })
 }
 
 fn measured_tok_s(
@@ -659,6 +650,7 @@ mod tests {
             detected_backend: AccelerationBackend::Vulkan,
             recommended_threads: 4,
         };
+        let moe = MoeConfig::default();
         let req = PlacementRequest {
             gguf: &gguf,
             policy: MemoryPolicy {
@@ -674,8 +666,7 @@ mod tests {
             local_gpu_layers: 99,
             enable_rpc: true,
             bench: None,
-            moe_stream_enabled: true,
-            moe_cache_ceil_mb: 0,
+            moe: &moe,
             candidates: vec![PlacementCandidate {
                 name: "desktop".into(),
                 budget: NodeBudget::new(Uuid::new_v4(), "desktop", 24_000),

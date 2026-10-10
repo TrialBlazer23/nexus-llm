@@ -558,11 +558,7 @@ impl ModelDownloader {
 }
 
 fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    digest
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Returns true if the URL points to a Hugging Face domain (*.huggingface.co or *.hf.co).

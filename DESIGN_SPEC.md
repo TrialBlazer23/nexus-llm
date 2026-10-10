@@ -178,15 +178,25 @@ max_cache_mb = 2048
 
 # Phase 16 — BigMoeOnEdge expert flash streaming (RAM cache for active experts)
 # Operator knobs: enabled + cache_mb (defaults after scripts/setup.sh are enough).
+# Load-time planner (`plan_moe_spawn`) picks one (context, cache) under three layers:
+#   1. LMK room: resident weights + KV + cache_floor_mb stay inside max_ram_usage_percent.
+#   2. Operator cap: cache_ceil_mb > 0 is a hard ceiling. 0 means no extra cap.
+#   3. Measurement: bench hit-rate may hold, raise, or (to keep context) lower the cache.
+#      Adapted values stay on the session. They are not written back to this file.
+# prefer = "context" keeps the requested context and shrinks cache first.
+# prefer = "cache" holds the working-set cache and steps context down first.
 # Expert knobs below: leave at defaults unless tuning flash I/O or lossy quality.
 # Termux / Bionic: native build targets -target aarch64-linux-android28 for AHardwareBuffer support.
 # Session stdout lifecycle: wait_for_ready evaluates against overall deadline; n_predict clamps to context_size.
 [inference.moe]
 enabled = true
 bmoe_binary = "~/.nexus/bin/bmoe-cli"  # setup writes absolute paths under ~/.nexus/bin
-cache_mb = "auto"                   # operator: auto | 0 | >=1500
-cache_floor_mb = 1536               # expert
-cache_ceil_mb = 0                   # expert: 0 = derive from SystemProfile (~45% of LMK budget)
+cache_mb = "auto"                   # operator: auto | 0 | >= min_cache_mb (default 2000)
+cache_floor_mb = 1536               # safety reserve left under the LMK ceiling
+cache_ceil_mb = 0                   # 0 = no operator cap (planner uses LMK room)
+min_cache_mb = 2000                 # smallest legal non-zero cache; 0 disables the floor
+prefer = "context"                  # context | cache
+adapt = true                        # bench hit-rate may move the cache target at load
 io_threads = 4                      # expert: 1–8
 dense_weights = "anon"              # expert: mmap|warm|anon|ahwb
 overlap = false                     # expert: needs Helldez expert-ready llama.cpp inside bmoe build

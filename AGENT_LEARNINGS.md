@@ -25,9 +25,16 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — One MoE budget replaces the knob grid and governor
+- Category: design-decision
+- Context: Phase 16.5 ranked a (context, cache) grid and then ran a second governor (25% shrink, 45% of the LMK budget). Both capped RAM the stream guard would have allowed, and the peer ran the same pass again.
+- Finding: `cache_ceil_mb = 0` was doing three jobs (unset, cache off, and "derive 45%"). A monotonic grid cannot spend leftover room. Measured tok/s must not pick the cache; it only scores the point the budget already chose. Warm samples must hold cache and step context. Cold samples may raise the cache up to the room. A chronic lossy overlay stays on the session clone.
+- Action: Delete `src/cluster/moe_knobs.rs` and `src/cluster/moe_governor.rs`. Call `plan_moe_spawn` once at each spawn site (CLI, gateway, control plane, hub). Room is LMK minus resident weights, KV, and `cache_floor_mb`. Target is the minimum of that room, the working-set prior, an operator cap, and a peer cap. `cache_ceil_mb = 0` means no operator cap. On the load-request wire, `Some(0)` means cache off and omitted means no extra cap. Bench rows store `cache_mb` so 2000 MiB and 6000 MiB do not average. Do not write adapted values into `config.toml`, flip lossless to lossy, respawn mid-session, combine MoE stream with RPC, or surface these knobs in the Settings TUI. This entry supersedes the same-day grid and governor entries below.
+- Verification: `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings` passed on 2026-10-10 (lib, placement, and bench suites included).
+
 ## 2026-10-10 — Hit%-driven MoE cache governor
 - Category: design-decision
-- Context: Phase 16.5 step 5 — `cache_hit_pct` was recorded in BenchStore but never biased ceil or lossy knobs at load time.
+- Context: Superseded by the budget-planner entry above. Do not restore `moe_governor`. Original context: Phase 16.5 step 5 — `cache_hit_pct` was recorded in BenchStore but never biased ceil or lossy knobs at load time.
 - Finding: Warm hit (≥70%) can shrink default ceil 25%; cold (<40%) bumps toward 45% LMK headroom; chronically cold (<25% with ≥3 hit samples) may overlay session `drop_cold_experts=0.85` only when `quality_mode=lossy` and operator drop is unset. Never auto-flip Lossless→Lossy; never persist into TOML; load/plan only (no mid-session respawn).
 - Action: `BenchStore::lookup_moe_cache_hit`; `cluster::moe_governor::{govern_moe_stream, apply_moe_governor_to_config}`; bias `default_ceil` inside `plan_moe_stream_knobs`; apply lossy overlay at hub/control-plane/CLI/gateway spawn.
 - Verification: Governor unit tests + warm-hit planner shrink; `cargo test --locked`; clippy `-D warnings`.
@@ -36,19 +43,19 @@ avoid repeating known mistakes.
 - Category: design-decision
 - Context: Phase 16.5 step 4 — cold-start MoE tok/s was a flat 2.2 for every (ctx, ceil), so joint knobs could not prefer warmer expert caches on throughput grounds, and denser top-k MoEs ranked identically to A3B.
 - Finding: GGUF already exposes `expert_count` / `expert_used_count` and expert tensor bytes. Measured `BACKEND_MOE_STREAM` samples must stay authoritative (not rescaled). Soft sqrt demotion on active fraction plus cache-vs-working-set I/O penalty (`0.55 + 0.45*hit`) matches soak (~2.2 A3B warm) while making ceil tok/s-sensitive.
-- Action: Add `predict_moe_stream_tok_s` in `cluster/moe_knobs.rs`; wire into `plan_moe_stream_knobs` cold-start path; keep `MOE_COLD_START_TOK_S = 2.2` as A3B reference.
+- Action: `predict_moe_stream_tok_s` now lives in `cluster/moe_plan.rs` (the knob grid that first called it was removed). Keep the active-fraction prior and the `0.55 + 0.45*hit` I/O term. Measured samples stay unclamped.
 - Verification: Unit tests for measured override, A3B warm ≈2.2, higher top-k demotion, cold < warm, knob planner prefers warm ceil; `cargo test --locked` + clippy `-D warnings`.
 
 ## 2026-10-10 — RemoteMoeStream mesh placement (Phase 16.5 step 3)
 - Category: design-decision
 - Context: Peers advertise `moe_stream` but ranking only offered dense `PlanTarget::Remote`, which mmap-fit checks could mark as Fits for oversize MoE files; Hub remote load always sent `backend=auto` without planned ctx/ceil.
-- Finding: Client-side placement needs a synthetic `SystemProfile::from_advertised(free, total, backend)`; remote dense plans for stream-capable peers must be suppressed when dense LMK fails; control-plane load must re-run `plan_moe_stream_knobs` on the peer and spawn via `from_profile_with_ceil`. Cross-node MoE bench stays on each device's `BenchStore` (`node_id=local`) in v1 — remote ranking uses cold-start tok/s unless samples were recorded under the peer label locally.
+- Finding: Client-side placement needs a synthetic `SystemProfile::from_advertised(free, total, backend)`; remote dense plans for stream-capable peers must be suppressed when dense LMK fails; control-plane load must re-run `plan_moe_spawn` on the peer and spawn via `from_profile_with_ceil`. A peer-advertised cache is only a ceiling. Cross-node MoE bench stays on each device's `BenchStore` (`node_id=local`) in v1 — remote ranking uses cold-start tok/s unless samples were recorded under the peer label locally.
 - Action: Add `PlanTarget::RemoteMoeStream`, `TargetExecutionNode::RemoteMoeStream`, `ModelLoadRequest.moe_cache_ceil_mb`, Hub `LoadModelRemote` with `backend=bmoe`; reject RPC+MoE on control plane.
 - Verification: `cargo test --locked` (including `ranks_remote_moe_stream_on_capable_peer_when_local_too_small`, `no_remote_moe_stream_*`, `from_advertised_uses_free_ram_for_lmk`); `cargo clippy --locked --all-targets -- -D warnings` clean.
 
 ## 2026-10-10 — Joint MoE (ctx, cache_ceil) planner wires into spawn
 - Category: design-decision
-- Context: Phase 16.5 step 2 — pick feasible stream LMK knobs and apply them at bmoe-cli spawn.
+- Context: Superseded by the budget-planner entry above. Do not restore `moe_knobs`. Original context: Phase 16.5 step 2 — pick feasible stream LMK knobs and apply them at bmoe-cli spawn.
 - Finding: Ranking advertised a single ceil at fixed policy ctx; Hub hardcoded placement ctx=4096; load ignored `LocalMoeStream.ceil_mb` and re-derived via `from_profile`. `--cache-mb auto` could disagree with the LMK ceil commitment.
 - Action: Add `cluster::moe_knobs::plan_moe_stream_knobs` (grid + tok/s-then-ctx-then-ceil scoring); rank emits winner ctx/ceil; Hub passes `selected_context` and threads `moe_cache_ceil_mb` through `LoadModelLocal`/`HotSwapIntent`; `BmoeSessionConfig::from_profile_with_ceil` forces integer `--cache-mb` when ceil≥2000; CLI `nexus host` plans before spawn.
 - Verification: `cargo test --locked` green (moe_knobs unit tests + placement); `cargo clippy --locked --all-targets -- -D warnings` clean.

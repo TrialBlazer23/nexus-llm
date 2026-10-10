@@ -10,6 +10,7 @@ use nexus::cluster::{
     rank_execution_plans, LinkQuality, MemoryPolicy, NodeBudget, PlacementCandidate,
     PlacementRequest, PlanTarget,
 };
+use nexus::config::MoeConfig;
 use nexus::gguf::{GgufMetadata, KvCacheDtype};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::collections::HashMap;
@@ -57,6 +58,7 @@ fn bench_store_round_trip_and_lookup() {
             ttft_ms: Some(120),
             prompt_tok_s: Some(80.0),
             cache_hit_pct: None,
+            cache_mb: None,
             measured_at: unix_now(),
         },
     );
@@ -142,10 +144,12 @@ fn ranker_prefers_measured_tok_s_over_heuristic() {
             ttft_ms: Some(10),
             prompt_tok_s: Some(200.0),
             cache_hit_pct: None,
+            cache_mb: None,
             measured_at: unix_now(),
         },
     );
 
+    let moe = MoeConfig::default();
     let req = PlacementRequest {
         gguf: &gguf,
         policy: MemoryPolicy {
@@ -162,8 +166,7 @@ fn ranker_prefers_measured_tok_s_over_heuristic() {
         enable_rpc: false,
         candidates: vec![],
         bench: Some(&store),
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
     };
     let plans = rank_execution_plans(&req).expect("plans");
     let local = plans
@@ -187,6 +190,7 @@ fn ranker_without_bench_stays_heuristic() {
         detected_backend: AccelerationBackend::Vulkan,
         recommended_threads: 4,
     };
+    let moe = MoeConfig::default();
     let req = PlacementRequest {
         gguf: &gguf,
         policy: MemoryPolicy {
@@ -202,8 +206,7 @@ fn ranker_without_bench_stays_heuristic() {
         local_gpu_layers: 99,
         enable_rpc: true,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
         candidates: vec![PlacementCandidate {
             name: "desktop".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "desktop", 24_000),

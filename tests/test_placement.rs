@@ -4,7 +4,7 @@ use nexus::cluster::{
     host_lmk_budget_mb, rank_execution_plans, LinkQuality, MemoryPlan, MemoryPolicy, NodeBudget,
     PlacementCandidate, PlacementRequest, PlanTarget, Verdict,
 };
-use nexus::config::NexusConfig;
+use nexus::config::{MoeConfig, NexusConfig};
 use nexus::gguf::{GgufMetadata, KvCacheDtype};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use std::collections::HashMap;
@@ -75,6 +75,7 @@ fn ranked_plans_include_predicted_tok_s() {
         detected_backend: AccelerationBackend::Vulkan,
         recommended_threads: 4,
     };
+    let moe = MoeConfig::default();
     let req = PlacementRequest {
         gguf: &gguf,
         policy: MemoryPolicy::from_safety(75, true, false, 2048),
@@ -83,8 +84,7 @@ fn ranked_plans_include_predicted_tok_s() {
         local_gpu_layers: 99,
         enable_rpc: true,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
         candidates: vec![PlacementCandidate {
             name: "big-desktop".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "big-desktop", 28_000),
@@ -152,6 +152,10 @@ fn ranks_local_moe_stream_for_oversize_moe() {
         detected_backend: AccelerationBackend::ArmCpuDotProd,
         recommended_threads: 4,
     };
+    let moe = MoeConfig {
+        cache_ceil_mb: 3500,
+        ..MoeConfig::default()
+    };
     let req = PlacementRequest {
         gguf: &gguf,
         policy: MemoryPolicy::from_safety(75, true, false, 2048),
@@ -160,8 +164,7 @@ fn ranks_local_moe_stream_for_oversize_moe() {
         local_gpu_layers: 0,
         enable_rpc: true,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 3500,
+        moe: &moe,
         candidates: vec![PlacementCandidate {
             name: "worker".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "worker", 1800),
@@ -203,6 +206,7 @@ fn ranks_local_moe_stream_for_oversize_moe() {
         },
         AccelerationBackend::ArmCpuDotProd,
         None,
+        &moe,
     );
     assert!(
         (plans[moe_idx].predicted_tok_s - expected).abs() < 0.01,
@@ -266,6 +270,7 @@ fn local_moe_stream_uses_measured_bench_tok_s() {
             ttft_ms: None,
             prompt_tok_s: None,
             cache_hit_pct: Some(70.0),
+            cache_mb: None,
             measured_at: unix_now(),
         },
     );
@@ -275,6 +280,10 @@ fn local_moe_stream_uses_measured_bench_tok_s() {
         detected_backend: AccelerationBackend::ArmCpuDotProd,
         recommended_threads: 4,
     };
+    let moe = MoeConfig {
+        cache_ceil_mb: 3500,
+        ..MoeConfig::default()
+    };
     let req = PlacementRequest {
         gguf: &gguf,
         policy: MemoryPolicy::from_safety(75, true, false, 2048),
@@ -283,8 +292,7 @@ fn local_moe_stream_uses_measured_bench_tok_s() {
         local_gpu_layers: 0,
         enable_rpc: false,
         bench: Some(&store),
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 3500,
+        moe: &moe,
         candidates: vec![],
     };
     let plans = rank_execution_plans(&req).expect("plans");
@@ -346,6 +354,7 @@ fn oversize_streamable_moe_gguf() -> GgufMetadata {
 #[test]
 fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
     let gguf = oversize_streamable_moe_gguf();
+    let moe = MoeConfig::default();
     let laptop = SystemProfile {
         total_ram_mb: 8_192,
         available_ram_mb: 512,
@@ -360,8 +369,7 @@ fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
         local_gpu_layers: 0,
         enable_rpc: true,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
         candidates: vec![
             PlacementCandidate {
                 name: "phone".into(),
@@ -421,6 +429,7 @@ fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
 #[test]
 fn no_remote_moe_stream_without_peer_capability() {
     let gguf = oversize_streamable_moe_gguf();
+    let moe = MoeConfig::default();
     let laptop = SystemProfile {
         total_ram_mb: 8_192,
         available_ram_mb: 2_048,
@@ -435,8 +444,7 @@ fn no_remote_moe_stream_without_peer_capability() {
         local_gpu_layers: 0,
         enable_rpc: false,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
         candidates: vec![PlacementCandidate {
             name: "worker".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "worker", 1800),
@@ -459,6 +467,7 @@ fn no_remote_moe_stream_without_peer_capability() {
 #[test]
 fn no_remote_moe_stream_when_peer_stream_lmk_tight() {
     let gguf = oversize_streamable_moe_gguf();
+    let moe = MoeConfig::default();
     let laptop = SystemProfile {
         total_ram_mb: 8_192,
         available_ram_mb: 2_048,
@@ -473,8 +482,7 @@ fn no_remote_moe_stream_when_peer_stream_lmk_tight() {
         local_gpu_layers: 0,
         enable_rpc: false,
         bench: None,
-        moe_stream_enabled: true,
-        moe_cache_ceil_mb: 0,
+        moe: &moe,
         candidates: vec![PlacementCandidate {
             name: "tiny-phone".into(),
             budget: NodeBudget::new(Uuid::new_v4(), "tiny-phone", 400),

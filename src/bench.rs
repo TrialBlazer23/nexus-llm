@@ -68,6 +68,11 @@ pub struct BenchSample {
     /// MoE expert-cache hit rate from `BMOE_DONE` (percent), when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_pct: Option<f32>,
+    /// Expert-cache size (MiB) that produced this sample.
+    ///
+    /// `None` on legacy rows and on non-MoE samples. `Some(0)` is cache off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_mb: Option<u64>,
     /// Unix seconds since epoch.
     pub measured_at: u64,
 }
@@ -87,6 +92,9 @@ pub struct BenchEntry {
     /// Rolling average of MoE expert-cache hit percent samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_pct: Option<f32>,
+    /// Cache size (MiB) shared by samples in this entry. MoE identity includes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_mb: Option<u64>,
     pub measured_at: u64,
     #[serde(default)]
     pub samples: Vec<BenchSample>,
@@ -99,6 +107,8 @@ pub struct MoeCacheHitStats {
     pub hit_pct: f32,
     /// Number of samples on that entry that recorded `cache_hit_pct`.
     pub samples_with_hit: usize,
+    /// Cache size (MiB) recorded on that entry, when the sample knew it.
+    pub cache_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -226,12 +236,49 @@ impl BenchStore {
         backend: &str,
         context_size: usize,
     ) -> Option<&BenchEntry> {
-        self.entries.iter().find(|e| {
-            model_ids_match(&e.model_id, model_id)
-                && e.node_id == node_id
-                && e.backend == backend
-                && e.context_size == context_size
-        })
+        self.entries
+            .iter()
+            .filter(|e| {
+                model_ids_match(&e.model_id, model_id)
+                    && e.node_id == node_id
+                    && e.backend == backend
+                    && e.context_size == context_size
+            })
+            .max_by_key(|e| e.measured_at)
+    }
+
+    /// Measured MoE tok/s. Prefers the same cache, then any cache at this context.
+    ///
+    /// Same-node rows win over other nodes. A hit at one cache does not invent a
+    /// different tok/s for other caches when an exact cache row exists.
+    pub fn lookup_moe_gen_tok_s(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        context_size: usize,
+        cache_mb: u64,
+    ) -> Option<f32> {
+        let exact = |node: Option<&str>| {
+            self.entries
+                .iter()
+                .filter(|e| {
+                    e.backend == BACKEND_MOE_STREAM
+                        && model_ids_match(&e.model_id, model_id)
+                        && e.context_size == context_size
+                        && e.cache_mb == Some(cache_mb)
+                        && node.is_none_or(|n| e.node_id == n)
+                })
+                .max_by_key(|e| e.measured_at)
+                .map(|e| e.gen_tok_s)
+        };
+        exact(Some(node_id))
+            .or_else(|| exact(None))
+            .or_else(|| {
+                self.lookup_gen_tok_s_by_key(model_id, node_id, BACKEND_MOE_STREAM, context_size)
+            })
+            .or_else(|| {
+                self.lookup_gen_tok_s_any_node_by_key(model_id, BACKEND_MOE_STREAM, context_size)
+            })
     }
 
     /// Lookup rolling-average MoE cache hit percent by free-form backend key.
@@ -271,6 +318,31 @@ impl BenchStore {
         Some(MoeCacheHitStats {
             hit_pct,
             samples_with_hit,
+            cache_mb: entry.cache_mb,
+        })
+    }
+
+    /// Hit stats for one context only. Does not borrow a sample from another context.
+    pub fn lookup_moe_cache_hit_exact(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        context_size: usize,
+    ) -> Option<MoeCacheHitStats> {
+        let entry = self
+            .find_entry_by_key(model_id, node_id, BACKEND_MOE_STREAM, context_size)
+            .or_else(|| self.find_newest_moe_entry(model_id, Some(context_size)))?;
+        let hit_pct = entry.cache_hit_pct.filter(|v| *v >= 0.0)?;
+        let samples_with_hit = entry
+            .samples
+            .iter()
+            .filter(|s| s.cache_hit_pct.is_some())
+            .count()
+            .max(if entry.cache_hit_pct.is_some() { 1 } else { 0 });
+        Some(MoeCacheHitStats {
+            hit_pct,
+            samples_with_hit,
+            cache_mb: entry.cache_mb,
         })
     }
 
@@ -331,11 +403,14 @@ impl BenchStore {
         let node_id = node_id.into();
         let backend_s = backend.to_string();
 
+        let split_on_cache = backend_s == BACKEND_MOE_STREAM;
+        let sample_cache = sample.cache_mb;
         if let Some(idx) = self.entries.iter().position(|e| {
             model_ids_match(&e.model_id, &model_id)
                 && e.node_id == node_id
                 && e.backend == backend_s
                 && e.context_size == context_size
+                && (!split_on_cache || e.cache_mb == sample_cache)
         }) {
             let entry = &mut self.entries[idx];
             entry.samples.push(sample.clone());
@@ -356,6 +431,7 @@ impl BenchStore {
             ttft_ms: sample.ttft_ms,
             prompt_tok_s: sample.prompt_tok_s,
             cache_hit_pct: sample.cache_hit_pct,
+            cache_mb: sample.cache_mb,
             measured_at: sample.measured_at,
             samples: vec![sample],
         };
@@ -430,6 +506,9 @@ fn recompute_entry(entry: &mut BenchEntry) {
     } else {
         Some(hit_vals.iter().sum::<f32>() / hit_vals.len() as f32)
     };
+    if let Some(cache) = entry.samples.iter().rev().find_map(|s| s.cache_mb) {
+        entry.cache_mb = Some(cache);
+    }
     entry.measured_at = entry
         .samples
         .iter()
@@ -517,6 +596,7 @@ pub async fn measure_once(
         ttft_ms,
         prompt_tok_s,
         cache_hit_pct: None,
+        cache_mb: None,
         measured_at: unix_now(),
     })
 }
@@ -590,6 +670,7 @@ mod unit_tests {
                 ttft_ms: Some(100),
                 prompt_tok_s: Some(50.0),
                 cache_hit_pct: None,
+                cache_mb: None,
                 measured_at: 1,
             },
         );
@@ -603,6 +684,7 @@ mod unit_tests {
                 ttft_ms: Some(80),
                 prompt_tok_s: Some(60.0),
                 cache_hit_pct: None,
+                cache_mb: None,
                 measured_at: 2,
             },
         );
@@ -633,6 +715,7 @@ mod unit_tests {
                 ttft_ms: None,
                 prompt_tok_s: None,
                 cache_hit_pct: Some(40.0),
+                cache_mb: None,
                 measured_at: 1,
             },
         );
@@ -646,6 +729,7 @@ mod unit_tests {
                 ttft_ms: None,
                 prompt_tok_s: None,
                 cache_hit_pct: Some(60.0),
+                cache_mb: None,
                 measured_at: 2,
             },
         );
@@ -667,9 +751,88 @@ mod unit_tests {
             .expect("hit stats");
         assert!((hit.hit_pct - 50.0).abs() < 0.01);
         assert_eq!(hit.samples_with_hit, 2);
+        assert_eq!(hit.cache_mb, None);
         assert_eq!(
             store.lookup_cache_hit_pct_by_key("qwen-moe", "local", BACKEND_MOE_STREAM, 4096),
             Some(50.0)
         );
+    }
+
+    #[test]
+    fn legacy_bench_json_without_cache_mb_loads() {
+        let raw = r#"{
+            "version": 1,
+            "entries": [{
+                "model_id": "qwen",
+                "node_id": "local",
+                "backend": "moe-stream",
+                "context_size": 2048,
+                "gen_tok_s": 2.0,
+                "measured_at": 1,
+                "samples": [{"gen_tok_s": 2.0, "measured_at": 1}]
+            }]
+        }"#;
+        let store: BenchStore = serde_json::from_str(raw).expect("legacy json");
+        assert_eq!(store.entries[0].cache_mb, None);
+        assert_eq!(store.entries[0].samples[0].cache_mb, None);
+        assert_eq!(
+            store.lookup_gen_tok_s_by_key("qwen", "local", BACKEND_MOE_STREAM, 2048),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn moe_samples_at_different_caches_do_not_merge() {
+        let mut store = BenchStore {
+            version: 1,
+            entries: vec![],
+        };
+        store.record_with_backend_key(
+            "qwen",
+            "local",
+            BACKEND_MOE_STREAM,
+            4096,
+            BenchSample {
+                gen_tok_s: 2.0,
+                ttft_ms: None,
+                prompt_tok_s: None,
+                cache_hit_pct: Some(40.0),
+                cache_mb: Some(2000),
+                measured_at: 1,
+            },
+        );
+        store.record_with_backend_key(
+            "qwen",
+            "local",
+            BACKEND_MOE_STREAM,
+            4096,
+            BenchSample {
+                gen_tok_s: 4.0,
+                ttft_ms: None,
+                prompt_tok_s: None,
+                cache_hit_pct: Some(90.0),
+                cache_mb: Some(6000),
+                measured_at: 2,
+            },
+        );
+        let rows: Vec<_> = store
+            .entries
+            .iter()
+            .filter(|e| e.backend == BACKEND_MOE_STREAM)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            store.lookup_moe_gen_tok_s("qwen", "local", 4096, 2000),
+            Some(2.0)
+        );
+        assert_eq!(
+            store.lookup_moe_gen_tok_s("qwen", "local", 4096, 6000),
+            Some(4.0)
+        );
+        let hit = store
+            .lookup_moe_cache_hit_exact("qwen", "local", 4096)
+            .expect("newest hit");
+        assert_eq!(hit.cache_mb, Some(6000));
+        assert!((hit.hit_pct - 90.0).abs() < 0.01);
     }
 }

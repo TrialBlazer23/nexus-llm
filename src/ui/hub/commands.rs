@@ -911,11 +911,7 @@ pub(crate) async fn build_target_selection(
             candidates: placement_candidates,
             enable_rpc: ctx.config.cluster.enable_rpc && ctx.config.cluster.auto_offload,
             bench: bench_store.as_ref(),
-            moe_stream_enabled: ctx.config.inference.moe.enabled,
-            moe_cache_ceil_mb: ctx.config.inference.moe.derive_cache_ceil_mb(
-                profile.available_ram_mb,
-                ctx.config.hardware.safety.max_ram_usage_percent,
-            ),
+            moe: &ctx.config.inference.moe,
         };
         if let Ok(plans) = rank_execution_plans(&req) {
             for plan in plans {
@@ -1207,47 +1203,42 @@ async fn run_local_load(
                     phase: "Selecting BigMoe flash-stream backend (local MoE)…".to_string(),
                 })
                 .await;
-            let (spawn_ctx, ceil_override) = resolve_moe_spawn_knobs(
+            let model_key = crate::cluster::moe_model_key(&gguf);
+            let bench = crate::bench::BenchStore::load_default().ok();
+            let Some(plan) = crate::cluster::plan_moe_spawn(
                 &gguf,
                 &profile,
-                &ctx.config,
+                &ctx.config.inference.moe,
+                ctx.config.hardware.safety.max_ram_usage_percent,
                 context_size,
-                moe_cache_ceil_mb,
-            );
-            let mut moe_cfg = ctx.config.inference.moe.clone();
-            let model_key = gguf
-                .model_name
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| gguf.quant_label.clone())
-                .unwrap_or_else(|| model_name.clone());
-            let lmk_budget_mb = profile
-                .max_allowed_memory_bytes_pct(ctx.config.hardware.safety.max_ram_usage_percent)
-                / (1024 * 1024);
-            let bench = crate::bench::BenchStore::load_default().ok();
-            let gov_notes = crate::cluster::apply_moe_governor_to_config(
-                &mut moe_cfg,
                 bench.as_ref(),
                 &model_key,
                 "local",
-                spawn_ctx,
-                lmk_budget_mb,
-            );
-            for note in &gov_notes {
+                crate::cluster::MoeCacheCap::from_optional_mb(moe_cache_ceil_mb),
+            ) else {
+                let _ = evt_tx
+                    .send(HubEvent::ModelFailed {
+                        message: "MoE stream LMK: no feasible (context, cache) plan on this node"
+                            .into(),
+                    })
+                    .await;
+                return;
+            };
+            for note in &plan.notes {
                 info!("{note}");
             }
             let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
-                PathBuf::from(&ctx.config.inference.moe.bmoe_binary),
+                PathBuf::from(&plan.moe.bmoe_binary),
                 model_path.clone(),
                 ctx.config.network.api_host.clone(),
                 ctx.config.network.api_port,
-                spawn_ctx,
+                plan.context_size,
                 threads,
-                moe_cfg,
+                plan.moe.clone(),
                 &profile,
                 ctx.config.hardware.safety.max_ram_usage_percent,
                 Vec::new(),
-                ceil_override,
+                Some(plan.cache_mb),
             );
             let _ = evt_tx
                 .send(HubEvent::ModelLoadProgress {
@@ -1520,43 +1511,6 @@ pub async fn request_load_or_hot_swap_with_args(
             extra_args,
             moe_cache_ceil_mb,
         })
-    }
-}
-
-/// Resolve MoE spawn knobs: honor an explicit planned ceil, else re-run the joint planner.
-fn resolve_moe_spawn_knobs(
-    gguf: &crate::gguf::GgufMetadata,
-    profile: &SystemProfile,
-    config: &NexusConfig,
-    desired_ctx: usize,
-    moe_cache_ceil_mb: Option<u64>,
-) -> (usize, Option<u64>) {
-    if let Some(ceil) = moe_cache_ceil_mb {
-        return (desired_ctx, Some(ceil));
-    }
-    let default_ceil = config.inference.moe.derive_cache_ceil_mb(
-        profile.available_ram_mb,
-        config.hardware.safety.max_ram_usage_percent,
-    );
-    let model_key = gguf
-        .model_name
-        .clone()
-        .filter(|s| !s.is_empty())
-        .or_else(|| gguf.quant_label.clone())
-        .unwrap_or_else(|| "unknown".into());
-    let bench = crate::bench::BenchStore::load_default().ok();
-    match crate::cluster::plan_moe_stream_knobs(
-        gguf,
-        profile,
-        config.hardware.safety.max_ram_usage_percent,
-        desired_ctx,
-        default_ceil,
-        bench.as_ref(),
-        &model_key,
-        "local",
-    ) {
-        Some(knobs) => (knobs.context_size, Some(knobs.cache_ceil_mb)),
-        None => (desired_ctx, None),
     }
 }
 

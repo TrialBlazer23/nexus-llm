@@ -226,7 +226,8 @@ fallback_to_cpu = true
 
 [inference.moe]
 enabled = true
-cache_mb = "auto"                             # expert RAM cache governor (e.g. 2048)
+cache_mb = "auto"                             # planner assigns expert cache under the LMK; 0 is off
+cache_ceil_mb = 0                             # 0 = no operator cap; a positive MiB value is a hard ceiling
 
 [inference.cache]
 enabled = true

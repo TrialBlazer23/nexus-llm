@@ -706,55 +706,43 @@ async fn handle_api_model_load(
             payload.context_size,
             budget_percent,
         ) {
-            let mut moe_cfg = moe;
-            let model_key = gguf
-                .model_name
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| gguf.quant_label.clone())
-                .unwrap_or_else(|| filename.clone());
-            let lmk_budget_mb =
-                profile.max_allowed_memory_bytes_pct(budget_percent) / (1024 * 1024);
+            let model_key = crate::cluster::moe_model_key(&gguf);
             let bench = crate::bench::BenchStore::load_default().ok();
-            let gov_notes = crate::cluster::apply_moe_governor_to_config(
-                &mut moe_cfg,
-                bench.as_ref(),
-                &model_key,
-                "local",
-                payload.context_size,
-                lmk_budget_mb,
-            );
-            for note in &gov_notes {
-                info!("{note}");
-            }
-            let default_ceil =
-                moe_cfg.derive_cache_ceil_mb(profile.available_ram_mb, budget_percent);
-            let knobs = crate::cluster::plan_moe_stream_knobs(
+            let Some(plan) = crate::cluster::plan_moe_spawn(
                 &gguf,
                 &profile,
+                &moe,
                 budget_percent,
                 payload.context_size,
-                default_ceil,
                 bench.as_ref(),
                 &model_key,
                 "local",
-            );
-            let (spawn_ctx, ceil_override) = match knobs {
-                Some(k) => (k.context_size, Some(k.cache_ceil_mb)),
-                None => (payload.context_size, None),
+                crate::cluster::MoeCacheCap::None,
+            ) else {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "success": false,
+                        "error": "MoE stream LMK: no feasible (context, cache) plan on this node"
+                    }),
+                );
             };
+            for note in &plan.notes {
+                info!("{note}");
+            }
+            let binary = PathBuf::from(&plan.moe.bmoe_binary);
             let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
-                PathBuf::from(&moe_cfg.bmoe_binary),
+                binary,
                 resolved_path.clone(),
                 "127.0.0.1",
                 ctx.api_port,
-                spawn_ctx,
+                plan.context_size,
                 threads,
-                moe_cfg,
+                plan.moe,
                 &profile,
                 budget_percent,
                 Vec::new(),
-                ceil_override,
+                Some(plan.cache_mb),
             );
             return match ctx.supervisor.spawn_bmoe(bmoe_cfg).await {
                 Ok(_) => {
@@ -1189,6 +1177,14 @@ async fn handle_config_get(ctx: Arc<GatewayContext>) -> Response<RespBody> {
                     "drop_cold_experts": cfg.inference.moe.drop_cold_experts,
                     "expert_substitute": cfg.inference.moe.expert_substitute,
                     "route_ahead": cfg.inference.moe.route_ahead,
+                    "min_cache_mb": cfg.inference.moe.min_cache_mb,
+                    "prefer": cfg.inference.moe.prefer,
+                    "adapt": cfg.inference.moe.adapt,
+                    "warm_hit_pct": cfg.inference.moe.warm_hit_pct,
+                    "cold_hit_pct": cfg.inference.moe.cold_hit_pct,
+                    "chronic_hit_pct": cfg.inference.moe.chronic_hit_pct,
+                    "working_set_factor": cfg.inference.moe.working_set_factor,
+                    "reference_tok_millis": cfg.inference.moe.reference_tok_millis,
                 }
             },
             "safety": {

@@ -153,9 +153,10 @@ impl BmoeSessionConfig {
 
     /// Like [`from_profile`], but applies a planned cache ceiling (and matches `--cache-mb`).
     ///
-    /// When `cache_ceil_override` is `Some(ceil)` with `ceil >= 2000`, both `--cache-ceil-mb`
-    /// and `--cache-mb` are set to that integer so LMK and BigMoe agree. `Some(0)` forces
-    /// cache off. `None` keeps `MoeConfig::derive_cache_ceil_mb` + configured `cache_mb`.
+    /// When `cache_ceil_override` is `Some(ceil)` at or above `min_cache_mb`, both
+    /// `--cache-ceil-mb` and `--cache-mb` are set to that integer. `Some(0)` and a value
+    /// under the minimum force cache off. `None` uses an operator `cache_ceil_mb` pin when
+    /// one is set, and otherwise leaves the configured `cache_mb` string alone.
     #[allow(clippy::too_many_arguments)]
     pub fn from_profile_with_ceil(
         binary: impl Into<PathBuf>,
@@ -170,16 +171,17 @@ impl BmoeSessionConfig {
         tags: Vec<String>,
         cache_ceil_override: Option<u64>,
     ) -> Self {
+        let _ = (profile, memory_budget_percent);
         let cache_ceil_mb = match cache_ceil_override {
-            Some(ceil) => {
-                if ceil >= 2000 {
-                    moe.cache_mb = ceil.to_string();
-                } else if ceil == 0 {
-                    moe.cache_mb = "0".into();
+            Some(ceil) => apply_cache_ceil(&mut moe, ceil),
+            None => {
+                let pin = moe.cache_ceil_mb;
+                if pin > 0 {
+                    apply_cache_ceil(&mut moe, pin)
+                } else {
+                    0
                 }
-                ceil
             }
-            None => moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent),
         };
         Self {
             binary_path: binary.into(),
@@ -193,6 +195,17 @@ impl BmoeSessionConfig {
             cache_ceil_mb,
             tags,
         }
+    }
+}
+
+fn apply_cache_ceil(moe: &mut MoeConfig, ceil: u64) -> u64 {
+    let legal = ceil > 0 && (moe.min_cache_mb == 0 || ceil >= moe.min_cache_mb);
+    if legal {
+        moe.cache_mb = ceil.to_string();
+        ceil
+    } else {
+        moe.cache_mb = "0".into();
+        0
     }
 }
 
@@ -358,6 +371,7 @@ impl BmoeRuntime {
                 .n_ctx
                 .map(|c| c as usize)
                 .unwrap_or(config.context_size),
+            cache_mb: config.cache_ceil_mb,
         };
         let listen_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
         // Prefer binding the configured host when it is loopback/unspecified.
@@ -431,7 +445,12 @@ impl BmoeRuntime {
                     if d.id.is_some_and(|i| i != id) {
                         continue;
                     }
-                    record_moe_bench_sample(&self.model_name(), self.config.context_size, &d);
+                    record_moe_bench_sample(
+                        &self.model_name(),
+                        self.config.context_size,
+                        self.config.cache_ceil_mb,
+                        &d,
+                    );
                     if let Some(t) = d.text {
                         if !t.is_empty() {
                             text = t;
@@ -595,10 +614,11 @@ struct AdapterState {
     next_id: Arc<AtomicU64>,
     model_name: String,
     context_size: usize,
+    cache_mb: u64,
 }
 
 /// Build a bench sample from `BMOE_DONE` when the generation completed with tok/s.
-fn moe_bench_sample_from_done(done: &BmoeDone) -> Option<BenchSample> {
+fn moe_bench_sample_from_done(done: &BmoeDone, cache_mb: u64) -> Option<BenchSample> {
     if done.cancelled == Some(true) {
         return None;
     }
@@ -608,13 +628,14 @@ fn moe_bench_sample_from_done(done: &BmoeDone) -> Option<BenchSample> {
         ttft_ms: None,
         prompt_tok_s: None,
         cache_hit_pct: done.cache_hit_pct.map(|v| v as f32),
+        cache_mb: Some(cache_mb),
         measured_at: unix_now(),
     })
 }
 
 /// Persist engine `BMOE_DONE` throughput into `~/.nexus/bench.json` (best-effort).
-fn record_moe_bench_sample(model_id: &str, context_size: usize, done: &BmoeDone) {
-    let Some(sample) = moe_bench_sample_from_done(done) else {
+fn record_moe_bench_sample(model_id: &str, context_size: usize, cache_mb: u64, done: &BmoeDone) {
+    let Some(sample) = moe_bench_sample_from_done(done, cache_mb) else {
         return;
     };
     BenchStore::record_default_best_effort_key(
@@ -777,7 +798,7 @@ async fn collect_generation(state: &AdapterState, id: i64) -> Result<String, Bmo
                 if d.id.is_some_and(|i| i != id) {
                     continue;
                 }
-                record_moe_bench_sample(&state.model_name, state.context_size, &d);
+                record_moe_bench_sample(&state.model_name, state.context_size, state.cache_mb, &d);
                 if let Some(t) = d.text {
                     if !t.is_empty() {
                         text = t;
@@ -831,7 +852,12 @@ fn sse_stream_generation(state: Arc<AdapterState>, id: i64) -> Response<RespBody
                     ))
                 }
                 Some(BmoeEvent::Done(d)) => {
-                    record_moe_bench_sample(&state.model_name, state.context_size, &d);
+                    record_moe_bench_sample(
+                        &state.model_name,
+                        state.context_size,
+                        state.cache_mb,
+                        &d,
+                    );
                     let chunk = json!({
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -914,18 +940,24 @@ pub fn should_use_bmoe(
     context_size: usize,
     memory_budget_percent: u8,
 ) -> bool {
-    if !moe.enabled {
+    if !moe.enabled || !gguf.streamable_moe() {
         return false;
     }
-    let ceil = moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent);
-    let cache_mb = if ceil > 0 {
-        ceil
-    } else if moe.resolved_cache_mb_arg() == "0" {
-        0
-    } else {
-        2000
-    };
-    profile.should_prefer_moe_stream(gguf, context_size, cache_mb, memory_budget_percent, true)
+    if profile.can_safely_load_gguf_pct(gguf, context_size, memory_budget_percent) {
+        return false;
+    }
+    crate::cluster::plan_moe_spawn(
+        gguf,
+        profile,
+        moe,
+        memory_budget_percent,
+        context_size,
+        None,
+        &crate::cluster::moe_model_key(gguf),
+        "local",
+        crate::cluster::MoeCacheCap::None,
+    )
+    .is_some()
 }
 
 #[cfg(test)]
@@ -1038,39 +1070,49 @@ mod tests {
 
     #[test]
     fn moe_bench_sample_from_done_filters() {
-        let ok = moe_bench_sample_from_done(&BmoeDone {
-            id: Some(1),
-            cancelled: Some(false),
-            tokens: Some(16),
-            tok_s: Some(2.35),
-            text: Some("ok".into()),
-            reasoning: None,
-            cache_hit_pct: Some(62.5),
-        })
+        let ok = moe_bench_sample_from_done(
+            &BmoeDone {
+                id: Some(1),
+                cancelled: Some(false),
+                tokens: Some(16),
+                tok_s: Some(2.35),
+                text: Some("ok".into()),
+                reasoning: None,
+                cache_hit_pct: Some(62.5),
+            },
+            3500,
+        )
         .expect("sample");
         assert!((ok.gen_tok_s - 2.35).abs() < 0.01);
         assert_eq!(ok.cache_hit_pct, Some(62.5));
+        assert_eq!(ok.cache_mb, Some(3500));
 
-        assert!(moe_bench_sample_from_done(&BmoeDone {
-            id: Some(2),
-            cancelled: Some(true),
-            tokens: Some(1),
-            tok_s: Some(9.0),
-            text: None,
-            reasoning: None,
-            cache_hit_pct: None,
-        })
+        assert!(moe_bench_sample_from_done(
+            &BmoeDone {
+                id: Some(2),
+                cancelled: Some(true),
+                tokens: Some(1),
+                tok_s: Some(9.0),
+                text: None,
+                reasoning: None,
+                cache_hit_pct: None,
+            },
+            0
+        )
         .is_none());
 
-        assert!(moe_bench_sample_from_done(&BmoeDone {
-            id: Some(3),
-            cancelled: None,
-            tokens: Some(1),
-            tok_s: Some(0.0),
-            text: None,
-            reasoning: None,
-            cache_hit_pct: None,
-        })
+        assert!(moe_bench_sample_from_done(
+            &BmoeDone {
+                id: Some(3),
+                cancelled: None,
+                tokens: Some(1),
+                tok_s: Some(0.0),
+                text: None,
+                reasoning: None,
+                cache_hit_pct: None,
+            },
+            0
+        )
         .is_none());
     }
 

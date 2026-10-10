@@ -366,6 +366,17 @@ pub struct InferenceConfig {
     pub moe: MoeConfig,
 }
 
+/// Which side of the MoE budget to protect when context and cache cannot both fit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MoeCachePreference {
+    /// Keep the requested context. Shrink the expert cache before stepping context down.
+    #[default]
+    Context,
+    /// Keep the working-set cache. Step context down before shrinking that cache.
+    Cache,
+}
+
 /// Quality mode for MoE streaming knobs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -400,9 +411,59 @@ pub struct MoeConfig {
     #[serde(default = "default_moe_cache_floor_mb")]
     pub cache_floor_mb: u64,
 
-    /// Cap for `auto` cache (MiB). `0` = derive from SystemProfile at load time.
+    /// Operator hard cap (MiB). `0` means no cap beyond the LMK room and working set.
     #[serde(default)]
     pub cache_ceil_mb: u64,
+
+    /// Smallest legal non-zero expert cache (MiB). BigMoe rejects the open interval below this.
+    /// `0` disables the floor. Otherwise must be >= 1500.
+    #[serde(default = "default_moe_min_cache_mb")]
+    pub min_cache_mb: u64,
+
+    /// `context` keeps the requested context and shrinks the expert cache first.
+    /// `cache` holds the working-set cache and steps context down first.
+    #[serde(default)]
+    pub prefer: MoeCachePreference,
+
+    /// When true, bench hit-rate may raise, hold, or (only to recover context) lower the cache target.
+    #[serde(default = "default_true")]
+    pub adapt: bool,
+
+    /// At or above this hit percent, do not shrink cache below the measured warm size to buy context.
+    #[serde(default = "default_moe_warm_hit_pct")]
+    pub warm_hit_pct: u8,
+
+    /// Below this hit percent, raise the cache target toward the LMK room.
+    #[serde(default = "default_moe_cold_hit_pct")]
+    pub cold_hit_pct: u8,
+
+    /// Below this hit percent, with enough samples, a lossy session may drop cold experts.
+    #[serde(default = "default_moe_chronic_hit_pct")]
+    pub chronic_hit_pct: u8,
+
+    /// Hit samples required before the chronic lossy overlay.
+    #[serde(default = "default_moe_chronic_min_samples")]
+    pub chronic_min_samples: u16,
+
+    /// Session-only `--drop-cold-experts` value used when the chronic rule fires.
+    #[serde(default = "default_moe_chronic_drop_cold")]
+    pub chronic_drop_cold: String,
+
+    /// Cold-start multiplier on one-step active expert bytes. Bench hit-rate replaces it.
+    #[serde(default = "default_moe_working_set_factor")]
+    pub working_set_factor: u32,
+
+    /// Cold-start tok/s prior in milli-tokens/sec (2200 = 2.20). Ignored once a sample exists.
+    #[serde(default = "default_moe_reference_tok_millis")]
+    pub reference_tok_millis: u32,
+
+    /// Top-k used when the GGUF omits `expert_used_count`.
+    #[serde(default = "default_moe_reference_active_experts")]
+    pub reference_active_experts: u32,
+
+    /// Expert count used when the GGUF omits `expert_count`.
+    #[serde(default = "default_moe_reference_expert_count")]
+    pub reference_expert_count: u32,
 
     /// Parallel O_DIRECT read lanes (1–8).
     #[serde(default = "default_moe_io_threads")]
@@ -441,6 +502,18 @@ impl Default for MoeConfig {
             cache_mb: default_moe_cache_mb(),
             cache_floor_mb: default_moe_cache_floor_mb(),
             cache_ceil_mb: 0,
+            min_cache_mb: default_moe_min_cache_mb(),
+            prefer: MoeCachePreference::Context,
+            adapt: true,
+            warm_hit_pct: default_moe_warm_hit_pct(),
+            cold_hit_pct: default_moe_cold_hit_pct(),
+            chronic_hit_pct: default_moe_chronic_hit_pct(),
+            chronic_min_samples: default_moe_chronic_min_samples(),
+            chronic_drop_cold: default_moe_chronic_drop_cold(),
+            working_set_factor: default_moe_working_set_factor(),
+            reference_tok_millis: default_moe_reference_tok_millis(),
+            reference_active_experts: default_moe_reference_active_experts(),
+            reference_expert_count: default_moe_reference_expert_count(),
             io_threads: default_moe_io_threads(),
             dense_weights: default_moe_dense_weights(),
             overlap: false,
@@ -453,29 +526,9 @@ impl Default for MoeConfig {
 }
 
 impl MoeConfig {
-    /// Derive an effective cache ceiling (MiB) from the probed profile and LMK percent.
-    ///
-    /// Leaves headroom for OS / dense resident weights: roughly
-    /// `0.45 * max_allowed_mb` clamped to a sensible phone range when unset.
-    pub fn derive_cache_ceil_mb(&self, available_ram_mb: u64, max_ram_usage_percent: u8) -> u64 {
-        if self.cache_ceil_mb > 0 {
-            return self.cache_ceil_mb;
-        }
-        let pct = u64::from(max_ram_usage_percent.clamp(1, 100));
-        let max_allowed = available_ram_mb.saturating_mul(pct) / 100;
-        // Leave floor + dense working set; expert cache gets ~45% of LMK budget.
-        let derived = (max_allowed.saturating_mul(45) / 100)
-            .saturating_sub(self.cache_floor_mb.min(max_allowed / 4));
-        // BigMoe rejects 1..1499 unless forced; keep ceil at 0 or ≥2000.
-        if derived < 2000 {
-            if max_allowed >= 2500 {
-                2000
-            } else {
-                0 // cache off / auto will decide
-            }
-        } else {
-            derived.min(max_allowed.saturating_sub(self.cache_floor_mb))
-        }
+    /// Cold-start tok/s prior. Measured bench samples replace this.
+    pub fn reference_tok_s(&self) -> f32 {
+        self.reference_tok_millis as f32 / 1000.0
     }
 
     /// Resolve `--cache-mb` CLI value (passes through `auto` / `0` / integer).
@@ -517,9 +570,47 @@ impl MoeConfig {
                     "inference.moe.cache_mb must be auto, 0, or an integer MiB".into(),
                 )
             })?;
-            if (1..1500).contains(&n) {
+            let floor = if self.min_cache_mb == 0 {
+                1
+            } else {
+                self.min_cache_mb
+            };
+            if (1..floor).contains(&n) {
+                return Err(ConfigError::Invalid(format!(
+                    "inference.moe.cache_mb must be 0 or >= {floor} (min_cache_mb)"
+                )));
+            }
+        }
+        if self.min_cache_mb != 0 && self.min_cache_mb < 1500 {
+            return Err(ConfigError::Invalid(
+                "inference.moe.min_cache_mb must be 0 or >= 1500".into(),
+            ));
+        }
+        if self.working_set_factor < 1 {
+            return Err(ConfigError::Invalid(
+                "inference.moe.working_set_factor must be >= 1".into(),
+            ));
+        }
+        if self.reference_tok_millis < 1 {
+            return Err(ConfigError::Invalid(
+                "inference.moe.reference_tok_millis must be >= 1".into(),
+            ));
+        }
+        if self.reference_active_experts < 1 || self.reference_expert_count < 1 {
+            return Err(ConfigError::Invalid(
+                "inference.moe reference expert counts must be >= 1".into(),
+            ));
+        }
+        if !(self.warm_hit_pct > self.cold_hit_pct && self.cold_hit_pct > self.chronic_hit_pct) {
+            return Err(ConfigError::Invalid(
+                "inference.moe hit percents must satisfy warm > cold > chronic".into(),
+            ));
+        }
+        match self.chronic_drop_cold.trim().parse::<f32>() {
+            Ok(v) if v >= 0.0 => {}
+            _ => {
                 return Err(ConfigError::Invalid(
-                    "inference.moe.cache_mb must be 0 or >= 1500 (BigMoe cache rule)".into(),
+                    "inference.moe.chronic_drop_cold must be a non-negative number".into(),
                 ));
             }
         }
@@ -546,6 +637,46 @@ fn default_moe_cache_mb() -> String {
 
 fn default_moe_cache_floor_mb() -> u64 {
     1536
+}
+
+fn default_moe_min_cache_mb() -> u64 {
+    2000
+}
+
+fn default_moe_warm_hit_pct() -> u8 {
+    70
+}
+
+fn default_moe_cold_hit_pct() -> u8 {
+    40
+}
+
+fn default_moe_chronic_hit_pct() -> u8 {
+    25
+}
+
+fn default_moe_chronic_min_samples() -> u16 {
+    3
+}
+
+fn default_moe_chronic_drop_cold() -> String {
+    "0.85".to_string()
+}
+
+fn default_moe_working_set_factor() -> u32 {
+    4
+}
+
+fn default_moe_reference_tok_millis() -> u32 {
+    2200
+}
+
+fn default_moe_reference_active_experts() -> u32 {
+    8
+}
+
+fn default_moe_reference_expert_count() -> u32 {
+    128
 }
 
 fn default_moe_io_threads() -> u8 {

@@ -35,8 +35,8 @@ bytes = "1"
 http = "1"
 libc = "0.2"
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.10"
 hmac = "0.12"
 crc16 = "0.4"
 tokio-stream = "0.1"

@@ -1,7 +1,8 @@
 //! Ed25519 node identity persisted at `~/.nexus/node.key`.
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,7 +30,7 @@ pub struct NodeIdentity {
 
 impl NodeIdentity {
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut UnwrapErr(SysRng));
         Self { signing_key }
     }
 

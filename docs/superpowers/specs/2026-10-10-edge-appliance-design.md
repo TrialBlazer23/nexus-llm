@@ -68,6 +68,8 @@ Routing, fit, and rank read only:
 - link class and measured or assigned link quality
 - GGUF metadata and bench samples
 
+`free_ram_mb` and `total_ram_mb` are raw `MemAvailable` and `MemTotal`, the same numbers beacon bytes `0x20` and `0x1C` carry. `allocatable_memory_mb` is that peer's own budget (`MemAvailable * memory_budget_percent / 100`). Fit applies the hub `max_ram_usage_percent` once to raw free RAM through `SystemProfile::from_advertised`. A USB probe does not store `allocatable_memory_mb` in `free_ram_mb`. The backend is the peer's probed `AccelerationBackend`, not a capability string.
+
 The following are forbidden as behavior inputs: marketing names, `ro.product.model`, ADB `product:` strings, fixed RAM constants for a known device, and a built-in table of serials. Tests use synthetic serials such as `serial-a`. They must not branch on a real product string.
 
 `config.node.name` on each phone remains the operator-facing label (`PeerNode.display_name`). If the name is empty, the label stays `Node-<uuid8>`.
@@ -120,7 +122,9 @@ adb -s <serial> reverse tcp:<device_rpc> tcp:<local_rpc>
 
 After the control forward succeeds, `POST /nexus/control/v1/state` on `http://127.0.0.1:<host_control>`. Signing follows the existing rule: sign when `require_pairing` is true, allow the current unsigned request when it is false.
 
-A successful body supplies the UUID, display name, allocatable memory, capabilities, and the new battery fields. Persist:
+A successful body supplies the UUID, display name, allocatable memory, capabilities, and the new battery fields. The body also supplies optional `available_ram_mb`, `total_ram_mb`, and `backend` (`vulkan`, `arm-dotprod`, `x86-sse41`, or `cpu`). Missing keys are an older peer. The hub leaves a positive beacon `free_ram_mb`, a positive `total_ram_mb`, and an existing backend in place when the matching key is missing or the backend token does not parse. A new peer with those keys missing stores `free_ram_mb = allocatable_memory_mb * 100 / hub max_ram_usage_percent` and `AccelerationBackend::GenericCpu`. `Some(0)` for either RAM field is treated as missing.
+
+Persist:
 
 ```json
 {

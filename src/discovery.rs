@@ -535,6 +535,8 @@ fn mb_u32(mb: u64) -> u32 {
     u32::try_from(mb).unwrap_or(u32::MAX)
 }
 
+// USB probe merge reads `state.backend`, not capability strings.
+#[allow(dead_code)]
 fn backend_hint(capabilities: &[String]) -> Option<AccelerationBackend> {
     capabilities
         .iter()
@@ -544,6 +546,68 @@ fn backend_hint(capabilities: &[String]) -> Option<AccelerationBackend> {
             "x86_baseline" | "x86-baseline" => Some(AccelerationBackend::X86Baseline),
             _ => None,
         })
+}
+
+fn parse_state_backend(raw: &str) -> Option<AccelerationBackend> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(backend) = crate::bench::parse_backend_key(key) {
+        return Some(backend);
+    }
+    match key {
+        "Vulkan" => Some(AccelerationBackend::Vulkan),
+        "ArmCpuDotProd" => Some(AccelerationBackend::ArmCpuDotProd),
+        "X86Baseline" => Some(AccelerationBackend::X86Baseline),
+        "GenericCpu" => Some(AccelerationBackend::GenericCpu),
+        _ => None,
+    }
+}
+
+fn free_ram_from_allocatable(allocatable_mb: u64, hub_percent: u8) -> u32 {
+    let pct = u32::from(hub_percent.clamp(1, 100));
+    let free = u128::from(allocatable_mb).saturating_mul(100) / u128::from(pct);
+    mb_u32(u64::try_from(free).unwrap_or(u64::MAX))
+}
+
+fn advertised_free_ram(
+    state: &crate::control_plane::ControlPlaneState,
+    previous_free: u32,
+    hub_percent: u8,
+) -> u32 {
+    match state.available_ram_mb {
+        Some(mb) if mb > 0 => mb_u32(mb),
+        _ if previous_free > 0 => previous_free,
+        _ => free_ram_from_allocatable(state.allocatable_memory_mb, hub_percent),
+    }
+}
+
+fn advertised_total_ram(
+    state: &crate::control_plane::ControlPlaneState,
+    previous_total: u32,
+    free: u32,
+) -> u32 {
+    let total = match state.total_ram_mb {
+        Some(mb) if mb > 0 => mb_u32(mb),
+        _ if previous_total > 0 => previous_total,
+        _ => free,
+    };
+    total.max(free)
+}
+
+fn advertised_backend(
+    state: &crate::control_plane::ControlPlaneState,
+) -> Option<AccelerationBackend> {
+    state.backend.as_deref().and_then(parse_state_backend)
+}
+
+fn set_vulkan_flag(status: &mut StatusFlags, backend: AccelerationBackend) {
+    if backend == AccelerationBackend::Vulkan {
+        status.0 |= StatusFlags::VULKAN_ACTIVE.0;
+    } else {
+        status.0 &= !StatusFlags::VULKAN_ACTIVE.0;
+    }
 }
 
 fn status_from_state(
@@ -582,16 +646,11 @@ fn stale_seen() -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit) {
+fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit, hub_ram_percent: u8) {
     let id = hit.state.node_id;
     if let Some(peer) = peers.get_mut(&id) {
         if !hit.state.display_name.trim().is_empty() {
             peer.display_name = hit.state.display_name.clone();
-        }
-        let mem = mb_u32(hit.state.allocatable_memory_mb);
-        peer.free_ram_mb = mem;
-        if peer.total_ram_mb == 0 {
-            peer.total_ram_mb = mem;
         }
         if hit
             .state
@@ -605,17 +664,25 @@ fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit) {
         peer.power_source = hit.state.power_source;
         peer.role = hit.state.role;
         peer.status = status_from_state(&hit.state, peer.status);
+        let free = advertised_free_ram(&hit.state, peer.free_ram_mb, hub_ram_percent);
+        peer.free_ram_mb = free;
+        peer.total_ram_mb = advertised_total_ram(&hit.state, peer.total_ram_mb, free);
+        if let Some(backend) = advertised_backend(&hit.state) {
+            peer.backend = backend;
+            set_vulkan_flag(&mut peer.status, backend);
+        }
         if let Some(model) = &hit.state.active_model {
             peer.active_model = model.clone();
-        }
-        if let Some(backend) = backend_hint(&hit.state.capabilities) {
-            peer.backend = backend;
         }
         peer.apply_usb_probe(&hit.serial, hit.host_api, hit.host_control);
         return;
     }
 
-    let mem = mb_u32(hit.state.allocatable_memory_mb);
+    let free = advertised_free_ram(&hit.state, 0, hub_ram_percent);
+    let total = advertised_total_ram(&hit.state, 0, free);
+    let backend = advertised_backend(&hit.state).unwrap_or(AccelerationBackend::GenericCpu);
+    let mut status = status_from_state(&hit.state, StatusFlags(0));
+    set_vulkan_flag(&mut status, backend);
     let rpc_port = if hit.state.rpc_ready {
         hit.device_rpc
     } else {
@@ -628,13 +695,13 @@ fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit) {
             hit.device_api,
         ),
         role: hit.state.role,
-        status: status_from_state(&hit.state, StatusFlags(0)),
+        status,
         api_port: hit.device_api,
         rpc_port,
         control_port: hit.device_control,
-        total_ram_mb: mem,
-        free_ram_mb: mem,
-        backend: backend_hint(&hit.state.capabilities).unwrap_or(AccelerationBackend::GenericCpu),
+        total_ram_mb: total,
+        free_ram_mb: free,
+        backend,
         thermal_index: 0,
         active_model: hit.state.active_model.clone().unwrap_or_default(),
         display_name: hit.state.display_name.clone(),
@@ -667,6 +734,7 @@ pub fn fold_usb_probes(
     hits: &[UsbProbeHit],
     present_serials: &[String],
     listed_forwards: &[(String, u16)],
+    hub_ram_percent: u8,
 ) -> UsbFold {
     use std::collections::HashSet;
 
@@ -703,7 +771,7 @@ pub fn fold_usb_probes(
             device_control_port: hit.device_control,
             device_rpc_port: hit.device_rpc,
         });
-        apply_probe_hit(peers, hit);
+        apply_probe_hit(peers, hit, hub_ram_percent);
     }
 
     cache.retain_present(present_serials);
@@ -946,7 +1014,14 @@ impl DiscoveryService {
     ) -> UsbFold {
         let fold = {
             let mut peers = self.peers.write().await;
-            fold_usb_probes(&mut peers, cache, hits, present_serials, listed_forwards)
+            fold_usb_probes(
+                &mut peers,
+                cache,
+                hits,
+                present_serials,
+                listed_forwards,
+                self.cfg().hardware.safety.max_ram_usage_percent,
+            )
         };
         for id in &fold.dropped {
             self.remove_peer(*id).await;
@@ -2382,7 +2457,7 @@ mod tests {
             ("serial-old".into(), 18084u16),
             ("serial-old".into(), 18085),
         ];
-        let fold = fold_usb_probes(&mut peers, &mut cache, &hits, &present, &listed);
+        let fold = fold_usb_probes(&mut peers, &mut cache, &hits, &present, &listed, 75);
 
         let winner = &peers[&shared];
         assert_eq!(winner.link_class, LinkClass::Usb);
@@ -2462,10 +2537,186 @@ mod tests {
         assert_eq!(cache.ports_for("serial-c"), Some((8080, 9998, 50052)));
 
         let present_now = vec!["serial-a".into(), "serial-d".into()];
-        let fold_gone = fold_usb_probes(&mut peers, &mut cache, &[], &present_now, &[]);
+        let fold_gone = fold_usb_probes(&mut peers, &mut cache, &[], &present_now, &[], 75);
         assert!(!peers.contains_key(&created));
         assert!(fold_gone.dropped.contains(&created));
         assert_eq!(peers[&shared].link_class, LinkClass::Wifi);
         assert_eq!(peers[&shared].addr, "192.168.1.20:9999".parse().unwrap());
+    }
+
+    fn budget_mb(peer: &PeerNode, percent: u8) -> u64 {
+        use crate::sysinfo::SystemProfile;
+        SystemProfile::from_advertised(
+            u64::from(peer.free_ram_mb),
+            u64::from(peer.total_ram_mb),
+            peer.backend,
+        )
+        .max_allowed_memory_bytes_pct(percent)
+            / (1024 * 1024)
+    }
+
+    fn advertised_state(id: Uuid) -> crate::control_plane::ControlPlaneState {
+        let mut state = probe_state(id, "phone");
+        state.allocatable_memory_mb = 9_000;
+        state.available_ram_mb = Some(12_000);
+        state.total_ram_mb = Some(16_000);
+        state.backend = Some("vulkan".into());
+        state.capabilities = vec!["inference".into()];
+        state
+    }
+
+    #[test]
+    fn usb_probe_stores_raw_ram_and_vulkan_backend() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(11);
+        let mut peers = HashMap::new();
+        apply_probe_hit(
+            &mut peers,
+            &hit("serial-a", 18080, advertised_state(id)),
+            75,
+        );
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 12_000);
+        assert_eq!(peer.total_ram_mb, 16_000);
+        assert_eq!(peer.backend, AccelerationBackend::Vulkan);
+        assert!(peer.status.is_vulkan_active());
+        assert_eq!(peer.link_class, LinkClass::Usb);
+        assert_eq!(peer.control_endpoint(), "http://127.0.0.1:18081");
+        // 75% of raw 12000. Storing allocatable 9000 would budget 6750.
+        assert_eq!(budget_mb(peer, 75), 9_000);
+    }
+
+    #[test]
+    fn usb_probe_accepts_pascal_case_backend_and_refreshes_ram() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(11);
+        let mut peers = HashMap::new();
+        apply_probe_hit(
+            &mut peers,
+            &hit("serial-a", 18080, advertised_state(id)),
+            75,
+        );
+        let mut refreshed = advertised_state(id);
+        refreshed.available_ram_mb = Some(11_000);
+        refreshed.backend = Some("ArmCpuDotProd".into());
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, refreshed), 75);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 11_000);
+        assert_eq!(peer.total_ram_mb, 16_000);
+        assert_eq!(peer.backend, AccelerationBackend::ArmCpuDotProd);
+        assert!(!peer.status.is_vulkan_active());
+        assert_eq!(budget_mb(peer, 75), 11_000 * 75 / 100);
+    }
+
+    #[test]
+    fn old_usb_state_does_not_clobber_beacon_ram_or_backend() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(7);
+        let mut beaconed = usb_fixture();
+        beaconed.uuid = id;
+        beaconed.free_ram_mb = 12_000;
+        beaconed.total_ram_mb = 16_000;
+        beaconed.backend = AccelerationBackend::Vulkan;
+        beaconed.status.0 |= StatusFlags::VULKAN_ACTIVE.0;
+        let mut peers = HashMap::new();
+        peers.insert(id, beaconed);
+        let mut old = probe_state(id, "phone");
+        old.allocatable_memory_mb = 9_000;
+        old.backend = Some("nope".into());
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, old), 75);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 12_000);
+        assert_eq!(peer.total_ram_mb, 16_000);
+        assert_eq!(peer.backend, AccelerationBackend::Vulkan);
+        assert!(peer.status.is_vulkan_active());
+        assert_eq!(budget_mb(peer, 75), 9_000);
+
+        let mut refresh = probe_state(id, "phone");
+        refresh.available_ram_mb = Some(11_000);
+        refresh.total_ram_mb = Some(16_000);
+        refresh.backend = Some("nope".into());
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, refresh), 75);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 11_000);
+        assert_eq!(peer.total_ram_mb, 16_000);
+        assert_eq!(peer.backend, AccelerationBackend::Vulkan);
+        assert_eq!(budget_mb(peer, 75), 11_000 * 75 / 100);
+    }
+
+    #[test]
+    fn old_usb_state_can_replace_backend_when_the_token_parses() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(7);
+        let mut beaconed = usb_fixture();
+        beaconed.uuid = id;
+        beaconed.free_ram_mb = 12_000;
+        beaconed.total_ram_mb = 16_000;
+        beaconed.backend = AccelerationBackend::Vulkan;
+        beaconed.status.0 |= StatusFlags::VULKAN_ACTIVE.0;
+        let mut peers = HashMap::new();
+        peers.insert(id, beaconed);
+        let mut state = probe_state(id, "phone");
+        state.available_ram_mb = Some(11_000);
+        state.total_ram_mb = Some(16_000);
+        state.backend = Some("cpu".into());
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, state), 75);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 11_000);
+        assert_eq!(peer.backend, AccelerationBackend::GenericCpu);
+        assert!(!peer.status.is_vulkan_active());
+    }
+
+    #[test]
+    fn new_peer_from_old_state_inverts_allocatable_once() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(11);
+        let mut peers = HashMap::new();
+        let mut old = probe_state(id, "phone");
+        old.allocatable_memory_mb = 9_000;
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, old.clone()), 75);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 12_000);
+        assert_eq!(peer.total_ram_mb, 12_000);
+        assert_eq!(peer.backend, AccelerationBackend::GenericCpu);
+        assert!(!peer.status.is_vulkan_active());
+        assert_eq!(budget_mb(peer, 75), 9_000);
+
+        let mut peers = HashMap::new();
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, old), 60);
+        let peer = &peers[&id];
+        assert_eq!(peer.free_ram_mb, 15_000);
+        assert_eq!(budget_mb(peer, 60), 9_000);
+    }
+
+    #[tokio::test]
+    async fn folded_probe_uses_config_ram_percent() {
+        use crate::adb_links::AdbLinkCache;
+        let discovery = DiscoveryService::new(NexusConfig::default(), Some(Uuid::from_u128(1)));
+        {
+            let cfg = discovery.shared_config();
+            cfg.write()
+                .expect("config")
+                .hardware
+                .safety
+                .max_ram_usage_percent = 60;
+        }
+        let id = Uuid::from_u128(11);
+        let mut cache = AdbLinkCache::default();
+        let mut old = probe_state(id, "phone");
+        old.allocatable_memory_mb = 9_000;
+        let hits = vec![hit("serial-a", 18080, old)];
+        discovery
+            .apply_folded_usb_probes(&mut cache, &hits, &["serial-a".into()], &[])
+            .await;
+        let peer = discovery
+            .peers()
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("peer");
+        assert_eq!(peer.free_ram_mb, 15_000);
+        assert_eq!(peer.backend, AccelerationBackend::GenericCpu);
+        assert_eq!(budget_mb(&peer, 60), 9_000);
     }
 }

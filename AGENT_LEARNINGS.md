@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — USB probe RAM and backend use beacon units
+- Category: bug
+- Context: After the edge-appliance merge, `apply_probe_hit` stored `ControlPlaneState.allocatable_memory_mb` in `PeerNode.free_ram_mb`. The ladder applies `max_ram_usage_percent` to `free_ram_mb`, so a 75% phone was planned at about 56% of MemAvailable, and a later probe overwrote a good beacon value. A peer created only from USB state became GenericCpu unless capabilities contained `vulkan`, so `peer_offload_layers` sent `gpu_layers` 0. Phone capabilities are feature flags and do not include `vulkan`.
+- Finding: Beacon `free_ram_mb` is raw MemAvailable and beacon `backend` is the probed AccelerationBackend. `allocatable_memory_mb` is already the phone's own percent of MemAvailable. The state handler already calls `SystemProfile::probe()`.
+- Action: State carries optional `available_ram_mb`, `total_ram_mb`, and bench `backend`. The probe writes those into the peer. An older body does not clobber positive beacon RAM or an existing backend. A new peer with the fields missing uses `allocatable * 100 / hub max_ram_usage_percent` and GenericCpu. Do not put the backend into capabilities, do not change the ladder percent, and do not change `peer_offload_layers`.
+- Verification: `cargo test --locked -- --test-threads=8` on this tree. No live adb and no device.
+
 ## 2026-10-10 — Appliance front door stays resident; pantry load waits for the catalog
 - Category: bug
 - Context: Edge appliance review. Hub and `nexusd` only logged the section 10.2 file. Fetch returned `accepted` before `{digest}.gguf` existed, and the load used the source filename. The hub client left the gateway after the first load. Idle unload deleted the peer before the HTTP call and awaited it on the TUI tick. Status-role SSE was stored as assistant text.

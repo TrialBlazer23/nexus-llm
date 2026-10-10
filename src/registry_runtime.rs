@@ -1,8 +1,7 @@
 //! Background peer-registry maintenance and control-plane verification.
 
 use crate::control_plane::{
-    endpoint_from_state, fetch_state, fetch_state_signed, validate_state, ControlPlaneRequest,
-    CONTROL_PLANE_VERSION,
+    fetch_state, fetch_state_signed, validate_state, ControlPlaneRequest, CONTROL_PLANE_VERSION,
 };
 use crate::discovery::{DiscoveryService, ServiceEndpoint};
 use crate::node_identity::NodeIdentity;
@@ -136,12 +135,7 @@ async fn run_verifier(
             continue;
         }
 
-        let verified_endpoint = endpoint_from_state(&state, &endpoint);
-        if let Err(err) = discovery.peer_registry().write().await.mark_verified(
-            node_id,
-            verified_endpoint,
-            Instant::now(),
-        ) {
+        if let Err(err) = discovery.apply_verified_state(&state, &endpoint).await {
             warn!("Registry mark_verified failed for {}: {}", node_id, err);
         } else {
             debug!("Peer {} verified via control plane", node_id);

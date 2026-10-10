@@ -154,7 +154,10 @@ fn endpoint_from_resolved(
 }
 
 /// Read advertisement TXT without resolving a host or starting a daemon.
-fn endpoint_from_properties(
+///
+/// A missing `bat` or `pwr` is `None` / [`PowerSource::Unknown`]. Callers must
+/// not treat those defaults as a clear of a stored reading.
+pub(crate) fn endpoint_from_properties(
     properties: &HashMap<String, String>,
     service_port: u16,
 ) -> Result<ServiceEndpoint, MdnsError> {

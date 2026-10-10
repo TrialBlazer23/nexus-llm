@@ -1,4 +1,5 @@
 use crate::discovery::{BackendHealth, DiscoveryEvent, NodeRole, ServiceEndpoint};
+use crate::sysinfo::PowerSource;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -163,7 +164,12 @@ impl PeerRegistry {
         if endpoint.node_id != node_id {
             return Err(RegistryError::EndpointConflict(node_id));
         }
+        let battery_percent = endpoint.battery_percent;
+        let power_source = endpoint.power_source;
         merge_endpoint(&mut peer.endpoint, endpoint);
+        // State overwrites a TXT hint, including a null percent and unknown power.
+        peer.endpoint.battery_percent = battery_percent;
+        peer.endpoint.power_source = power_source;
         peer.verified = true;
         peer.lifecycle = PeerLifecycle::Healthy;
         peer.last_seen = now;
@@ -257,8 +263,31 @@ fn merge_endpoint(current: &mut ServiceEndpoint, observed: ServiceEndpoint) {
     current.capabilities = observed.capabilities;
     current.api_port = observed.api_port;
     current.rpc_port = observed.rpc_port;
-    current.battery_percent = observed.battery_percent;
-    current.power_source = observed.power_source;
+    // UDP and mDNS observations carry battery only as a hint. Missing, empty,
+    // out-of-range, and `pwr=unknown` must not clear a stored reading.
+    apply_power_hint(
+        &mut current.battery_percent,
+        &mut current.power_source,
+        observed.battery_percent,
+        observed.power_source,
+    );
+}
+
+/// Apply a TXT battery hint. `None` and [`PowerSource::Unknown`] are not hints.
+pub(crate) fn apply_power_hint(
+    battery_percent: &mut Option<u8>,
+    power_source: &mut PowerSource,
+    observed_percent: Option<u8>,
+    observed_power: PowerSource,
+) {
+    if let Some(percent) = observed_percent {
+        if percent <= 100 {
+            *battery_percent = Some(percent);
+        }
+    }
+    if matches!(observed_power, PowerSource::Ac | PowerSource::Battery) {
+        *power_source = observed_power;
+    }
 }
 
 impl From<&PeerRecord> for SocketAddr {

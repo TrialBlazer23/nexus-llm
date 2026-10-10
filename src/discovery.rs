@@ -1,6 +1,6 @@
 use crate::cluster::LinkClass;
 use crate::config::NexusConfig;
-use crate::peer_registry::{ObservationSource, PeerLifecycle, PeerRegistry};
+use crate::peer_registry::{apply_power_hint, ObservationSource, PeerLifecycle, PeerRegistry};
 use crate::sysinfo::{AccelerationBackend, PowerSource, SystemProfile};
 use crate::trust_auth::pairing_enforced;
 use serde::{Deserialize, Serialize};
@@ -451,6 +451,49 @@ impl PeerNode {
             battery_percent: self.battery_percent,
             power_source: self.power_source,
         }
+    }
+}
+
+/// Beacon v1 has no USB or battery fields. Copy them from the peer we already know.
+fn peer_from_beacon(
+    existing: Option<&PeerNode>,
+    beacon: &BeaconPacket,
+    peer_ip: std::net::IpAddr,
+    default_control_port: u16,
+) -> PeerNode {
+    let control_port = existing
+        .map(|peer| peer.control_port)
+        .unwrap_or(default_control_port);
+    let display_name = existing
+        .map(|peer| peer.display_name.clone())
+        .unwrap_or_default();
+    PeerNode {
+        uuid: beacon.uuid,
+        addr: SocketAddr::new(peer_ip, beacon.api_port),
+        role: beacon.role,
+        status: beacon.status,
+        api_port: beacon.api_port,
+        rpc_port: beacon.rpc_port,
+        control_port,
+        total_ram_mb: beacon.total_ram_mb,
+        free_ram_mb: beacon.free_ram_mb,
+        backend: beacon.backend,
+        thermal_index: beacon.thermal_index,
+        active_model: beacon.active_model.clone(),
+        display_name,
+        moe_stream: existing.map(|peer| peer.moe_stream).unwrap_or(false),
+        moe_cache_ceil_mb: existing.map(|peer| peer.moe_cache_ceil_mb).unwrap_or(0),
+        link_class: existing
+            .map(|peer| peer.link_class)
+            .unwrap_or(LinkClass::Wifi),
+        usb_serial: existing.and_then(|peer| peer.usb_serial.clone()),
+        usb_api_endpoint: existing.and_then(|peer| peer.usb_api_endpoint.clone()),
+        usb_control_endpoint: existing.and_then(|peer| peer.usb_control_endpoint.clone()),
+        battery_percent: existing.and_then(|peer| peer.battery_percent),
+        power_source: existing
+            .map(|peer| peer.power_source)
+            .unwrap_or(PowerSource::Unknown),
+        last_seen: Instant::now(),
     }
 }
 
@@ -910,79 +953,8 @@ impl DiscoveryService {
                                         "Received valid beacon from {:?} ({:?})",
                                         peer_addr, beacon.uuid
                                     );
-                                    let mut peers = self.peers.write().await;
-                                    // Beacon v1 has no control_port or display_name; preserve
-                                    // mDNS-learned values, otherwise assume mesh defaults.
-                                    let existing = peers.get(&beacon.uuid);
-                                    let default_control_port = self
-                                        .config
-                                        .read()
-                                        .expect("config lock")
-                                        .network
-                                        .control_port;
-                                    let control_port = existing
-                                        .map(|p| p.control_port)
-                                        .unwrap_or(default_control_port);
-                                    let display_name = existing
-                                        .map(|p| p.display_name.clone())
-                                        .unwrap_or_default();
-                                    // Beacon v1 cannot carry USB or battery. Copy them so a
-                                    // refresh does not clear a live forward or the last TXT reading.
-                                    let link_class = existing
-                                        .map(|peer| peer.link_class)
-                                        .unwrap_or(LinkClass::Wifi);
-                                    let usb_serial =
-                                        existing.and_then(|peer| peer.usb_serial.clone());
-                                    let usb_api_endpoint =
-                                        existing.and_then(|peer| peer.usb_api_endpoint.clone());
-                                    let usb_control_endpoint =
-                                        existing.and_then(|peer| peer.usb_control_endpoint.clone());
-                                    let battery_percent =
-                                        existing.and_then(|peer| peer.battery_percent);
-                                    let power_source = existing
-                                        .map(|peer| peer.power_source)
-                                        .unwrap_or(PowerSource::Unknown);
-                                    let peer = PeerNode {
-                                        uuid: beacon.uuid,
-                                        addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
-                                        role: beacon.role,
-                                        status: beacon.status,
-                                        api_port: beacon.api_port,
-                                        rpc_port: beacon.rpc_port,
-                                        control_port,
-                                        total_ram_mb: beacon.total_ram_mb,
-                                        free_ram_mb: beacon.free_ram_mb,
-                                        backend: beacon.backend,
-                                        thermal_index: beacon.thermal_index,
-                                        active_model: beacon.active_model,
-                                        display_name,
-                                        moe_stream: existing.map(|p| p.moe_stream).unwrap_or(false),
-                                        moe_cache_ceil_mb: existing
-                                            .map(|p| p.moe_cache_ceil_mb)
-                                            .unwrap_or(0),
-                                        link_class,
-                                        usb_serial,
-                                        usb_api_endpoint,
-                                        usb_control_endpoint,
-                                        battery_percent,
-                                        power_source,
-                                        last_seen: Instant::now(),
-                                    };
-
-                                    let event = if peers.contains_key(&beacon.uuid) {
-                                        DiscoveryEvent::ServiceUpdated(peer.service_endpoint())
-                                    } else {
-                                        DiscoveryEvent::ServiceFound(peer.service_endpoint())
-                                    };
-                                    peers.insert(beacon.uuid, peer);
-                                    drop(peers);
-                                    if let Err(error) = self.registry.write().await.apply_event(
-                                        event.clone(),
-                                        ObservationSource::Udp,
-                                        Instant::now(),
-                                    ) {
-                                        warn!("Rejected UDP peer observation: {}", error);
-                                    }
+                                    let event =
+                                        self.rebuild_peer_from_beacon(&beacon, peer_addr).await;
                                     if let Some(sender) = &events {
                                         let _ = sender.send(event).await;
                                     }
@@ -1240,6 +1212,62 @@ impl DiscoveryService {
         }
     }
 
+    /// Replace the cached peer with this beacon, keeping USB and battery fields.
+    async fn rebuild_peer_from_beacon(
+        &self,
+        beacon: &BeaconPacket,
+        peer_addr: SocketAddr,
+    ) -> DiscoveryEvent {
+        let mut peers = self.peers.write().await;
+        let default_control_port = self
+            .config
+            .read()
+            .expect("config lock")
+            .network
+            .control_port;
+        let peer = peer_from_beacon(
+            peers.get(&beacon.uuid),
+            beacon,
+            peer_addr.ip(),
+            default_control_port,
+        );
+        let event = if peers.contains_key(&beacon.uuid) {
+            DiscoveryEvent::ServiceUpdated(peer.service_endpoint())
+        } else {
+            DiscoveryEvent::ServiceFound(peer.service_endpoint())
+        };
+        peers.insert(beacon.uuid, peer);
+        drop(peers);
+        if let Err(error) = self.registry.write().await.apply_event(
+            event.clone(),
+            ObservationSource::Udp,
+            Instant::now(),
+        ) {
+            warn!("Rejected UDP peer observation: {}", error);
+        }
+        event
+    }
+
+    /// Control-plane state overwrites a TXT battery hint on the registry record and the live peer.
+    pub async fn apply_verified_state(
+        &self,
+        state: &crate::control_plane::ControlPlaneState,
+        endpoint: &ServiceEndpoint,
+    ) -> Result<(), crate::peer_registry::RegistryError> {
+        {
+            let mut peers = self.peers.write().await;
+            if let Some(peer) = peers.get_mut(&state.node_id) {
+                peer.battery_percent = state.battery_percent;
+                peer.power_source = state.power_source;
+            }
+        }
+        let verified = crate::control_plane::endpoint_from_state(state, endpoint);
+        self.peer_registry()
+            .write()
+            .await
+            .mark_verified(state.node_id, verified, Instant::now())
+    }
+
     /// Record a discovered service endpoint (from mDNS, static config, etc.) and merge into active peers.
     pub async fn record_service_endpoint(
         &self,
@@ -1273,8 +1301,13 @@ impl DiscoveryService {
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
-            existing.battery_percent = endpoint.battery_percent;
-            existing.power_source = endpoint.power_source;
+            // Missing, empty, or out-of-range TXT keys are not hints.
+            apply_power_hint(
+                &mut existing.battery_percent,
+                &mut existing.power_source,
+                endpoint.battery_percent,
+                endpoint.power_source,
+            );
             existing.last_seen = Instant::now();
             DiscoveryEvent::ServiceUpdated(existing.service_endpoint())
         } else {
@@ -1583,9 +1616,154 @@ pub fn get_local_ip() -> std::net::IpAddr {
 mod tests {
     use super::*;
     use crate::cluster::LinkClass;
+    use crate::config::NexusConfig;
+    use crate::peer_registry::ObservationSource;
     use crate::sysinfo::{AccelerationBackend, PowerSource};
     use std::time::Instant;
     use uuid::Uuid;
+
+    fn endpoint_from_txt(node_id: Uuid, extra: &[(&str, &str)]) -> ServiceEndpoint {
+        let mut properties = std::collections::HashMap::new();
+        properties.insert("id".to_string(), node_id.to_string());
+        properties.insert("role".to_string(), NodeRole::HOST.0.to_string());
+        properties.insert("api".to_string(), "8080".to_string());
+        properties.insert("rpc".to_string(), "50052".to_string());
+        properties.insert("ctrl".to_string(), "9998".to_string());
+        for (key, value) in extra {
+            properties.insert((*key).to_string(), (*value).to_string());
+        }
+        let mut endpoint =
+            crate::mdns::endpoint_from_properties(&properties, 8080).expect("txt fixture");
+        endpoint.addresses = vec!["192.168.1.20:8080".parse().unwrap()];
+        endpoint
+    }
+
+    async fn assert_stored_power(
+        discovery: &DiscoveryService,
+        node_id: Uuid,
+        percent: Option<u8>,
+        power: PowerSource,
+    ) {
+        let peer = discovery
+            .peers()
+            .read()
+            .await
+            .get(&node_id)
+            .cloned()
+            .expect("peer");
+        assert_eq!(peer.battery_percent, percent);
+        assert_eq!(peer.power_source, power);
+        let registry = discovery.peer_registry();
+        let registry = registry.read().await;
+        let record = registry.get(node_id).expect("registry");
+        assert_eq!(record.endpoint.battery_percent, percent);
+        assert_eq!(record.endpoint.power_source, power);
+    }
+
+    #[tokio::test]
+    async fn second_observe_without_battery_keys_keeps_stored_hint() {
+        let discovery = DiscoveryService::new(NexusConfig::default(), Some(Uuid::from_u128(1)));
+        let node_id = Uuid::from_u128(42);
+        discovery
+            .record_service_endpoint(
+                endpoint_from_txt(node_id, &[("bat", "40"), ("pwr", "battery")]),
+                ObservationSource::Mdns,
+            )
+            .await;
+
+        discovery
+            .record_service_endpoint(endpoint_from_txt(node_id, &[]), ObservationSource::Mdns)
+            .await;
+        assert_stored_power(&discovery, node_id, Some(40), PowerSource::Battery).await;
+
+        // Present but not hints: empty bat, out of range, and pwr other than ac/battery.
+        discovery
+            .record_service_endpoint(
+                endpoint_from_txt(node_id, &[("bat", ""), ("pwr", "unknown")]),
+                ObservationSource::Mdns,
+            )
+            .await;
+        discovery
+            .record_service_endpoint(
+                endpoint_from_txt(node_id, &[("bat", "140"), ("pwr", "nope")]),
+                ObservationSource::Mdns,
+            )
+            .await;
+        assert_stored_power(&discovery, node_id, Some(40), PowerSource::Battery).await;
+    }
+
+    #[tokio::test]
+    async fn state_verify_sets_peer_battery_and_beacon_keeps_it() {
+        let discovery = DiscoveryService::new(NexusConfig::default(), Some(Uuid::from_u128(1)));
+        let node_id = Uuid::from_u128(7);
+        discovery
+            .record_service_endpoint(
+                endpoint_from_txt(node_id, &[("bat", "40"), ("pwr", "battery")]),
+                ObservationSource::Mdns,
+            )
+            .await;
+        let endpoint = discovery
+            .peer_registry()
+            .read()
+            .await
+            .get(node_id)
+            .expect("observed")
+            .endpoint
+            .clone();
+        let state = crate::control_plane::ControlPlaneState {
+            node_id,
+            protocol_version: 1,
+            role: NodeRole::HOST,
+            capabilities: Vec::new(),
+            ready: true,
+            inferring: false,
+            rpc_ready: true,
+            allocatable_memory_mb: 1000,
+            active_model: None,
+            loaded_models: Vec::new(),
+            signing_public_key: None,
+            battery_percent: Some(15),
+            power_source: PowerSource::Ac,
+        };
+        discovery
+            .apply_verified_state(&state, &endpoint)
+            .await
+            .expect("verify writes state battery");
+        assert_stored_power(&discovery, node_id, Some(15), PowerSource::Ac).await;
+
+        let beacon = BeaconPacket {
+            magic: BEACON_MAGIC,
+            version: BEACON_VERSION,
+            role: NodeRole::HOST,
+            status: StatusFlags::READY,
+            uuid: node_id,
+            api_port: 8080,
+            rpc_port: 50052,
+            total_ram_mb: 8000,
+            free_ram_mb: 4000,
+            backend: AccelerationBackend::Vulkan,
+            thermal_index: 3,
+            active_model: String::new(),
+        };
+        discovery
+            .rebuild_peer_from_beacon(&beacon, "192.168.1.20:9999".parse().unwrap())
+            .await;
+        let peer = discovery
+            .peers()
+            .read()
+            .await
+            .get(&node_id)
+            .cloned()
+            .expect("peer");
+        assert_eq!(peer.free_ram_mb, 4000);
+        assert_eq!(peer.battery_percent, Some(15));
+        assert_eq!(peer.power_source, PowerSource::Ac);
+        let registry = discovery.peer_registry();
+        let registry = registry.read().await;
+        let record = registry.get(node_id).expect("registry");
+        assert_eq!(record.endpoint.battery_percent, Some(15));
+        assert_eq!(record.endpoint.power_source, PowerSource::Ac);
+    }
 
     fn usb_fixture() -> PeerNode {
         PeerNode {

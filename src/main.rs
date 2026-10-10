@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use nexus::bmoe_client::{should_use_bmoe, BmoeSessionConfig};
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
+use nexus::cluster::plan_moe_stream_knobs;
 use nexus::config::NexusConfig;
 use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
@@ -481,17 +482,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if want_bmoe {
-                let bmoe_cfg = BmoeSessionConfig::from_profile(
+                let meta = gguf.as_ref().expect("want_bmoe requires parsed GGUF");
+                let default_ceil = config.inference.moe.derive_cache_ceil_mb(
+                    profile.available_ram_mb,
+                    config.hardware.safety.max_ram_usage_percent,
+                );
+                let model_key = meta
+                    .model_name
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| meta.quant_label.clone())
+                    .unwrap_or_else(|| "unknown".into());
+                let bench = nexus::bench::BenchStore::load_default().ok();
+                let knobs = plan_moe_stream_knobs(
+                    meta,
+                    &profile,
+                    config.hardware.safety.max_ram_usage_percent,
+                    ctx,
+                    default_ceil,
+                    bench.as_ref(),
+                    &model_key,
+                    "local",
+                );
+                let (spawn_ctx, ceil_override) = match knobs {
+                    Some(k) => (k.context_size, Some(k.cache_ceil_mb)),
+                    None => (ctx, None),
+                };
+                let mut moe_cfg = config.inference.moe.clone();
+                let lmk_budget_mb = profile
+                    .max_allowed_memory_bytes_pct(config.hardware.safety.max_ram_usage_percent)
+                    / (1024 * 1024);
+                let gov_notes = nexus::cluster::apply_moe_governor_to_config(
+                    &mut moe_cfg,
+                    bench.as_ref(),
+                    &model_key,
+                    "local",
+                    spawn_ctx,
+                    lmk_budget_mb,
+                );
+                for note in &gov_notes {
+                    tracing::info!("{note}");
+                }
+                let bmoe_cfg = BmoeSessionConfig::from_profile_with_ceil(
                     std::path::PathBuf::from(&config.inference.moe.bmoe_binary),
                     model,
                     api_host,
                     api_port,
-                    ctx,
+                    spawn_ctx,
                     profile.recommended_threads,
-                    config.inference.moe.clone(),
+                    moe_cfg,
                     &profile,
                     config.hardware.safety.max_ram_usage_percent,
                     Vec::new(),
+                    ceil_override,
                 );
                 supervisor.spawn_bmoe(bmoe_cfg).await?;
             } else {

@@ -536,6 +536,7 @@ async fn test_hub_app_hot_swap_confirmation_modal() {
         gpu_layers: Some(0),
         context_size: 4096,
         extra_args: Vec::new(),
+        moe_cache_ceil_mb: None,
     });
 
     let backend = TestBackend::new(120, 35);

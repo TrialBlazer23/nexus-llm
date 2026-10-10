@@ -213,6 +213,8 @@ fn ranker_without_bench_stays_heuristic() {
             is_local: false,
             thermal_index: 20,
             moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            total_ram_mb: 0,
         }],
     };
     let plans = rank_execution_plans(&req).expect("plans");

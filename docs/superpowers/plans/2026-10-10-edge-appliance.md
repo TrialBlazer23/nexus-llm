@@ -297,7 +297,7 @@ fn dense_mmap_counts_full_weights() {
 
 Context is 512 so the KV term does not hide the weight-file rule. 75% of 4096 MB is 3072 MB. 4500 MB of weights exceeds it. 900 MB of weights plus a 512-token KV plus the 256 MB x86 compute buffer fits. 75% of 12000 MB is 9000 MB, so the same 4500 MB file fits there.
 
-In `tests/test_placement.rs`, change `memory_plan_beats_heuristic_for_small_model` so the 2000 MB available / 75% profile expects `Verdict::Exceeds` for the ~950 MB file at context 4096 (weights ~906 MB + exact KV ~672 MB + 256 MB compute buffer is over the 1500 MB budget). Keep `assert!(plan.kv_cache_mb < 800)`. Keep `assert!(!profile.can_safely_load(...))`.
+In `tests/test_placement.rs`, change `memory_plan_beats_heuristic_for_small_model` so the 2000 MB available / 75% profile shows the F16 full-file load over the 1500 MB budget (`headroom_mb` negative). Q8 KV at that geometry is about 336 MB, so full weights plus Q8 KV plus the 256 MB compute buffer is about 1497 MB and the verdict is `FitsIfQuantizedKv`, not `Exceeds`. Assert `FitsIfQuantizedKv`. Keep `assert!(plan.kv_cache_mb < 800)`. Keep `assert!(!profile.can_safely_load(...))`. Do not restore the 10% discount to force `Exceeds`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 

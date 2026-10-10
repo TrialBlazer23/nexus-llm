@@ -1182,7 +1182,10 @@ pub async fn run_chat_tui(mut app: ChatApp) -> Result<(), Box<dyn std::error::Er
 async fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut ChatApp,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    <B as ratatui::backend::Backend>::Error: 'static,
+{
     let mut event_stream = EventStream::new();
     let (tx, mut rx) = mpsc::channel::<StreamMsg>(100);
 

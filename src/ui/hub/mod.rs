@@ -3,12 +3,13 @@
 pub mod commands;
 pub mod keymap;
 
-use crate::appliance::warn_front_door_once;
+use crate::appliance::hub_chat_target_after_load;
 use crate::client::NexusClient;
 use crate::config::NexusConfig;
 use crate::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
+use crate::gateway::load_appliance_front_door;
 use crate::gateway::{spawn as spawn_gateway, unload_idle_burst_peers, GatewayContext};
 use crate::node_identity::NodeIdentity;
 use crate::registry_runtime::spawn_registry_runtime;
@@ -38,7 +39,7 @@ use ratatui::{
 };
 use std::io::stdout;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -539,6 +540,33 @@ impl HubApp {
         }
     }
 
+    /// Gateway base and appliance model id while both flags are on and no host is pinned.
+    fn chat_target_after_load(&self, endpoint: &str, model_name: &str) -> (String, String) {
+        let (default_host, appliance, gateway, port) = if let Ok(cfg) = self.shared_config.read() {
+            (
+                cfg.network.default_host.clone(),
+                cfg.inference.appliance.enabled,
+                cfg.network.gateway_enabled,
+                cfg.network.gateway_port,
+            )
+        } else {
+            (
+                self.config.network.default_host.clone(),
+                self.config.inference.appliance.enabled,
+                self.config.network.gateway_enabled,
+                self.config.network.gateway_port,
+            )
+        };
+        hub_chat_target_after_load(
+            endpoint,
+            model_name,
+            default_host.as_deref(),
+            appliance,
+            gateway,
+            port,
+        )
+    }
+
     /// Apply a worker event on the UI thread (no awaits).
     pub fn apply_event(&mut self, event: HubEvent) {
         match event {
@@ -557,8 +585,9 @@ impl HubApp {
             } => {
                 self.load_phase = None;
                 self.active_model_name = model_name.clone();
-                self.chat.client = NexusClient::new(endpoint);
-                self.chat.model_name = model_name;
+                let (base, chat_model) = self.chat_target_after_load(&endpoint, &model_name);
+                self.chat.client = NexusClient::new(base);
+                self.chat.model_name = chat_model;
                 self.chat.set_target_hardware("Local Host", backend_label);
                 self.chat.messages.clear();
                 self.chat.messages.push(ChatEntry::notice(notice));
@@ -598,8 +627,9 @@ impl HubApp {
             } => {
                 self.load_phase = None;
                 self.active_model_name = model_name.clone();
-                self.chat.client = NexusClient::new(api_endpoint);
-                self.chat.model_name = model_name;
+                let (base, chat_model) = self.chat_target_after_load(&api_endpoint, &model_name);
+                self.chat.client = NexusClient::new(base);
+                self.chat.model_name = chat_model;
                 self.chat.set_target_hardware(&name, backend);
                 self.chat.messages.clear();
                 self.chat.messages.push(ChatEntry::notice(notice));
@@ -2165,7 +2195,18 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         (None, None)
     };
     if hub.config.inference.appliance.enabled {
-        warn_front_door_once(&hub.config);
+        if let Some(name) = load_appliance_front_door(
+            &hub.supervisor,
+            &hub.discovery,
+            &hub.config,
+            Path::new(&hub.config.node.llama_server_binary),
+            &hub.config.network.api_host,
+            hub.config.network.api_port,
+        )
+        .await
+        {
+            hub.active_model_name = name;
+        }
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(32);
@@ -3610,7 +3651,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             }
             _ = refresh_interval.tick() => {
                 if let Some(ctx) = &gateway_idle {
-                    unload_idle_burst_peers(ctx).await;
+                    unload_idle_burst_peers(ctx);
                 }
                 let modal_open = hub.pending_download_modal.is_some()
                     || hub.pending_import_modal.is_some()

@@ -30,6 +30,7 @@ pub fn spawn_registry_runtime(
             tokio::select! {
                 _ = reaper_tick.tick() => {
                     run_reaper(&discovery).await;
+                    refresh_usb_peer_links(&discovery).await;
                 }
                 _ = verify_tick.tick() => {
                     run_verifier(&discovery, &client, &identity, requester_id).await;
@@ -37,6 +38,20 @@ pub fn spawn_registry_runtime(
             }
         }
     })
+}
+
+async fn refresh_usb_peer_links(discovery: &DiscoveryService) {
+    let cfg = discovery.config();
+    let Some(forwards) = crate::tunnel::AdbTunnelSupervisor::active_authorized_forwards(
+        cfg.cluster.adb.host_port_base,
+        cfg.cluster.adb.max_devices,
+    ) else {
+        return;
+    };
+    let cache =
+        crate::adb_links::AdbLinkCache::load(&crate::adb_links::AdbLinkCache::default_path())
+            .unwrap_or_default();
+    discovery.sync_usb_links(&cache, &forwards).await;
 }
 
 async fn run_reaper(discovery: &DiscoveryService) {

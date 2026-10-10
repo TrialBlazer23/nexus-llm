@@ -6,15 +6,17 @@
 //! `control_port` (signed control plane).
 
 use crate::appliance::{
-    cold_predict_tok_s, decide_appliance, format_route_header, front_door_tags, link_header_token,
-    load_presets, observe_stream_done, peer_lost_sse, preset_tags_for_file, score_burst_candidate,
-    warn_front_door_once, ApplianceDecision, BurstActivity, RouteStay,
+    catalog_lists_digest, cold_predict_tok_s, decide_appliance, format_route_header,
+    front_door_tags, link_header_token, load_presets, observe_stream_done, pantry_load_name,
+    pantry_reverse_device_port, pantry_source_base, peer_lost_sse, plan_front_door,
+    preset_tags_for_file, score_burst_candidate, tier2_model_id, warn_front_door_once,
+    ApplianceDecision, BurstActivity, RouteStay, PANTRY_CATALOG_INTERVAL, PANTRY_CATALOG_WAIT,
 };
 use crate::bench::BenchStore;
 use crate::client::NexusClient;
 use crate::cluster::{
-    moe_model_key, plan_fit_ladder, plan_moe_spawn, select_burst_winner, BurstScore, MemoryPolicy,
-    MoeCacheCap,
+    moe_model_key, plan_fit_ladder, plan_moe_spawn, select_burst_winner, BurstScore, LinkClass,
+    MemoryPolicy, MoeCacheCap,
 };
 use crate::config::NexusConfig;
 use crate::control_plane::{
@@ -22,12 +24,12 @@ use crate::control_plane::{
     dispatch_unload_model, dispatch_unload_model_signed, fetch_models, request_blob_fetch,
     BlobFetchRequest, ModelLoadRequest, ModelUnloadRequest, CONTROL_PLANE_VERSION,
 };
-use crate::discovery::{DiscoveryService, PeerNode};
+use crate::discovery::{get_local_ip, DiscoveryService, PeerNode, StatusFlags};
 use crate::gguf::{GgufMetadata, GgufValue, KvCacheDtype};
 use crate::node_identity::NodeIdentity;
 use crate::router::{RouteDecision, RouteTarget, Router};
 use crate::store::ModelIndex;
-use crate::supervisor::SupervisorManager;
+use crate::supervisor::{LlamaServerConfig, SupervisorManager};
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use crate::trust_auth::pairing_enforced;
 use bytes::Bytes;
@@ -1708,13 +1710,22 @@ fn tier1_tag(prompt: &str, presets_dir: &Path, local_tags: &[String]) -> Option<
     }
 }
 
-async fn tier2_tag(prompt: &str, presets_dir: &Path, local_base: &str) -> Result<String, ()> {
+async fn tier2_tag(
+    prompt: &str,
+    presets_dir: &Path,
+    local_base: &str,
+    loaded_model: &str,
+) -> Result<String, ()> {
     let mut router = Router::new();
     router.load_presets_dir(presets_dir);
     let tags = known_route_tags(presets_dir, &[]);
     let routes = route_targets(&tags);
     let client = NexusClient::new(local_base);
-    match router.route_orchestrated(prompt, &routes, &client).await {
+    let model = tier2_model_id(loaded_model);
+    match router
+        .route_orchestrated(prompt, &routes, &client, &model)
+        .await
+    {
         Ok(RouteDecision::Orchestrated { route, .. }) => Ok(route),
         Ok(_) => Err(()),
         Err(_) => Err(()),
@@ -1949,7 +1960,15 @@ async fn handle_appliance_chat(ctx: Arc<GatewayContext>, body_bytes: Bytes) -> R
     let (local_loaded, local_tags, local_model) = local_front_door_tags(&ctx).await;
     let tier1 = tier1_tag(&prompt, &snap.presets_dir, &local_tags);
     let tier2 = if tier1.is_none() && local_loaded {
-        Some(tier2_tag(&prompt, &snap.presets_dir, &ctx.local_upstream()).await)
+        Some(
+            tier2_tag(
+                &prompt,
+                &snap.presets_dir,
+                &ctx.local_upstream(),
+                &local_model,
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -2056,7 +2075,7 @@ async fn escalate_chat(
     let mut scores: Vec<BurstScore> = rows.iter().map(|(_, score, _)| score.clone()).collect();
     let mut winner = select_burst_winner(&scores);
     let mut attempts = 0;
-    let mut prepared: Option<(usize, String)> = None;
+    let mut prepared: Option<(usize, String, String)> = None;
     while let Some(index) = winner {
         if attempts >= 2 {
             break;
@@ -2068,8 +2087,8 @@ async fn escalate_chat(
             Err(())
         };
         match loaded {
-            Ok(api) => {
-                prepared = Some((index, api));
+            Ok((api, loaded_name)) => {
+                prepared = Some((index, api, loaded_name));
                 break;
             }
             Err(()) => {
@@ -2086,14 +2105,9 @@ async fn escalate_chat(
         }
     }
 
-    if let Some((index, api)) = prepared {
+    if let Some((index, api, model)) = prepared {
         ctx.burst_activity.touch(rows[index].0.uuid);
         let peer = &rows[index].0;
-        let model = rows[index]
-            .2
-            .as_ref()
-            .map(|chosen| chosen.filename.clone())
-            .unwrap_or_else(|| local_model.to_string());
         let header = format_route_header(
             &peer.label(),
             link_header_token(peer.link_class),
@@ -2146,26 +2160,45 @@ async fn ensure_peer_model(
     peer: &PeerNode,
     chosen: &ChosenLoad,
     snap: &ApplianceSnap,
-) -> Result<String, ()> {
+) -> Result<(String, String), ()> {
+    let written = format!("{}.gguf", chosen.digest.trim().to_lowercase());
     if model_matches(&chosen.filename, &peer.active_model)
+        || model_matches(&written, &peer.active_model)
         || model_matches(&model_stem(&chosen.filename), &peer.active_model)
     {
-        return Ok(peer.api_endpoint());
+        let name = if peer.active_model.trim().is_empty() {
+            written
+        } else {
+            peer.active_model.clone()
+        };
+        return Ok((peer.api_endpoint(), name));
     }
     let client = reqwest::Client::new();
     let control = peer.control_endpoint();
-    let catalog = fetch_models(&client, &control).await.ok();
-    let present = catalog.as_ref().is_some_and(|catalog| {
-        catalog.models.iter().any(|entry| {
-            (!chosen.digest.is_empty() && entry.digest.eq_ignore_ascii_case(&chosen.digest))
-                || model_matches(&chosen.filename, &entry.filename)
-        })
-    });
-    if !present {
+    let catalog = fetch_models(&client, &control).await.map_err(|_| ())?;
+    let pairs: Vec<(&str, &str)> = catalog
+        .models
+        .iter()
+        .map(|entry| (entry.filename.as_str(), entry.digest.as_str()))
+        .collect();
+    let mut listed = catalog_lists_digest(pairs, &chosen.digest);
+    if !listed {
         if chosen.digest.is_empty() {
             return Err(());
         }
-        let source_base = format!("http://127.0.0.1:{}", snap.control_port);
+        let device_port =
+            pantry_reverse_device_port(peer.api_port, peer.control_port, peer.rpc_port);
+        let source_base = pantry_source_base(
+            peer.link_class,
+            &get_local_ip().to_string(),
+            snap.control_port,
+            device_port,
+        )?;
+        if peer.link_class == LinkClass::Usb {
+            let serial = peer.usb_serial.as_deref().ok_or(())?;
+            crate::tunnel::install_control_reverse(serial, device_port, snap.control_port)
+                .map_err(|_| ())?;
+        }
         let _source = blob_url(&source_base, &chosen.digest).map_err(|_| ())?;
         let request = BlobFetchRequest {
             protocol_version: CONTROL_PLANE_VERSION,
@@ -2184,11 +2217,15 @@ async fn ensure_peer_model(
         if !response.accepted {
             return Err(());
         }
+        // `accepted` only queues the write of `{digest}.gguf`. Wait until the catalog lists it.
+        poll_catalog_for_digest(&client, &control, &chosen.digest).await?;
+        listed = true;
     }
+    let load_name = pantry_load_name(&chosen.digest, &chosen.filename, true, listed).ok_or(())?;
     let request = ModelLoadRequest {
         protocol_version: CONTROL_PLANE_VERSION,
         requester_id: ctx.node_id,
-        model_path: chosen.filename.clone(),
+        model_path: load_name.clone(),
         context_size: chosen.context_size,
         gpu_layers: if peer.backend == AccelerationBackend::Vulkan {
             snap.gpu_layers
@@ -2212,38 +2249,161 @@ async fn ensure_peer_model(
     if !loaded.success {
         return Err(());
     }
-    if !loaded.api_endpoint.is_empty() && !loaded.api_endpoint.contains("0.0.0.0") {
-        Ok(loaded.api_endpoint)
+    let api = if !loaded.api_endpoint.is_empty() && !loaded.api_endpoint.contains("0.0.0.0") {
+        loaded.api_endpoint
     } else {
-        Ok(peer.api_endpoint())
+        peer.api_endpoint()
+    };
+    Ok((api, load_name))
+}
+
+/// Poll the peer catalog until `{digest}.gguf` is listed, or the wait elapses.
+async fn poll_catalog_for_digest(
+    client: &reqwest::Client,
+    control: &str,
+    digest: &str,
+) -> Result<(), ()> {
+    let deadline = tokio::time::Instant::now() + PANTRY_CATALOG_WAIT;
+    loop {
+        let catalog = fetch_models(client, control).await.map_err(|_| ())?;
+        let pairs: Vec<(&str, &str)> = catalog
+            .models
+            .iter()
+            .map(|entry| (entry.filename.as_str(), entry.digest.as_str()))
+            .collect();
+        if catalog_lists_digest(pairs, digest) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        tokio::time::sleep(PANTRY_CATALOG_INTERVAL).await;
     }
 }
 
-/// Unload burst peers that have been idle. The local front door is never in the map.
-pub async fn unload_idle_burst_peers(ctx: &GatewayContext) {
-    let Some(snap) = ctx.config.read().ok() else {
-        return;
+/// Load the section 10.2 file into `supervisor`. Escalation does not stop it.
+pub async fn load_appliance_front_door(
+    supervisor: &SupervisorManager,
+    discovery: &DiscoveryService,
+    cfg: &NexusConfig,
+    binary: &Path,
+    host: &str,
+    port: u16,
+) -> Option<String> {
+    if !cfg.inference.appliance.enabled {
+        return None;
+    }
+    let plan = plan_front_door(cfg).or_else(|| {
+        warn_front_door_once(cfg);
+        None
+    })?;
+    let profile = SystemProfile::probe();
+    let gpu_layers = if cfg.hardware.acceleration.prefer_gpu {
+        cfg.hardware.acceleration.gpu_layers
+    } else {
+        0
     };
-    if !snap.inference.appliance.enabled {
+    let threads = if cfg.hardware.acceleration.cpu_threads > 0 {
+        cfg.hardware.acceleration.cpu_threads
+    } else {
+        profile.recommended_threads.max(1)
+    };
+    let mut server = LlamaServerConfig::new(binary, &plan.model_path, host, port);
+    server.gpu_layers = gpu_layers;
+    server.threads = threads;
+    server.context_size = plan.context_size;
+    server.use_mmap = cfg.hardware.safety.mmap;
+    server.use_mlock = cfg.hardware.safety.mlock;
+    server.cpu_threads_batch = cfg.hardware.acceleration.cpu_threads_batch.max(1);
+    server.fallback_to_cpu = cfg.hardware.acceleration.fallback_to_cpu;
+    server.memory_budget_percent = cfg.hardware.safety.max_ram_usage_percent;
+    server.tags = plan.tags.clone();
+    if plan.kv_q8 {
+        server.cache_type_k = Some("q8_0".to_string());
+        server.cache_type_v = Some("q8_0".to_string());
+    }
+    if cfg.inference.cache.prompt_cache_enabled {
+        server.slot_save_path = Some(PathBuf::from(&cfg.inference.cache.slot_save_path));
+    }
+    match supervisor.spawn(server).await {
+        Ok(()) => {
+            discovery.set_active_model(&plan.filename).await;
+            let mut status = StatusFlags::READY;
+            if profile.detected_backend == AccelerationBackend::Vulkan {
+                status.0 |= StatusFlags::VULKAN_ACTIVE.0;
+            }
+            discovery.set_status_flags(status).await;
+            tracing::info!("appliance front door loaded: {}", plan.filename);
+            Some(plan.filename)
+        }
+        Err(err) => {
+            tracing::warn!("appliance front door did not start: {err}");
+            None
+        }
+    }
+}
+
+/// Schedule idle burst unloads off the UI task. The local front door is never unloaded.
+pub fn unload_idle_burst_peers(ctx: &Arc<GatewayContext>) {
+    let idle_secs = {
+        let Ok(snap) = ctx.config.read() else {
+            return;
+        };
+        if !snap.inference.appliance.enabled {
+            return;
+        }
+        snap.inference.appliance.burst_idle_secs
+    };
+    let idle = ctx.burst_activity.idle_candidates(idle_secs, ctx.node_id);
+    if idle.is_empty() {
         return;
     }
-    let idle_secs = snap.inference.appliance.burst_idle_secs;
-    let pairing = snap.network.security.pairing_enforced();
-    drop(snap);
-    let expired = ctx.burst_activity.take_idle(idle_secs, ctx.node_id);
-    if expired.is_empty() {
-        return;
-    }
-    let Some(discovery) = &ctx.discovery else {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        unload_idle_ids(ctx, idle, idle_secs).await;
+    });
+}
+
+async fn unload_idle_ids(
+    ctx: Arc<GatewayContext>,
+    idle: Vec<(uuid::Uuid, std::time::Instant)>,
+    idle_secs: u64,
+) {
+    let pairing = ctx
+        .config
+        .read()
+        .map(|snap| snap.network.security.pairing_enforced())
+        .unwrap_or(false);
+    let Some(discovery) = ctx.discovery.clone() else {
+        for (id, started) in idle {
+            ctx.burst_activity
+                .finish_idle_unload(id, started, false, idle_secs, ctx.node_id);
+        }
         return;
     };
     let peers = discovery.get_active_peers().await;
     let client = reqwest::Client::new();
-    for id in expired {
+    for (id, started) in idle {
         if id == ctx.node_id {
+            ctx.burst_activity
+                .finish_idle_unload(id, started, false, idle_secs, ctx.node_id);
+            continue;
+        }
+        if !ctx.burst_activity.claim_unload(id) {
+            continue;
+        }
+        if !ctx
+            .burst_activity
+            .still_the_same_idle(id, started, idle_secs, ctx.node_id)
+        {
+            ctx.burst_activity
+                .finish_idle_unload(id, started, false, idle_secs, ctx.node_id);
             continue;
         }
         let Some(peer) = peers.iter().find(|peer| peer.uuid == id) else {
+            warn!("burst idle unload skipped; peer {id} is not in this tick");
+            ctx.burst_activity
+                .finish_idle_unload(id, started, false, idle_secs, ctx.node_id);
             continue;
         };
         let request = ModelUnloadRequest {
@@ -2267,9 +2427,24 @@ pub async fn unload_idle_burst_peers(ctx: &GatewayContext) {
         } else {
             dispatch_unload_model(&client, &peer.control_endpoint(), &request).await
         };
-        if let Err(err) = result {
-            warn!("burst idle unload for {} failed: {err}", peer.label());
+        let ok = match &result {
+            Ok(response) => response.success,
+            Err(err) => {
+                warn!("burst idle unload for {} failed: {err}", peer.label());
+                false
+            }
+        };
+        if !ok {
+            if let Ok(response) = &result {
+                warn!(
+                    "burst idle unload for {} was refused: {}",
+                    peer.label(),
+                    response.message
+                );
+            }
         }
+        ctx.burst_activity
+            .finish_idle_unload(id, started, ok, idle_secs, ctx.node_id);
     }
 }
 

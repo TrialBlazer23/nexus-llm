@@ -142,6 +142,14 @@ pub struct SseErrorDetail {
     pub error_type: Option<String>,
 }
 
+/// Assistant text from one SSE delta. A `status` role is a notice, not dialogue.
+pub fn assistant_delta_text<'a>(role: Option<&str>, content: Option<&'a str>) -> Option<&'a str> {
+    if role.is_some_and(|role| role.eq_ignore_ascii_case("status")) {
+        return None;
+    }
+    content.filter(|text| !text.is_empty())
+}
+
 /// OpenAI-compatible HTTP REST and SSE streaming client for Nexus-LLM.
 #[derive(Debug, Clone)]
 pub struct NexusClient {
@@ -317,10 +325,17 @@ impl NexusClient {
                             match serde_json::from_str::<ChatCompletionChunk>(data) {
                                 Ok(chunk) => {
                                     if let Some(first_choice) = chunk.choices.first() {
-                                        if let Some(content) = &first_choice.delta.content {
-                                            if !content.is_empty() {
-                                                return Some(Ok(content.clone()));
-                                            }
+                                        let role = first_choice.delta.role.as_deref();
+                                        if let Some(content) = assistant_delta_text(
+                                            role,
+                                            first_choice.delta.content.as_deref(),
+                                        ) {
+                                            return Some(Ok(content.to_string()));
+                                        }
+                                        if role
+                                            .is_some_and(|role| role.eq_ignore_ascii_case("status"))
+                                        {
+                                            return None;
                                         }
                                         if let Some(reasoning) =
                                             &first_choice.delta.reasoning_content
@@ -409,4 +424,27 @@ pub struct EmbeddingData {
     pub embedding: Vec<f32>,
     #[serde(default)]
     pub index: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assistant_delta_text;
+
+    #[test]
+    fn status_role_delta_is_not_assistant_content() {
+        assert_eq!(
+            assistant_delta_text(Some("status"), Some("peer lost")),
+            None
+        );
+        assert_eq!(
+            assistant_delta_text(Some("STATUS"), Some("peer lost")),
+            None
+        );
+        assert_eq!(
+            assistant_delta_text(Some("assistant"), Some("hello")),
+            Some("hello")
+        );
+        assert_eq!(assistant_delta_text(None, Some("token")), Some("token"));
+        assert_eq!(assistant_delta_text(None, Some("")), None);
+    }
 }

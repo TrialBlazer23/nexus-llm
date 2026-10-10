@@ -12,8 +12,8 @@ use crate::gguf::{GgufMetadata, KvCacheDtype};
 use crate::preset::Preset;
 use crate::store::ModelIndex;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -176,6 +176,120 @@ pub fn hub_client_base_url(
         return Some(format!("http://127.0.0.1:{gateway_port}"));
     }
     None
+}
+
+/// After a local or remote load. Appliance plus gateway, with no pinned host,
+/// keeps the hub on the gateway and on an id that enters the appliance path.
+pub fn hub_chat_target_after_load(
+    inference_endpoint: &str,
+    loaded_name: &str,
+    default_host: Option<&str>,
+    appliance_enabled: bool,
+    gateway_enabled: bool,
+    gateway_port: u16,
+) -> (String, String) {
+    let pinned = default_host.map(str::trim).filter(|host| !host.is_empty());
+    if appliance_enabled && gateway_enabled && pinned.is_none() {
+        return (
+            format!("http://127.0.0.1:{gateway_port}"),
+            "default".to_string(),
+        );
+    }
+    (inference_endpoint.to_string(), loaded_name.to_string())
+}
+
+/// OpenAI model id for a tier-2 classify call. Llama-server's alias is the file stem.
+pub fn tier2_model_id(loaded_model: &str) -> String {
+    let name = loaded_model.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("local") {
+        return "orchestrator".to_string();
+    }
+    Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(name)
+        .to_string()
+}
+
+/// How long to wait for `{digest}.gguf` to show up in the peer catalog.
+pub const PANTRY_CATALOG_WAIT: Duration = Duration::from_secs(15);
+/// Pause between catalog polls. The wait above is the bound.
+pub const PANTRY_CATALOG_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Device port for `adb reverse` of the host control plane.
+/// Never one of the phone's Nexus listen ports.
+pub fn pantry_reverse_device_port(device_api: u16, device_control: u16, device_rpc: u16) -> u16 {
+    const BASE: u16 = 28180;
+    let avoid = [device_api, device_control, device_rpc];
+    let mut port = BASE;
+    loop {
+        if !avoid.contains(&port) {
+            return port;
+        }
+        match port.checked_add(1) {
+            Some(next) => port = next,
+            None => return BASE,
+        }
+    }
+}
+
+/// Base URL the peer GETs. Wi-Fi uses the host LAN address. USB uses the
+/// reversed device port on the phone's loopback, not the Mac control port.
+pub fn pantry_source_base(
+    link: LinkClass,
+    lan_ip: &str,
+    mac_control_port: u16,
+    usb_device_port: u16,
+) -> Result<String, ()> {
+    match link {
+        LinkClass::Usb => {
+            if usb_device_port == 0 {
+                return Err(());
+            }
+            Ok(format!("http://127.0.0.1:{usb_device_port}"))
+        }
+        LinkClass::Wifi | LinkClass::Local => {
+            let ip = lan_ip.trim();
+            if ip.is_empty() || ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" || ip == "::" {
+                return Err(());
+            }
+            Ok(format!("http://{ip}:{mac_control_port}"))
+        }
+    }
+}
+
+/// True when the peer catalog already has this digest or the written file name.
+pub fn catalog_lists_digest<'a, I>(entries: I, digest: &str) -> bool
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let digest = digest.trim();
+    if digest.is_empty() {
+        return false;
+    }
+    let written = format!("{}.gguf", digest.to_lowercase());
+    entries.into_iter().any(|(filename, entry_digest)| {
+        (!entry_digest.is_empty() && entry_digest.eq_ignore_ascii_case(digest))
+            || filename.eq_ignore_ascii_case(&written)
+    })
+}
+
+/// Load name after a pantry fetch. `accepted` does not select `source_filename`.
+/// The name is `{digest}.gguf` only once the catalog lists that digest.
+pub fn pantry_load_name(
+    digest: &str,
+    source_filename: &str,
+    accepted: bool,
+    catalog_lists: bool,
+) -> Option<String> {
+    let digest = digest.trim().to_lowercase();
+    if digest.is_empty() || !catalog_lists {
+        let _queued_source = (accepted, source_filename);
+        return None;
+    }
+    let _source = source_filename;
+    Some(format!("{digest}.gguf"))
 }
 
 /// Burst peers only. The front door never goes idle from this check.
@@ -344,33 +458,136 @@ pub fn preset_tags_for_file(
     tags
 }
 
-/// Last time a burst peer received an escalated request. The front door is never inserted.
+#[derive(Default)]
+struct BurstInner {
+    seen: HashMap<Uuid, Instant>,
+    unloading: HashSet<Uuid>,
+}
+
+/// Last time a burst peer received an escalated request. The front door is never removed.
 #[derive(Clone, Default)]
 pub struct BurstActivity {
-    seen: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    inner: Arc<Mutex<BurstInner>>,
 }
 
 impl BurstActivity {
     pub fn touch(&self, id: Uuid) {
-        if let Ok(mut seen) = self.seen.lock() {
-            seen.insert(id, Instant::now());
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.seen.insert(id, Instant::now());
         }
     }
 
-    /// UUIDs whose idle time has elapsed. `local_node` is the front door and is kept.
-    pub fn take_idle(&self, burst_idle_secs: u64, local_node: Uuid) -> Vec<Uuid> {
-        let Ok(mut seen) = self.seen.lock() else {
+    #[cfg(test)]
+    fn remember(&self, id: Uuid, at: Instant) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.seen.insert(id, at);
+        }
+    }
+
+    #[cfg(test)]
+    fn forget(&self, id: Uuid) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.seen.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_tracked(&self, id: Uuid) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.seen.contains_key(&id))
+            .unwrap_or(false)
+    }
+
+    /// Idle burst peers. Does not remove them. `local_node` is the front door.
+    pub fn idle_candidates(&self, burst_idle_secs: u64, local_node: Uuid) -> Vec<(Uuid, Instant)> {
+        let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
-        let mut expired = Vec::new();
-        seen.retain(|id, at| {
-            let idle = burst_idle_elapsed(at.elapsed(), burst_idle_secs, *id == local_node);
-            if idle {
-                expired.push(*id);
+        inner
+            .seen
+            .iter()
+            .filter_map(|(id, at)| {
+                if *id == local_node || inner.unloading.contains(id) {
+                    return None;
+                }
+                if burst_idle_elapsed(at.elapsed(), burst_idle_secs, false) {
+                    Some((*id, *at))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Same ids as [`Self::idle_candidates`]. Entries stay until [`Self::finish_idle_unload`].
+    pub fn take_idle(&self, burst_idle_secs: u64, local_node: Uuid) -> Vec<Uuid> {
+        self.idle_candidates(burst_idle_secs, local_node)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// True when this task owns the in-flight unload for `id`.
+    pub fn claim_unload(&self, id: Uuid) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        inner.unloading.insert(id)
+    }
+
+    /// The tracked instant is still `started` and still idle. A newer `touch` returns false.
+    pub fn still_the_same_idle(
+        &self,
+        id: Uuid,
+        started: Instant,
+        burst_idle_secs: u64,
+        local_node: Uuid,
+    ) -> bool {
+        if id == local_node {
+            return false;
+        }
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        match inner.seen.get(&id) {
+            Some(at) if *at == started => burst_idle_elapsed(at.elapsed(), burst_idle_secs, false),
+            _ => false,
+        }
+    }
+
+    /// Re-check idle under the lock. A failed unload, or a missing peer, puts `id` back.
+    /// A `touch` that landed during the HTTP call keeps the new timestamp.
+    /// The local front door is never dropped.
+    pub fn finish_idle_unload(
+        &self,
+        id: Uuid,
+        started: Instant,
+        unload_ok: bool,
+        burst_idle_secs: u64,
+        local_node: Uuid,
+    ) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.unloading.remove(&id);
+        if id == local_node {
+            return;
+        }
+        match inner.seen.get(&id).copied() {
+            Some(current) if current != started => {}
+            Some(current) => {
+                let still = burst_idle_elapsed(current.elapsed(), burst_idle_secs, false);
+                if unload_ok && still {
+                    inner.seen.remove(&id);
+                }
             }
-            !idle
-        });
-        expired
+            None => {
+                if !unload_ok {
+                    inner.seen.insert(id, started);
+                }
+            }
+        }
     }
 }
 
@@ -400,8 +617,19 @@ pub fn observe_stream_done(carry: &mut String, chunk: &[u8]) -> bool {
     found
 }
 
-/// Section 10.2 name, if any file fits. Does not spawn a server.
-pub fn resolve_front_door_name(cfg: &NexusConfig) -> Option<String> {
+/// Section 10.2 spawn plan. Does not start a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontDoorPlan {
+    pub filename: String,
+    pub model_path: PathBuf,
+    pub tags: Vec<String>,
+    pub context_size: usize,
+    /// True when the file only fits the 1024 / Q8 KV rung.
+    pub kv_q8: bool,
+}
+
+/// Section 10.2 choice, including the path and the rung that fit.
+pub fn plan_front_door(cfg: &NexusConfig) -> Option<FrontDoorPlan> {
     let index = ModelIndex::reconcile_default(Path::new(&cfg.node.models_dir)).unwrap_or_default();
     let presets = load_presets(&cfg.node.presets_dir);
     let profile = SystemProfile::probe();
@@ -422,6 +650,7 @@ pub fn resolve_front_door_name(cfg: &NexusConfig) -> Option<String> {
     let bench = crate::bench::BenchStore::load_default().ok();
     struct Owned {
         name: String,
+        path: PathBuf,
         weights_bytes: u64,
         tags: Vec<String>,
         fits_pin_policy: bool,
@@ -459,6 +688,7 @@ pub fn resolve_front_door_name(cfg: &NexusConfig) -> Option<String> {
         };
         owned.push(Owned {
             name: entry.filename.clone(),
+            path: entry.path.clone(),
             weights_bytes: meta.weights_bytes().max(entry.size_bytes),
             tags: preset_tags_for_file(&entry.filename, entry.model_name.as_deref(), &presets),
             fits_pin_policy: fits(&operator),
@@ -475,7 +705,21 @@ pub fn resolve_front_door_name(cfg: &NexusConfig) -> Option<String> {
             fits_1024_q8: file.fits_1024_q8,
         })
         .collect();
-    select_front_door(&cfg.inference.appliance.orchestrator, &views).map(str::to_string)
+    let name = select_front_door(&cfg.inference.appliance.orchestrator, &views)?;
+    let file = owned.iter().find(|file| file.name == name)?;
+    let pin_fit = file.fits_pin_policy;
+    Some(FrontDoorPlan {
+        filename: file.name.clone(),
+        model_path: file.path.clone(),
+        tags: front_door_tags(&file.tags),
+        context_size: if pin_fit { 4096 } else { 1024 },
+        kv_q8: !pin_fit,
+    })
+}
+
+/// Section 10.2 name, if any file fits. Does not spawn a server.
+pub fn resolve_front_door_name(cfg: &NexusConfig) -> Option<String> {
+    plan_front_door(cfg).map(|plan| plan.filename)
 }
 
 /// Log the front-door choice once per process. `None` prints [`FRONT_DOOR_MISS`].
@@ -626,5 +870,117 @@ mod tests {
         ];
         assert_eq!(select_front_door("", &untagged), Some("tiny.gguf"));
         assert_eq!(select_front_door("", &[]), None);
+    }
+
+    #[test]
+    fn appliance_gateway_keeps_hub_client_after_load() {
+        let local = hub_chat_target_after_load(
+            "http://127.0.0.1:8080",
+            "front.gguf",
+            None,
+            true,
+            true,
+            8090,
+        );
+        assert_eq!(local.0, "http://127.0.0.1:8090");
+        assert_eq!(local.1, "default");
+        let remote = hub_chat_target_after_load(
+            "http://10.1.2.3:8080",
+            "coder-7b.gguf",
+            None,
+            true,
+            true,
+            8090,
+        );
+        assert_eq!(remote.0, "http://127.0.0.1:8090");
+        assert_eq!(remote.1, "default");
+        assert!(!remote.0.contains("10.1.2.3"));
+        let pinned = hub_chat_target_after_load(
+            "http://10.1.2.3:8080",
+            "coder-7b.gguf",
+            Some("http://10.0.0.9:8080"),
+            true,
+            true,
+            8090,
+        );
+        assert_eq!(pinned.0, "http://10.1.2.3:8080");
+        assert_eq!(pinned.1, "coder-7b.gguf");
+    }
+
+    #[test]
+    fn accepted_fetch_does_not_choose_source_filename() {
+        let digest = "abCDef";
+        let source = "coder-7b.gguf";
+        assert_eq!(pantry_load_name(digest, source, true, false), None);
+        assert_eq!(
+            pantry_load_name(digest, source, true, true).as_deref(),
+            Some("abcdef.gguf")
+        );
+        assert_ne!(
+            pantry_load_name(digest, source, true, true).as_deref(),
+            Some(source)
+        );
+        let rows = [("coder-7b.gguf", "abcdef")];
+        assert!(catalog_lists_digest(rows, digest));
+        assert!(!catalog_lists_digest([("coder-7b.gguf", "other")], digest));
+        assert!(catalog_lists_digest([("abcdef.gguf", "")], digest));
+    }
+
+    #[test]
+    fn failed_unload_leaves_the_burst_peer_tracked() {
+        let activity = BurstActivity::default();
+        let id = Uuid::new_v4();
+        let local = Uuid::new_v4();
+        let started = Instant::now() - Duration::from_secs(1_000);
+        activity.remember(id, started);
+        assert!(activity.claim_unload(id));
+        activity.forget(id);
+        activity.finish_idle_unload(id, started, false, 600, local);
+        assert!(activity.is_tracked(id));
+
+        activity.remember(id, started);
+        activity.finish_idle_unload(id, started, true, 600, local);
+        assert!(!activity.is_tracked(id));
+
+        activity.remember(id, started);
+        activity.touch(id);
+        activity.finish_idle_unload(id, started, true, 600, local);
+        assert!(activity.is_tracked(id));
+
+        activity.remember(local, started);
+        activity.finish_idle_unload(local, started, true, 600, local);
+        assert!(activity.is_tracked(local));
+        assert!(activity.idle_candidates(600, local).is_empty());
+    }
+
+    #[test]
+    fn tier2_sends_loaded_alias_not_the_orchestrator_label() {
+        assert_eq!(tier2_model_id("front-door.gguf"), "front-door");
+        assert_ne!(tier2_model_id("front-door.gguf"), "orchestrator");
+    }
+
+    #[test]
+    fn usb_pantry_source_skips_the_phone_listen_port() {
+        let phone_control = 9998u16;
+        let port = pantry_reverse_device_port(8080, phone_control, 50052);
+        assert_ne!(port, phone_control);
+        assert_ne!(port, 8080);
+        assert_ne!(port, 50052);
+        let argv = crate::tunnel::control_reverse_argv("serial-a", port, phone_control);
+        assert_eq!(
+            argv,
+            vec![
+                "-s".to_string(),
+                "serial-a".to_string(),
+                "reverse".to_string(),
+                format!("tcp:{port}"),
+                format!("tcp:{phone_control}"),
+            ]
+        );
+        let wifi = pantry_source_base(LinkClass::Wifi, "10.0.0.4", phone_control, port).unwrap();
+        assert_eq!(wifi, "http://10.0.0.4:9998");
+        assert!(pantry_source_base(LinkClass::Wifi, "127.0.0.1", phone_control, port).is_err());
+        let usb = pantry_source_base(LinkClass::Usb, "10.0.0.4", phone_control, port).unwrap();
+        assert_eq!(usb, format!("http://127.0.0.1:{port}"));
     }
 }

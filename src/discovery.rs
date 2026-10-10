@@ -416,7 +416,63 @@ impl PeerNode {
         self.usb_api_endpoint = None;
         self.usb_control_endpoint = None;
     }
+}
 
+/// Point peers at localhost forwards, or clear them, matching cache node ids only.
+pub fn sync_peer_usb_links(
+    peers: &mut HashMap<Uuid, PeerNode>,
+    cache: &crate::adb_links::AdbLinkCache,
+    forwards: &[crate::adb_links::HostForward],
+) {
+    use std::collections::HashSet;
+    let present: HashSet<&str> = forwards
+        .iter()
+        .map(|forward| forward.serial.as_str())
+        .collect();
+    let mut applied = HashSet::new();
+    for forward in forwards {
+        let Some(link) = cache
+            .links
+            .iter()
+            .find(|link| link.serial == forward.serial)
+        else {
+            continue;
+        };
+        if let Some(peer) = peers.get_mut(&link.node_id) {
+            peer.apply_usb_probe(&forward.serial, forward.host_api, forward.host_control);
+            applied.insert(link.node_id);
+        }
+    }
+    let gone: Vec<Uuid> = cache
+        .links
+        .iter()
+        .filter(|link| !present.contains(link.serial.as_str()) && !applied.contains(&link.node_id))
+        .map(|link| link.node_id)
+        .collect();
+    for id in gone {
+        if let Some(peer) = peers.get_mut(&id) {
+            peer.clear_usb();
+        }
+    }
+    let stale: Vec<Uuid> = peers
+        .iter()
+        .filter_map(|(id, peer)| {
+            let serial = peer.usb_serial.as_deref()?;
+            if present.contains(serial) {
+                None
+            } else {
+                Some(*id)
+            }
+        })
+        .collect();
+    for id in stale {
+        if let Some(peer) = peers.get_mut(&id) {
+            peer.clear_usb();
+        }
+    }
+}
+
+impl PeerNode {
     pub fn is_rpc_ready(&self) -> bool {
         self.status.is_rpc_ready() && self.rpc_port > 0
     }
@@ -1010,6 +1066,16 @@ impl DiscoveryService {
                 }
             }
         })
+    }
+
+    /// Apply or clear USB endpoints from the serial cache. Match is the cache node id.
+    pub async fn sync_usb_links(
+        &self,
+        cache: &crate::adb_links::AdbLinkCache,
+        forwards: &[crate::adb_links::HostForward],
+    ) {
+        let mut peers = self.peers.write().await;
+        sync_peer_usb_links(&mut peers, cache, forwards);
     }
 
     /// Retrieve active peers, evicting any whose last beacon is older than `peer_timeout_ms` (6000 ms).
@@ -1804,5 +1870,35 @@ mod tests {
         peer.clear_usb();
         assert_eq!(peer.link_class, LinkClass::Wifi);
         assert_eq!(peer.api_endpoint(), "http://192.168.1.20:8080");
+    }
+
+    #[test]
+    fn sync_usb_links_follows_cache_uuid() {
+        use crate::adb_links::{AdbLinkCache, AdbLinkRecord, HostForward};
+        use std::collections::HashMap;
+
+        let id = Uuid::from_u128(7);
+        let mut peers = HashMap::new();
+        peers.insert(id, usb_fixture());
+        let cache = AdbLinkCache {
+            links: vec![AdbLinkRecord {
+                serial: "serial-a".into(),
+                node_id: id,
+                device_api_port: 8080,
+                device_control_port: 9998,
+                device_rpc_port: 50052,
+            }],
+        };
+        let forwards = vec![HostForward {
+            serial: "serial-a".into(),
+            host_api: 18080,
+            host_control: 18081,
+        }];
+        sync_peer_usb_links(&mut peers, &cache, &forwards);
+        assert_eq!(peers[&id].link_class, LinkClass::Usb);
+        assert_eq!(peers[&id].control_endpoint(), "http://127.0.0.1:18081");
+        sync_peer_usb_links(&mut peers, &cache, &[]);
+        assert_eq!(peers[&id].link_class, LinkClass::Wifi);
+        assert_eq!(peers[&id].api_endpoint(), "http://192.168.1.20:8080");
     }
 }

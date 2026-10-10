@@ -206,6 +206,28 @@ impl AdbTunnelSupervisor {
         forwards
     }
 
+    /// Host forwards that `adb forward --list` currently shows.
+    ///
+    /// `None` means `adb` is missing, so the caller must not clear USB state.
+    /// An empty vec means `adb` ran and no allocated forward is listed.
+    pub fn active_authorized_forwards(
+        host_port_base: u16,
+        max_devices: u8,
+    ) -> Option<Vec<HostForward>> {
+        if !Self::is_adb_available() {
+            return None;
+        }
+        let devices = Self::list_devices().ok()?;
+        let (forwards, _) = allocate_forwards(&devices, host_port_base, max_devices);
+        let listed = listed_forward_ports();
+        Some(
+            forwards
+                .into_iter()
+                .filter(|forward| listed.contains(&forward.host_api))
+                .collect(),
+        )
+    }
+
     /// Lightweight check: whether an ADB forward for `api_port` is already listed.
     /// Does not create tunnels; safe to call on a periodic UI tick.
     pub fn is_forward_active(api_port: u16) -> bool {
@@ -365,6 +387,25 @@ fn default_adb_host_settings() -> (u16, u8, u16) {
     )
 }
 
+fn listed_forward_ports() -> std::collections::HashSet<u16> {
+    let output = match Command::new("adb").args(["forward", "--list"]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return std::collections::HashSet::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ports = std::collections::HashSet::new();
+    for line in text.lines() {
+        for part in line.split_whitespace() {
+            if let Some(port) = part.strip_prefix("tcp:") {
+                if let Ok(port) = port.parse::<u16>() {
+                    ports.insert(port);
+                }
+            }
+        }
+    }
+    ports
+}
+
 fn load_link_cache() -> AdbLinkCache {
     AdbLinkCache::load(&AdbLinkCache::default_path()).unwrap_or_else(|err| {
         warn!("ADB link cache unavailable, using local device ports: {err}");
@@ -391,6 +432,22 @@ fn run_adb(args: &[String]) -> Result<bool, TunnelError> {
         err.trim()
     );
     Ok(false)
+}
+
+/// `adb -s <serial> reverse tcp:<device_port> tcp:<local_port>`.
+pub fn control_reverse_argv(serial: &str, device_port: u16, local_port: u16) -> Vec<String> {
+    reverse_argv(serial, device_port, local_port)
+}
+
+/// Reverse `device_port` on the phone to the host control port. Does not pick the port.
+pub fn install_control_reverse(
+    serial: &str,
+    device_port: u16,
+    local_port: u16,
+) -> Result<(), TunnelError> {
+    let args = reverse_argv(serial, device_port, local_port);
+    run_adb(&args)?;
+    Ok(())
 }
 
 fn reverse_argv(serial: &str, device_port: u16, local_port: u16) -> Vec<String> {

@@ -2,7 +2,7 @@ use clap::Parser;
 use nexus::config::NexusConfig;
 use nexus::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use nexus::discovery::{NodeRole, StatusFlags};
-use nexus::gateway::{spawn as spawn_gateway, GatewayContext};
+use nexus::gateway::{load_appliance_front_door, spawn as spawn_gateway, GatewayContext};
 use nexus::registry_runtime::spawn_registry_runtime;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::{AccelerationBackend, SystemProfile};
@@ -56,6 +56,36 @@ struct Args {
     /// Tracing filter level when RUST_LOG is unset
     #[arg(long, default_value = "info")]
     log_level: String,
+}
+
+async fn wait_for_supervisor_shutdown(supervisor: &SupervisorManager) {
+    info!("Listening for termination signal (Ctrl+C)...");
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                if let Err(e) = res {
+                    error!("Error listening for Ctrl+C: {}", e);
+                } else {
+                    info!("Termination signal received. Shutting down llama-server...");
+                }
+                break;
+            }
+            _ = tick.tick() => {
+                match supervisor.check_status().await {
+                    Ok(Some((exit_status, _))) => {
+                        error!("llama-server process exited unexpectedly: {:?}", exit_status);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Failed to poll supervisor: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -287,33 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 discovery.set_status_flags(status).await;
                 let broadcaster_handle = discovery.clone().start_broadcaster();
-                info!("Listening for termination signal (Ctrl+C)...");
-                let mut tick = tokio::time::interval(Duration::from_millis(500));
-                loop {
-                    tokio::select! {
-                        res = tokio::signal::ctrl_c() => {
-                            if let Err(e) = res {
-                                error!("Error listening for Ctrl+C: {}", e);
-                            } else {
-                                info!("Termination signal received. Shutting down llama-server...");
-                            }
-                            break;
-                        }
-                        _ = tick.tick() => {
-                            match supervisor.check_status().await {
-                                Ok(Some((exit_status, _))) => {
-                                    error!("llama-server process exited unexpectedly: {:?}", exit_status);
-                                    break;
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    error!("Failed to poll supervisor: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                wait_for_supervisor_shutdown(&supervisor).await;
                 discovery.set_status_flags(StatusFlags(0)).await;
                 let _ = supervisor.stop().await;
                 broadcaster_handle.abort();
@@ -328,6 +332,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+    } else if config.inference.appliance.enabled
+        && load_appliance_front_door(
+            &supervisor,
+            &discovery,
+            &config,
+            &args.binary,
+            &args.host,
+            args.port,
+        )
+        .await
+        .is_some()
+    {
+        let broadcaster_handle = discovery.clone().start_broadcaster();
+        info!("Appliance front door is resident. Press Ctrl+C to exit.");
+        wait_for_supervisor_shutdown(&supervisor).await;
+        discovery.set_status_flags(StatusFlags(0)).await;
+        let _ = supervisor.stop().await;
+        broadcaster_handle.abort();
+        listener_handle.abort();
+        control_handle.abort();
+        info!("Shutdown complete.");
     } else {
         let broadcaster_handle = discovery.clone().start_broadcaster();
         info!(

@@ -361,6 +361,7 @@ impl Router {
         prompt: &str,
         routes: &[RouteTarget],
         orch_client: &NexusClient,
+        model: &str,
     ) -> Result<RouteDecision, RouterError> {
         if routes.is_empty() {
             return Err(RouterError::NoRoutesAvailable);
@@ -377,8 +378,16 @@ impl Router {
         }
 
         let system_instruction = Self::build_orchestrator_prompt(prompt, &available_tags);
+        let model_id = {
+            let trimmed = model.trim();
+            if trimmed.is_empty() {
+                "orchestrator".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
         let chat_req = ChatCompletionRequest {
-            model: "orchestrator".to_string(),
+            model: model_id,
             messages: vec![
                 ChatMessage::system(system_instruction),
                 ChatMessage::user(prompt),
@@ -447,7 +456,10 @@ impl Router {
 
         // 2. Try Tier 2 orchestrator route if available
         if let Some(client) = orch_client {
-            match self.route_orchestrated(prompt, routes, client).await {
+            match self
+                .route_orchestrated(prompt, routes, client, "orchestrator")
+                .await
+            {
                 Ok(decision) => return decision,
                 Err(err) => {
                     warn!(

@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Appliance front door stays resident; pantry load waits for the catalog
+- Category: bug
+- Context: Edge appliance review. Hub and `nexusd` only logged the section 10.2 file. Fetch returned `accepted` before `{digest}.gguf` existed, and the load used the source filename. The hub client left the gateway after the first load. Idle unload deleted the peer before the HTTP call and awaited it on the TUI tick. Status-role SSE was stored as assistant text.
+- Finding: Spec 10.2 loads that one local file on hub and `nexusd` start and does not unload it on escalation. Spec 13 loads only after the peer catalog lists the digest (this handler has no byte count). The written name is `{digest}.gguf`. USB pantry reachback is `adb reverse` onto a device port that is not the phone's Nexus listen port. Wi-Fi uses `get_local_ip` and the Mac control port. While appliance and gateway are on and `default_host` is unset, chat stays on the gateway with model id `default`.
+- Action: Spawn the front door from `load_appliance_front_door`. Poll the catalog (15s) before `dispatch_load_model`. Keep hub chat on the gateway. Skip `role: status` in `stream_chat`. Re-check burst idle under the lock after unload and run that HTTP off the UI task. `sync_peer_usb_links` matches `AdbLinkCache` node id only.
+- Verification: `cargo test --locked --lib` — 145 passed. `cargo check --locked --bins --lib` — no warnings. No live `adb`. `tests/` not edited.
+
 ## 2026-10-10 — One MoE budget replaces the knob grid and governor
 - Category: design-decision
 - Context: Phase 16.5 ranked a (context, cache) grid and then ran a second governor (25% shrink, 45% of the LMK budget). Both capped RAM the stream guard would have allowed, and the peer ran the same pass again.

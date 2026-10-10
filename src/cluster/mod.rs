@@ -1,10 +1,18 @@
 //! Cluster budgets, layer-split planning, and placement ranking (Phase 11).
 
 mod memory;
+mod moe_governor;
+mod moe_knobs;
 mod rank;
 mod split;
 
 pub use memory::{estimate_compute_buffer_mb, MemoryPlan, MemoryPolicy, Remediation, Verdict};
+pub use moe_governor::{
+    apply_moe_governor_to_config, govern_moe_stream, MoeGovernorAdvice, CHRONIC_DROP_COLD,
+};
+pub use moe_knobs::{
+    plan_moe_stream_knobs, predict_moe_stream_tok_s, MoeStreamKnobPlan, MOE_COLD_START_TOK_S,
+};
 pub use rank::{
     classify_fit, link_quality_from_timings, rank_execution_plans, ExecutionPlan, LinkQuality,
     PlacementCandidate, PlacementRequest, PlanTarget,

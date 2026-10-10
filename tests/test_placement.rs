@@ -94,6 +94,8 @@ fn ranked_plans_include_predicted_tok_s() {
             is_local: false,
             thermal_index: 10,
             moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            total_ram_mb: 28_000,
         }],
     };
     let plans = rank_execution_plans(&req).expect("plans");
@@ -169,6 +171,8 @@ fn ranks_local_moe_stream_for_oversize_moe() {
             is_local: false,
             thermal_index: 10,
             moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            total_ram_mb: 0,
         }],
     };
     let plans = rank_execution_plans(&req).expect("plans");
@@ -190,4 +194,306 @@ fn ranks_local_moe_stream_for_oversize_moe() {
     {
         assert!(moe_idx < dist_idx);
     }
+    // Cold-start uses active-params + flash I/O heuristic (A3B warm ≈ 2.2).
+    let expected = nexus::cluster::predict_moe_stream_tok_s(
+        &gguf,
+        match &plans[moe_idx].target {
+            PlanTarget::LocalMoeStream { cache_mb, .. } => *cache_mb,
+            _ => 0,
+        },
+        AccelerationBackend::ArmCpuDotProd,
+        None,
+    );
+    assert!(
+        (plans[moe_idx].predicted_tok_s - expected).abs() < 0.01,
+        "expected heuristic {expected}, got {}",
+        plans[moe_idx].predicted_tok_s
+    );
+}
+
+#[test]
+fn local_moe_stream_uses_measured_bench_tok_s() {
+    use nexus::bench::{unix_now, BenchSample, BenchStore, BACKEND_MOE_STREAM};
+    use nexus::gguf::GgufTensorInfo;
+
+    let expert = GgufTensorInfo {
+        name: "blk.0.ffn_gate_exps.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 0,
+        nbytes: 12_000_000_000,
+        layer_index: Some(0),
+    };
+    let dense = GgufTensorInfo {
+        name: "blk.0.attn_q.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 100,
+        nbytes: 800_000_000,
+        layer_index: Some(0),
+    };
+    let gguf = GgufMetadata {
+        version: 3,
+        tensor_count: 2,
+        kv_count: 0,
+        metadata: HashMap::new(),
+        architecture: Some("qwen3moe".into()),
+        model_name: Some("big-moe".into()),
+        context_length: Some(4096),
+        block_count: Some(1),
+        head_count: Some(8),
+        head_count_kv: Some(8),
+        embedding_length: Some(512),
+        expert_count: Some(128),
+        expert_used_count: Some(8),
+        file_size_bytes: 18_000_000_000,
+        tensors: vec![expert, dense],
+        quant_label: Some("Q4_0".into()),
+    };
+    let mut store = BenchStore {
+        version: 1,
+        entries: vec![],
+    };
+    store.record_with_backend_key(
+        "big-moe",
+        "phone",
+        BACKEND_MOE_STREAM,
+        2048,
+        BenchSample {
+            gen_tok_s: 3.5,
+            ttft_ms: None,
+            prompt_tok_s: None,
+            cache_hit_pct: Some(70.0),
+            measured_at: unix_now(),
+        },
+    );
+    let profile = SystemProfile {
+        total_ram_mb: 12_000,
+        available_ram_mb: 10_000,
+        detected_backend: AccelerationBackend::ArmCpuDotProd,
+        recommended_threads: 4,
+    };
+    let req = PlacementRequest {
+        gguf: &gguf,
+        policy: MemoryPolicy::from_safety(75, true, false, 2048),
+        local_profile: profile,
+        local_name: "phone".into(),
+        local_gpu_layers: 0,
+        enable_rpc: false,
+        bench: Some(&store),
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 3500,
+        candidates: vec![],
+    };
+    let plans = rank_execution_plans(&req).expect("plans");
+    let moe = plans
+        .iter()
+        .find(|p| matches!(p.target, PlanTarget::LocalMoeStream { .. }))
+        .expect("LocalMoeStream plan");
+    assert!(
+        (moe.predicted_tok_s - 3.5).abs() < 0.01,
+        "expected measured 3.5, got {}",
+        moe.predicted_tok_s
+    );
+    assert_eq!(
+        moe.context_size, 2048,
+        "ExecutionPlan.context_size must match knob winner"
+    );
+}
+
+fn oversize_streamable_moe_gguf() -> GgufMetadata {
+    use nexus::gguf::GgufTensorInfo;
+    let expert = GgufTensorInfo {
+        name: "blk.0.ffn_gate_exps.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 0,
+        nbytes: 12_000_000_000,
+        layer_index: Some(0),
+    };
+    let dense = GgufTensorInfo {
+        name: "blk.0.attn_q.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 100,
+        nbytes: 800_000_000,
+        layer_index: Some(0),
+    };
+    GgufMetadata {
+        version: 3,
+        tensor_count: 2,
+        kv_count: 0,
+        metadata: HashMap::new(),
+        architecture: Some("qwen3moe".into()),
+        model_name: Some("big-moe".into()),
+        context_length: Some(4096),
+        block_count: Some(1),
+        head_count: Some(8),
+        head_count_kv: Some(8),
+        embedding_length: Some(512),
+        expert_count: Some(128),
+        expert_used_count: Some(8),
+        file_size_bytes: 18_000_000_000,
+        tensors: vec![expert, dense],
+        quant_label: Some("Q4_0".into()),
+    }
+}
+
+#[test]
+fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
+    let gguf = oversize_streamable_moe_gguf();
+    let laptop = SystemProfile {
+        total_ram_mb: 8_192,
+        available_ram_mb: 512,
+        detected_backend: AccelerationBackend::X86Baseline,
+        recommended_threads: 2,
+    };
+    let req = PlacementRequest {
+        gguf: &gguf,
+        policy: MemoryPolicy::from_safety(75, true, false, 2048),
+        local_profile: laptop,
+        local_name: "laptop".into(),
+        local_gpu_layers: 0,
+        enable_rpc: true,
+        bench: None,
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 0,
+        candidates: vec![
+            PlacementCandidate {
+                name: "phone".into(),
+                budget: NodeBudget::new(Uuid::new_v4(), "phone", 10_000),
+                backend: AccelerationBackend::ArmCpuDotProd,
+                rpc_endpoint: None,
+                link: LinkQuality::unknown(),
+                is_local: false,
+                thermal_index: 10,
+                moe_stream: true,
+                moe_cache_ceil_mb: 3500,
+                total_ram_mb: 12_000,
+            },
+            PlacementCandidate {
+                name: "worker".into(),
+                budget: NodeBudget::new(Uuid::new_v4(), "worker", 1800),
+                backend: AccelerationBackend::X86Baseline,
+                rpc_endpoint: Some("10.0.0.2:50052".into()),
+                link: LinkQuality::unknown(),
+                is_local: false,
+                thermal_index: 10,
+                moe_stream: false,
+                moe_cache_ceil_mb: 0,
+                total_ram_mb: 0,
+            },
+        ],
+    };
+    let plans = rank_execution_plans(&req).expect("plans");
+    assert!(
+        !plans
+            .iter()
+            .any(|p| matches!(p.target, PlanTarget::LocalMoeStream { .. })),
+        "laptop should not plan local MoE stream"
+    );
+    let remote_moe_idx = plans
+        .iter()
+        .position(|p| matches!(p.target, PlanTarget::RemoteMoeStream { .. }))
+        .expect("RemoteMoeStream plan");
+    assert!(
+        !plans.iter().any(|p| matches!(
+            &p.target,
+            PlanTarget::Remote { peer_name } if peer_name == "phone"
+        )),
+        "misleading dense remote plan for phone should be suppressed"
+    );
+    if let Some(dist_idx) = plans
+        .iter()
+        .position(|p| matches!(p.target, PlanTarget::Distributed { .. }))
+    {
+        assert!(
+            remote_moe_idx < dist_idx,
+            "RemoteMoeStream should outrank distributed RPC for flash-capable phone"
+        );
+    }
+}
+
+#[test]
+fn no_remote_moe_stream_without_peer_capability() {
+    let gguf = oversize_streamable_moe_gguf();
+    let laptop = SystemProfile {
+        total_ram_mb: 8_192,
+        available_ram_mb: 2_048,
+        detected_backend: AccelerationBackend::X86Baseline,
+        recommended_threads: 2,
+    };
+    let req = PlacementRequest {
+        gguf: &gguf,
+        policy: MemoryPolicy::from_safety(75, true, false, 2048),
+        local_profile: laptop,
+        local_name: "laptop".into(),
+        local_gpu_layers: 0,
+        enable_rpc: false,
+        bench: None,
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 0,
+        candidates: vec![PlacementCandidate {
+            name: "worker".into(),
+            budget: NodeBudget::new(Uuid::new_v4(), "worker", 1800),
+            backend: AccelerationBackend::X86Baseline,
+            rpc_endpoint: Some("10.0.0.2:50052".into()),
+            link: LinkQuality::unknown(),
+            is_local: false,
+            thermal_index: 10,
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            total_ram_mb: 0,
+        }],
+    };
+    let plans = rank_execution_plans(&req).expect("plans");
+    assert!(!plans
+        .iter()
+        .any(|p| matches!(p.target, PlanTarget::RemoteMoeStream { .. })));
+}
+
+#[test]
+fn no_remote_moe_stream_when_peer_stream_lmk_tight() {
+    let gguf = oversize_streamable_moe_gguf();
+    let laptop = SystemProfile {
+        total_ram_mb: 8_192,
+        available_ram_mb: 2_048,
+        detected_backend: AccelerationBackend::X86Baseline,
+        recommended_threads: 2,
+    };
+    let req = PlacementRequest {
+        gguf: &gguf,
+        policy: MemoryPolicy::from_safety(75, true, false, 4096),
+        local_profile: laptop,
+        local_name: "laptop".into(),
+        local_gpu_layers: 0,
+        enable_rpc: false,
+        bench: None,
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 0,
+        candidates: vec![PlacementCandidate {
+            name: "tiny-phone".into(),
+            budget: NodeBudget::new(Uuid::new_v4(), "tiny-phone", 400),
+            backend: AccelerationBackend::GenericCpu,
+            rpc_endpoint: None,
+            link: LinkQuality::unknown(),
+            is_local: false,
+            thermal_index: 10,
+            moe_stream: true,
+            moe_cache_ceil_mb: 0,
+            total_ram_mb: 2_048,
+        }],
+    };
+    let plans = rank_execution_plans(&req).expect("plans");
+    assert!(
+        !plans
+            .iter()
+            .any(|p| matches!(p.target, PlanTarget::RemoteMoeStream { .. })),
+        "tight peer should not emit RemoteMoeStream, got {:?}",
+        plans.iter().map(|p| &p.target).collect::<Vec<_>>()
+    );
 }

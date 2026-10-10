@@ -109,6 +109,7 @@ async fn control_plane_http_load_fails_without_binary_and_unload_succeeds() {
             tags: Vec::new(),
             target_port: None,
             backend: "auto".to_string(),
+            moe_cache_ceil_mb: None,
         },
     )
     .await

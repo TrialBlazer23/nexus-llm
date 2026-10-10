@@ -626,8 +626,13 @@ impl ChatApp {
                 Some(self.tokens_streamed),
             );
 
-            // Best-effort Phase 12 §5.5 telemetry into ~/.nexus/bench.json
-            if metrics.tokens > 0 && metrics.tokens_per_sec > 0.0 {
+            // Best-effort Phase 12 §5.5 telemetry into ~/.nexus/bench.json.
+            // MoE sessions record engine tok/s from BMOE_DONE in the bmoe adapter;
+            // skip wall-clock SSE chunk rates here (wrong metric + would poison "cpu").
+            if metrics.tokens > 0
+                && metrics.tokens_per_sec > 0.0
+                && !self.target_backend.to_ascii_lowercase().contains("moe")
+            {
                 let backend = backend_from_label(&self.target_backend);
                 let prompt_tok_s = metrics.ttft_ms.map(|ms| {
                     let secs = (ms as f32 / 1000.0).max(1e-3);
@@ -643,6 +648,7 @@ impl ChatApp {
                         gen_tok_s: metrics.tokens_per_sec as f32,
                         ttft_ms: metrics.ttft_ms,
                         prompt_tok_s,
+                        cache_hit_pct: None,
                         measured_at: crate::bench::unix_now(),
                     },
                 );

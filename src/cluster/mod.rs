@@ -1,10 +1,12 @@
 //! Cluster budgets, layer-split planning, and placement ranking (Phase 11).
 
+mod ladder;
 mod memory;
 mod moe_plan;
 mod rank;
 mod split;
 
+pub use ladder::{context_steps, plan_fit_ladder, quant_stem, LadderChoice};
 pub use memory::{estimate_compute_buffer_mb, MemoryPlan, MemoryPolicy, Remediation, Verdict};
 pub use moe_plan::{
     plan_moe_spawn, predict_moe_stream_tok_s, MoeCacheCap, MoeScoreSource, MoeSpawnPlan,

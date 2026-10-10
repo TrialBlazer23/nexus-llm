@@ -92,6 +92,15 @@ pub struct BenchEntry {
     pub samples: Vec<BenchSample>,
 }
 
+/// Rolling MoE expert-cache hit stats for the cache governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoeCacheHitStats {
+    /// Rolling-average hit percent from the chosen bench entry.
+    pub hit_pct: f32,
+    /// Number of samples on that entry that recorded `cache_hit_pct`.
+    pub samples_with_hit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BenchStore {
     pub version: u32,
@@ -223,6 +232,72 @@ impl BenchStore {
                 && e.backend == backend
                 && e.context_size == context_size
         })
+    }
+
+    /// Lookup rolling-average MoE cache hit percent by free-form backend key.
+    pub fn lookup_cache_hit_pct_by_key(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        backend: &str,
+        context_size: usize,
+    ) -> Option<f32> {
+        self.find_entry_by_key(model_id, node_id, backend, context_size)
+            .and_then(|e| e.cache_hit_pct)
+            .filter(|v| *v >= 0.0)
+    }
+
+    /// MoE stream hit stats for the cache governor.
+    ///
+    /// Prefer exact `(model, node, moe-stream, ctx)`, then any-node same ctx,
+    /// then the newest moe-stream entry for the model (any ctx).
+    pub fn lookup_moe_cache_hit(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        context_size: usize,
+    ) -> Option<MoeCacheHitStats> {
+        let entry = self
+            .find_entry_by_key(model_id, node_id, BACKEND_MOE_STREAM, context_size)
+            .or_else(|| self.find_newest_moe_entry(model_id, Some(context_size)))
+            .or_else(|| self.find_newest_moe_entry(model_id, None))?;
+        let hit_pct = entry.cache_hit_pct.filter(|v| *v >= 0.0)?;
+        let samples_with_hit = entry
+            .samples
+            .iter()
+            .filter(|s| s.cache_hit_pct.is_some())
+            .count()
+            .max(if entry.cache_hit_pct.is_some() { 1 } else { 0 });
+        Some(MoeCacheHitStats {
+            hit_pct,
+            samples_with_hit,
+        })
+    }
+
+    fn find_newest_moe_entry(
+        &self,
+        model_id: &str,
+        context_size: Option<usize>,
+    ) -> Option<&BenchEntry> {
+        let mut best: Option<&BenchEntry> = None;
+        for e in &self.entries {
+            if e.backend != BACKEND_MOE_STREAM || !model_ids_match(&e.model_id, model_id) {
+                continue;
+            }
+            if let Some(ctx) = context_size {
+                if e.context_size != ctx {
+                    continue;
+                }
+            }
+            if e.cache_hit_pct.is_none() {
+                continue;
+            }
+            best = Some(match best {
+                Some(cur) if cur.measured_at >= e.measured_at => cur,
+                _ => e,
+            });
+        }
+        best
     }
 
     /// Append a sample and refresh rolling averages. Returns the updated entry.
@@ -586,6 +661,15 @@ mod unit_tests {
         assert_eq!(
             store.lookup_gen_tok_s_any_node_by_key("qwen-moe", BACKEND_MOE_STREAM, 4096),
             Some(2.5)
+        );
+        let hit = store
+            .lookup_moe_cache_hit("qwen-moe", "local", 4096)
+            .expect("hit stats");
+        assert!((hit.hit_pct - 50.0).abs() < 0.01);
+        assert_eq!(hit.samples_with_hit, 2);
+        assert_eq!(
+            store.lookup_cache_hit_pct_by_key("qwen-moe", "local", BACKEND_MOE_STREAM, 4096),
+            Some(50.0)
         );
     }
 }

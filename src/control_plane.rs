@@ -5,6 +5,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
+use tracing::info;
 use uuid::Uuid;
 
 pub const CONTROL_PLANE_VERSION: u16 = 1;
@@ -1145,6 +1146,20 @@ pub async fn handle_load_model_with_moe(
                 };
             }
         };
+        let mut moe_cfg = moe.clone();
+        let lmk_budget_mb =
+            profile.max_allowed_memory_bytes_pct(memory_budget_percent) / (1024 * 1024);
+        let gov_notes = crate::cluster::apply_moe_governor_to_config(
+            &mut moe_cfg,
+            bench.as_ref(),
+            &model_key,
+            "local",
+            knobs.context_size,
+            lmk_budget_mb,
+        );
+        for note in &gov_notes {
+            info!("{note}");
+        }
         let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
             std::path::PathBuf::from(&moe.bmoe_binary),
             model_path.clone(),
@@ -1152,7 +1167,7 @@ pub async fn handle_load_model_with_moe(
             port,
             knobs.context_size,
             request.threads,
-            moe.clone(),
+            moe_cfg,
             &profile,
             memory_budget_percent,
             request.tags.clone(),

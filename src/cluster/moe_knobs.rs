@@ -91,6 +91,15 @@ pub fn plan_moe_stream_knobs(
 
     let budget_mb = profile.max_allowed_memory_bytes_pct(percent) / (1024 * 1024);
     let resident_mb = gguf.moe_resident_weight_bytes() / (1024 * 1024);
+    let hit = bench.and_then(|s| s.lookup_moe_cache_hit(model_key, node_id, desired_ctx));
+    // Ceil-only governor: bias the grid seed from rolling hit% (lossy applied at spawn).
+    let default_ceil_mb = super::govern_moe_stream(
+        &crate::config::MoeConfig::default(),
+        default_ceil_mb,
+        budget_mb,
+        hit,
+    )
+    .default_ceil_mb;
     let contexts = context_candidates(desired_ctx, gguf.context_length);
 
     let mut best: Option<MoeStreamKnobPlan> = None;
@@ -476,6 +485,56 @@ mod tests {
             "winner tok/s {} should beat cold {}",
             plan.predicted_tok_s,
             cold_tok
+        );
+    }
+
+    #[test]
+    fn warm_hit_governor_shrinks_default_ceil_seed() {
+        let gguf = streamable_moe_gguf(12, 800);
+        let profile = SystemProfile {
+            total_ram_mb: 16_000,
+            available_ram_mb: 14_000,
+            detected_backend: AccelerationBackend::ArmCpuDotProd,
+            recommended_threads: 4,
+        };
+        let ungoverned =
+            plan_moe_stream_knobs(&gguf, &profile, 75, 4096, 3500, None, "big-moe", "local")
+                .expect("plan");
+        let mut store = BenchStore {
+            version: 1,
+            entries: vec![],
+        };
+        // Hit-only samples with tok/s below heuristic so ceil seed (not measured tok/s)
+        // drives the comparison: warm governor shrinks 3500→2625.
+        store.record_with_backend_key(
+            "big-moe",
+            "local",
+            BACKEND_MOE_STREAM,
+            4096,
+            BenchSample {
+                gen_tok_s: 0.5,
+                ttft_ms: None,
+                prompt_tok_s: None,
+                cache_hit_pct: Some(85.0),
+                measured_at: unix_now(),
+            },
+        );
+        let governed = plan_moe_stream_knobs(
+            &gguf,
+            &profile,
+            75,
+            4096,
+            3500,
+            Some(&store),
+            "big-moe",
+            "local",
+        )
+        .expect("plan");
+        assert!(
+            governed.cache_ceil_mb <= ungoverned.cache_ceil_mb,
+            "warm governor ceil {} should be ≤ ungoverned {}",
+            governed.cache_ceil_mb,
+            ungoverned.cache_ceil_mb
         );
     }
 }

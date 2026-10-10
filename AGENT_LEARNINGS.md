@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Hit%-driven MoE cache governor
+- Category: design-decision
+- Context: Phase 16.5 step 5 — `cache_hit_pct` was recorded in BenchStore but never biased ceil or lossy knobs at load time.
+- Finding: Warm hit (≥70%) can shrink default ceil 25%; cold (<40%) bumps toward 45% LMK headroom; chronically cold (<25% with ≥3 hit samples) may overlay session `drop_cold_experts=0.85` only when `quality_mode=lossy` and operator drop is unset. Never auto-flip Lossless→Lossy; never persist into TOML; load/plan only (no mid-session respawn).
+- Action: `BenchStore::lookup_moe_cache_hit`; `cluster::moe_governor::{govern_moe_stream, apply_moe_governor_to_config}`; bias `default_ceil` inside `plan_moe_stream_knobs`; apply lossy overlay at hub/control-plane/CLI/gateway spawn.
+- Verification: Governor unit tests + warm-hit planner shrink; `cargo test --locked`; clippy `-D warnings`.
+
 ## 2026-10-10 — Active-params + flash I/O MoE cold-start scoring
 - Category: design-decision
 - Context: Phase 16.5 step 4 — cold-start MoE tok/s was a flat 2.2 for every (ctx, ceil), so joint knobs could not prefer warmer expert caches on throughput grounds, and denser top-k MoEs ranked identically to A3B.

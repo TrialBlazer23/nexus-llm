@@ -1214,6 +1214,28 @@ async fn run_local_load(
                 context_size,
                 moe_cache_ceil_mb,
             );
+            let mut moe_cfg = ctx.config.inference.moe.clone();
+            let model_key = gguf
+                .model_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| gguf.quant_label.clone())
+                .unwrap_or_else(|| model_name.clone());
+            let lmk_budget_mb = profile
+                .max_allowed_memory_bytes_pct(ctx.config.hardware.safety.max_ram_usage_percent)
+                / (1024 * 1024);
+            let bench = crate::bench::BenchStore::load_default().ok();
+            let gov_notes = crate::cluster::apply_moe_governor_to_config(
+                &mut moe_cfg,
+                bench.as_ref(),
+                &model_key,
+                "local",
+                spawn_ctx,
+                lmk_budget_mb,
+            );
+            for note in &gov_notes {
+                info!("{note}");
+            }
             let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
                 PathBuf::from(&ctx.config.inference.moe.bmoe_binary),
                 model_path.clone(),
@@ -1221,7 +1243,7 @@ async fn run_local_load(
                 ctx.config.network.api_port,
                 spawn_ctx,
                 threads,
-                ctx.config.inference.moe.clone(),
+                moe_cfg,
                 &profile,
                 ctx.config.hardware.safety.max_ram_usage_percent,
                 Vec::new(),

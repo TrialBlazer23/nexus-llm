@@ -706,17 +706,55 @@ async fn handle_api_model_load(
             payload.context_size,
             budget_percent,
         ) {
-            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
-                PathBuf::from(&moe.bmoe_binary),
+            let mut moe_cfg = moe;
+            let model_key = gguf
+                .model_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| gguf.quant_label.clone())
+                .unwrap_or_else(|| filename.clone());
+            let lmk_budget_mb =
+                profile.max_allowed_memory_bytes_pct(budget_percent) / (1024 * 1024);
+            let bench = crate::bench::BenchStore::load_default().ok();
+            let gov_notes = crate::cluster::apply_moe_governor_to_config(
+                &mut moe_cfg,
+                bench.as_ref(),
+                &model_key,
+                "local",
+                payload.context_size,
+                lmk_budget_mb,
+            );
+            for note in &gov_notes {
+                info!("{note}");
+            }
+            let default_ceil =
+                moe_cfg.derive_cache_ceil_mb(profile.available_ram_mb, budget_percent);
+            let knobs = crate::cluster::plan_moe_stream_knobs(
+                &gguf,
+                &profile,
+                budget_percent,
+                payload.context_size,
+                default_ceil,
+                bench.as_ref(),
+                &model_key,
+                "local",
+            );
+            let (spawn_ctx, ceil_override) = match knobs {
+                Some(k) => (k.context_size, Some(k.cache_ceil_mb)),
+                None => (payload.context_size, None),
+            };
+            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
+                PathBuf::from(&moe_cfg.bmoe_binary),
                 resolved_path.clone(),
                 "127.0.0.1",
                 ctx.api_port,
-                payload.context_size,
+                spawn_ctx,
                 threads,
-                moe,
+                moe_cfg,
                 &profile,
                 budget_percent,
                 Vec::new(),
+                ceil_override,
             );
             return match ctx.supervisor.spawn_bmoe(bmoe_cfg).await {
                 Ok(_) => {

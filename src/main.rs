@@ -508,6 +508,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(k) => (k.context_size, Some(k.cache_ceil_mb)),
                     None => (ctx, None),
                 };
+                let mut moe_cfg = config.inference.moe.clone();
+                let lmk_budget_mb = profile
+                    .max_allowed_memory_bytes_pct(config.hardware.safety.max_ram_usage_percent)
+                    / (1024 * 1024);
+                let gov_notes = nexus::cluster::apply_moe_governor_to_config(
+                    &mut moe_cfg,
+                    bench.as_ref(),
+                    &model_key,
+                    "local",
+                    spawn_ctx,
+                    lmk_budget_mb,
+                );
+                for note in &gov_notes {
+                    tracing::info!("{note}");
+                }
                 let bmoe_cfg = BmoeSessionConfig::from_profile_with_ceil(
                     std::path::PathBuf::from(&config.inference.moe.bmoe_binary),
                     model,
@@ -515,7 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     api_port,
                     spawn_ctx,
                     profile.recommended_threads,
-                    config.inference.moe.clone(),
+                    moe_cfg,
                     &profile,
                     config.hardware.safety.max_ram_usage_percent,
                     Vec::new(),

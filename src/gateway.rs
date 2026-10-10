@@ -5,16 +5,34 @@
 //! requested model. Distinct from `api_port` (llama-server) and
 //! `control_port` (signed control plane).
 
+use crate::appliance::{
+    cold_predict_tok_s, decide_appliance, format_route_header, front_door_tags, link_header_token,
+    load_presets, observe_stream_done, peer_lost_sse, preset_tags_for_file, score_burst_candidate,
+    warn_front_door_once, ApplianceDecision, BurstActivity, RouteStay,
+};
+use crate::bench::BenchStore;
+use crate::client::NexusClient;
+use crate::cluster::{
+    moe_model_key, plan_fit_ladder, plan_moe_spawn, select_burst_winner, BurstScore, MemoryPolicy,
+    MoeCacheCap,
+};
 use crate::config::NexusConfig;
-use crate::control_plane::build_model_catalog;
+use crate::control_plane::{
+    blob_url, build_model_catalog, dispatch_load_model, dispatch_load_model_signed,
+    dispatch_unload_model, dispatch_unload_model_signed, fetch_models, request_blob_fetch,
+    BlobFetchRequest, ModelLoadRequest, ModelUnloadRequest, CONTROL_PLANE_VERSION,
+};
 use crate::discovery::{DiscoveryService, PeerNode};
+use crate::gguf::{GgufMetadata, GgufValue, KvCacheDtype};
 use crate::node_identity::NodeIdentity;
+use crate::router::{RouteDecision, RouteTarget, Router};
+use crate::store::ModelIndex;
 use crate::supervisor::SupervisorManager;
-use crate::sysinfo::SystemProfile;
+use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use crate::trust_auth::pairing_enforced;
 use bytes::Bytes;
-use futures_util::stream::unfold;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::stream::{unfold, BoxStream};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
@@ -26,8 +44,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -64,6 +84,8 @@ pub struct GatewayContext {
     pub session_tokens: Arc<tokio::sync::RwLock<HashMap<String, std::time::Instant>>>,
     pub active_pin: Option<String>,
     pub download_status: Arc<tokio::sync::RwLock<Option<DownloadProgressStatus>>>,
+    /// Last escalated request per burst peer. The local front door is not recorded.
+    pub burst_activity: BurstActivity,
 }
 
 impl GatewayContext {
@@ -86,6 +108,7 @@ impl GatewayContext {
             session_tokens: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             active_pin: None,
             download_status: Arc::new(tokio::sync::RwLock::new(None)),
+            burst_activity: BurstActivity::default(),
         }
     }
 
@@ -170,6 +193,21 @@ fn is_default_model(model: &str) -> bool {
 
 /// Resolve `model` → OpenAI base URL using local supervisor / discovery peers.
 pub async fn resolve_model_upstream(ctx: &GatewayContext, model: &str) -> Option<ResolvedUpstream> {
+    let appliance_enabled = ctx
+        .config
+        .read()
+        .map(|cfg| cfg.inference.appliance.enabled)
+        .unwrap_or(false);
+    // Ordinary (default) chat belongs to the appliance router. Do not hand it
+    // to the largest ready peer. A loaded local model still resolves here.
+    if appliance_enabled && is_default_model(model) {
+        return local_active_model(ctx).await.map(|local| ResolvedUpstream {
+            base_url: ctx.local_upstream(),
+            model_id: local,
+            source: UpstreamSource::Local,
+        });
+    }
+
     let catalog = build_model_catalog(ctx.node_id, &ctx.models_dir);
     let resolved_names: Vec<String> = catalog
         .models
@@ -1325,6 +1363,15 @@ async fn handle_chat_completions(
         }
     };
 
+    let appliance_on = ctx
+        .config
+        .read()
+        .map(|cfg| cfg.inference.appliance.enabled)
+        .unwrap_or(false);
+    if appliance_on && is_default_model(&model) {
+        return handle_appliance_chat(ctx, body_bytes).await;
+    }
+
     let resolved = match resolve_model_upstream(&ctx, &model).await {
         Some(r) => r,
         None => {
@@ -1342,10 +1389,25 @@ async fn handle_chat_completions(
         }
     };
 
-    proxy_upstream(&resolved.base_url, "/v1/chat/completions", body_bytes).await
+    proxy_upstream(
+        &resolved.base_url,
+        "/v1/chat/completions",
+        body_bytes,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
-async fn proxy_upstream(base_url: &str, path: &str, body: Bytes) -> Response<RespBody> {
+async fn proxy_upstream(
+    base_url: &str,
+    path: &str,
+    body: Bytes,
+    route_header: Option<String>,
+    note_peer_lost: bool,
+    burst: Option<(BurstActivity, Uuid)>,
+) -> Response<RespBody> {
     let url = format!(
         "{}{}",
         base_url.trim_end_matches('/'),
@@ -1398,23 +1460,35 @@ async fn proxy_upstream(base_url: &str, path: &str, body: Bytes) -> Response<Res
         .unwrap_or("application/json")
         .to_string();
 
-    let byte_stream = upstream
+    let mapped = upstream
         .bytes_stream()
         .map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")));
+    let is_sse = content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
+    let annotate = note_peer_lost && is_sse && status.is_success();
+    let byte_stream: BoxStream<'static, Result<Bytes, std::io::Error>> =
+        if annotate || burst.is_some() {
+            Box::pin(PeerLostStream::new(mapped, annotate, burst))
+        } else {
+            Box::pin(mapped)
+        };
     let frame_stream = byte_stream.map_ok(Frame::data);
     let body = StreamBody::new(frame_stream).boxed_unsync();
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, content_type)
-        .header(hyper::header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .unwrap_or_else(|_| {
-            json_response(
-                StatusCode::BAD_GATEWAY,
-                &json!({"error": {"message": "failed to build proxy response", "type": "proxy_error"}}),
-            )
-        })
+        .header(hyper::header::CACHE_CONTROL, "no-cache");
+    if let Some(route) = route_header {
+        builder = builder.header("X-Nexus-Route", route);
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        json_response(
+            StatusCode::BAD_GATEWAY,
+            &json!({"error": {"message": "failed to build proxy response", "type": "proxy_error"}}),
+        )
+    })
 }
 
 async fn handle_models(ctx: Arc<GatewayContext>) -> Response<RespBody> {
@@ -1473,6 +1547,804 @@ async fn handle_models(ctx: Arc<GatewayContext>) -> Response<RespBody> {
     )
 }
 
+/// Escalate with no interactive winner stays local when a model is loaded, else HTTP 503.
+fn decision_after_rank(
+    decision: ApplianceDecision,
+    winner: Option<usize>,
+    local_loaded: bool,
+) -> Result<ApplianceDecision, StatusCode> {
+    match decision {
+        ApplianceDecision::Escalate { .. } if winner.is_none() => {
+            if local_loaded {
+                Ok(ApplianceDecision::Local {
+                    reason: RouteStay::NoInteractivePeer,
+                })
+            } else {
+                Err(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn no_interactive_peer_body(tag: &str) -> serde_json::Value {
+    json!({
+        "error": {
+            "message": format!("no interactive peer for tag {tag}"),
+            "type": "no_interactive_peer"
+        }
+    })
+}
+
+struct ChosenLoad {
+    filename: String,
+    digest: String,
+    context_size: usize,
+    predicted_tok_s: f32,
+    interactive: bool,
+    backend: String,
+    moe_cache_ceil_mb: Option<u64>,
+    tags: Vec<String>,
+}
+
+struct PantryRow {
+    filename: String,
+    digest: String,
+    tags: Vec<String>,
+    meta: GgufMetadata,
+}
+
+struct ApplianceSnap {
+    floor: f32,
+    battery_floor: u8,
+    battery_action: String,
+    max_ram: u8,
+    mmap: bool,
+    mlock: bool,
+    presets_dir: PathBuf,
+    models_dir: PathBuf,
+    control_port: u16,
+    label: String,
+    pairing: bool,
+    gpu_layers: u32,
+    threads: usize,
+    moe: crate::config::MoeConfig,
+}
+
+fn read_appliance_snap(ctx: &GatewayContext) -> Option<ApplianceSnap> {
+    let cfg = ctx.config.read().ok()?;
+    Some(ApplianceSnap {
+        floor: cfg.inference.appliance.floor_tok_s(),
+        battery_floor: cfg.hardware.safety.battery_floor_percent,
+        battery_action: cfg.hardware.safety.battery_action.clone(),
+        max_ram: cfg.hardware.safety.max_ram_usage_percent,
+        mmap: cfg.hardware.safety.mmap,
+        mlock: cfg.hardware.safety.mlock,
+        presets_dir: cfg.node.presets_dir.clone(),
+        models_dir: PathBuf::from(&cfg.node.models_dir),
+        control_port: cfg.network.control_port,
+        label: cfg.resolved_display_name(),
+        pairing: cfg.network.security.pairing_enforced(),
+        gpu_layers: cfg.hardware.acceleration.gpu_layers,
+        threads: cfg.hardware.acceleration.cpu_threads,
+        moe: cfg.inference.moe.clone(),
+    })
+}
+
+fn user_prompt(body: &serde_json::Value) -> String {
+    let Some(messages) = body.get("messages").and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    for message in messages.iter().rev() {
+        let role = message
+            .get("role")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if !role.eq_ignore_ascii_case("user") {
+            continue;
+        }
+        if let Some(text) = message.get("content").and_then(|value| value.as_str()) {
+            return text.to_string();
+        }
+        if let Some(parts) = message.get("content").and_then(|value| value.as_array()) {
+            let mut text = String::new();
+            for part in parts {
+                if let Some(piece) = part.as_str() {
+                    text.push_str(piece);
+                } else if let Some(piece) = part.get("text").and_then(|value| value.as_str()) {
+                    text.push_str(piece);
+                }
+            }
+            return text;
+        }
+    }
+    String::new()
+}
+
+fn route_targets(tags: &[String]) -> Vec<RouteTarget> {
+    tags.iter()
+        .map(|tag| RouteTarget::new(Uuid::nil(), "http://127.0.0.1", "local", vec![tag.clone()]))
+        .collect()
+}
+
+fn known_route_tags(presets_dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut push = |tag: &str| {
+        if !tag.is_empty()
+            && !tags
+                .iter()
+                .any(|have: &String| have.eq_ignore_ascii_case(tag))
+        {
+            tags.push(tag.to_string());
+        }
+    };
+    for preset in load_presets(presets_dir) {
+        for tag in &preset.tags {
+            push(tag);
+        }
+    }
+    for tag in extra {
+        push(tag);
+    }
+    for tag in ["general", "chat", "coder"] {
+        push(tag);
+    }
+    tags
+}
+
+fn tier1_tag(prompt: &str, presets_dir: &Path, local_tags: &[String]) -> Option<String> {
+    let mut router = Router::new();
+    router.load_presets_dir(presets_dir);
+    let mut tags = known_route_tags(presets_dir, local_tags);
+    if let Some((explicit, _)) = Router::extract_explicit_tag(prompt) {
+        if !tags.iter().any(|tag| tag.eq_ignore_ascii_case(explicit)) {
+            tags.push(explicit.to_string());
+        }
+    }
+    let routes = route_targets(&tags);
+    match router.route_deterministic(prompt, &routes) {
+        Some(RouteDecision::Direct { matched_tag, .. }) => Some(matched_tag),
+        _ => None,
+    }
+}
+
+async fn tier2_tag(prompt: &str, presets_dir: &Path, local_base: &str) -> Result<String, ()> {
+    let mut router = Router::new();
+    router.load_presets_dir(presets_dir);
+    let tags = known_route_tags(presets_dir, &[]);
+    let routes = route_targets(&tags);
+    let client = NexusClient::new(local_base);
+    match router.route_orchestrated(prompt, &routes, &client).await {
+        Ok(RouteDecision::Orchestrated { route, .. }) => Ok(route),
+        Ok(_) => Err(()),
+        Err(_) => Err(()),
+    }
+}
+
+async fn local_front_door_tags(ctx: &GatewayContext) -> (bool, Vec<String>, String) {
+    let slots = ctx.supervisor.slots_info().await;
+    if let Some(slot) = slots.into_iter().find(|slot| !slot.model_name.is_empty()) {
+        let presets = ctx
+            .config
+            .read()
+            .ok()
+            .map(|cfg| load_presets(&cfg.node.presets_dir))
+            .unwrap_or_default();
+        let tags = if slot.tags.is_empty() {
+            preset_tags_for_file(&slot.model_name, None, &presets)
+        } else {
+            slot.tags
+        };
+        return (true, front_door_tags(&tags), slot.model_name);
+    }
+    if let Some(name) = local_active_model(ctx).await {
+        let presets = ctx
+            .config
+            .read()
+            .ok()
+            .map(|cfg| load_presets(&cfg.node.presets_dir))
+            .unwrap_or_default();
+        let tags = preset_tags_for_file(&name, None, &presets);
+        return (true, front_door_tags(&tags), name);
+    }
+    (false, Vec::new(), "local".to_string())
+}
+
+fn tag_carried(tags: &[String], tag: &str) -> bool {
+    tags.iter().any(|have| have.eq_ignore_ascii_case(tag))
+}
+
+fn load_tagged_pantry(models_dir: &Path, presets_dir: &Path, tag: &str) -> Vec<PantryRow> {
+    let index = ModelIndex::reconcile_default(models_dir).unwrap_or_default();
+    let presets = load_presets(presets_dir);
+    let mut rows = Vec::new();
+    for entry in index.models {
+        let Ok(mut meta) = GgufMetadata::open(&entry.path) else {
+            continue;
+        };
+        if !meta.metadata.contains_key("filename") {
+            meta.metadata.insert(
+                "filename".to_string(),
+                GgufValue::String(entry.filename.clone()),
+            );
+        }
+        let tags = preset_tags_for_file(&entry.filename, entry.model_name.as_deref(), &presets);
+        if !tag_carried(&tags, tag) {
+            continue;
+        }
+        rows.push(PantryRow {
+            filename: entry.filename,
+            digest: entry.digest,
+            tags,
+            meta,
+        });
+    }
+    rows
+}
+
+fn predict_file(
+    meta: &GgufMetadata,
+    peer: &PeerNode,
+    context_size: usize,
+    bench: Option<&BenchStore>,
+) -> f32 {
+    let model_id = meta
+        .model_name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "model".to_string());
+    let measured = bench.and_then(|store| {
+        store
+            .lookup_gen_tok_s(
+                &model_id,
+                &peer.uuid.to_string(),
+                peer.backend,
+                context_size,
+            )
+            .or_else(|| store.lookup_gen_tok_s_any_node(&model_id, peer.backend, context_size))
+    });
+    cold_predict_tok_s(
+        peer.backend,
+        meta.weights_bytes(),
+        peer.thermal_index,
+        meta.quant_label.as_deref(),
+        measured,
+    )
+}
+
+fn plan_tagged_file(
+    row: &PantryRow,
+    peer: &PeerNode,
+    snap: &ApplianceSnap,
+    bench: Option<&BenchStore>,
+) -> Option<ChosenLoad> {
+    let profile = SystemProfile::from_advertised(
+        u64::from(peer.free_ram_mb),
+        u64::from(peer.total_ram_mb),
+        peer.backend,
+    );
+    let policy = MemoryPolicy {
+        max_ram_usage_percent: snap.max_ram,
+        mmap: snap.mmap,
+        mlock: snap.mlock,
+        kv_dtype: KvCacheDtype::F16,
+        context_size: 4096,
+        batch_size: 512,
+    };
+    if row.meta.streamable_moe() {
+        let key = moe_model_key(&row.meta);
+        let plan = plan_moe_spawn(
+            &row.meta,
+            &profile,
+            &snap.moe,
+            snap.max_ram,
+            policy.context_size,
+            bench,
+            &key,
+            &peer.uuid.to_string(),
+            MoeCacheCap::None,
+        )?;
+        return Some(ChosenLoad {
+            filename: row.filename.clone(),
+            digest: row.digest.clone(),
+            context_size: plan.context_size,
+            predicted_tok_s: plan.predicted_tok_s,
+            interactive: plan.predicted_tok_s >= snap.floor,
+            backend: "bmoe".to_string(),
+            moe_cache_ceil_mb: Some(plan.cache_mb),
+            tags: row.tags.clone(),
+        });
+    }
+    let choice = plan_fit_ladder(
+        std::slice::from_ref(&row.meta),
+        &profile,
+        &policy,
+        snap.floor,
+        |context_size, _, meta| predict_file(meta, peer, context_size, bench),
+    )?;
+    Some(ChosenLoad {
+        filename: row.filename.clone(),
+        digest: row.digest.clone(),
+        context_size: choice.context_size,
+        predicted_tok_s: choice.predicted_tok_s,
+        interactive: choice.interactive,
+        backend: "auto".to_string(),
+        moe_cache_ceil_mb: None,
+        tags: row.tags.clone(),
+    })
+}
+
+fn prefer_plan(candidate: ChosenLoad, best: &mut Option<ChosenLoad>) {
+    let replace = match best {
+        None => true,
+        Some(current) => match (candidate.interactive, current.interactive) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => candidate.predicted_tok_s > current.predicted_tok_s,
+        },
+    };
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
+fn route_text(reason: RouteStay, tag: &str) -> String {
+    match reason {
+        RouteStay::Fallback => "fallback".to_string(),
+        RouteStay::NoInteractivePeer => format!("{tag}; reason=no interactive peer"),
+        _ => {
+            if tag.is_empty() {
+                "general".to_string()
+            } else {
+                tag.to_string()
+            }
+        }
+    }
+}
+
+fn model_stem(filename: &str) -> String {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(filename)
+        .to_string()
+}
+
+fn body_with_model(body: &Bytes, model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
+}
+
+async fn handle_appliance_chat(ctx: Arc<GatewayContext>, body_bytes: Bytes) -> Response<RespBody> {
+    let value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": {"message": format!("invalid JSON: {err}"), "type": "invalid_request"}}),
+            );
+        }
+    };
+    let Some(snap) = read_appliance_snap(&ctx) else {
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": {"message": "config lock poisoned", "type": "internal"}}),
+        );
+    };
+    if !ctx.supervisor.is_running().await {
+        warn_front_door_once_from(&ctx);
+    }
+    let prompt = user_prompt(&value);
+    let (local_loaded, local_tags, local_model) = local_front_door_tags(&ctx).await;
+    let tier1 = tier1_tag(&prompt, &snap.presets_dir, &local_tags);
+    let tier2 = if tier1.is_none() && local_loaded {
+        Some(tier2_tag(&prompt, &snap.presets_dir, &ctx.local_upstream()).await)
+    } else {
+        None
+    };
+    let decision = match &tier2 {
+        None => decide_appliance(&local_tags, local_loaded, tier1.as_deref(), None),
+        Some(Ok(tag)) => decide_appliance(&local_tags, local_loaded, None, Some(Ok(tag.as_str()))),
+        Some(Err(())) => decide_appliance(&local_tags, local_loaded, None, Some(Err(()))),
+    };
+    let asked = tier1
+        .clone()
+        .or_else(|| match &tier2 {
+            Some(Ok(tag)) => Some(tag.clone()),
+            Some(Err(())) => Some("fallback".to_string()),
+            None => None,
+        })
+        .unwrap_or_else(|| "general".to_string());
+
+    match decision {
+        ApplianceDecision::Unavailable { tag } => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &no_interactive_peer_body(&tag),
+        ),
+        ApplianceDecision::Local { reason } => {
+            let header = format_route_header(
+                &snap.label,
+                "local",
+                &local_model,
+                &route_text(reason, &asked),
+            );
+            proxy_upstream(
+                &ctx.local_upstream(),
+                "/v1/chat/completions",
+                body_bytes,
+                Some(header),
+                true,
+                None,
+            )
+            .await
+        }
+        ApplianceDecision::Escalate { tag } => {
+            escalate_chat(ctx, body_bytes, &snap, &tag, local_loaded, &local_model).await
+        }
+    }
+}
+
+fn warn_front_door_once_from(ctx: &GatewayContext) {
+    if let Ok(cfg) = ctx.config.read() {
+        warn_front_door_once(&cfg);
+    }
+}
+
+async fn escalate_chat(
+    ctx: Arc<GatewayContext>,
+    body_bytes: Bytes,
+    snap: &ApplianceSnap,
+    tag: &str,
+    local_loaded: bool,
+    local_model: &str,
+) -> Response<RespBody> {
+    let require_trust = ctx
+        .config
+        .read()
+        .map(|cfg| pairing_enforced(&cfg.network.security))
+        .unwrap_or(false);
+    let peers = match &ctx.discovery {
+        Some(discovery) => discovery.get_active_peers().await,
+        None => Vec::new(),
+    };
+    let pantry = load_tagged_pantry(&snap.models_dir, &snap.presets_dir, tag);
+    let bench = BenchStore::load_default().ok();
+    let mut rows: Vec<(PeerNode, BurstScore, Option<ChosenLoad>)> = Vec::new();
+    for peer in peers {
+        if peer.uuid == ctx.node_id || !peer.status.is_ready() {
+            continue;
+        }
+        if require_trust {
+            if let Some(discovery) = &ctx.discovery {
+                if !discovery.is_peer_trusted_for_routing(peer.uuid).await {
+                    continue;
+                }
+            }
+        }
+        let mut best: Option<ChosenLoad> = None;
+        for row in &pantry {
+            if let Some(plan) = plan_tagged_file(row, &peer, snap, bench.as_ref()) {
+                prefer_plan(plan, &mut best);
+            }
+        }
+        let predicted = best.as_ref().map(|plan| plan.predicted_tok_s);
+        let interactive = best.as_ref().is_some_and(|plan| plan.interactive);
+        let score = score_burst_candidate(
+            peer.label(),
+            peer.link_class,
+            predicted,
+            interactive,
+            peer.thermal_index,
+            peer.battery_percent,
+            snap.battery_floor,
+            &snap.battery_action,
+        );
+        rows.push((peer, score, best));
+    }
+
+    let mut scores: Vec<BurstScore> = rows.iter().map(|(_, score, _)| score.clone()).collect();
+    let mut winner = select_burst_winner(&scores);
+    let mut attempts = 0;
+    let mut prepared: Option<(usize, String)> = None;
+    while let Some(index) = winner {
+        if attempts >= 2 {
+            break;
+        }
+        attempts += 1;
+        let loaded = if let Some(chosen) = rows[index].2.as_ref() {
+            ensure_peer_model(&ctx, &rows[index].0, chosen, snap).await
+        } else {
+            Err(())
+        };
+        match loaded {
+            Ok(api) => {
+                prepared = Some((index, api));
+                break;
+            }
+            Err(()) => {
+                warn!(
+                    "appliance escalation to {} failed for tag {tag}",
+                    rows[index].0.label()
+                );
+                scores[index].eligible = false;
+                if attempts >= 2 {
+                    break;
+                }
+                winner = select_burst_winner(&scores);
+            }
+        }
+    }
+
+    if let Some((index, api)) = prepared {
+        ctx.burst_activity.touch(rows[index].0.uuid);
+        let peer = &rows[index].0;
+        let model = rows[index]
+            .2
+            .as_ref()
+            .map(|chosen| chosen.filename.clone())
+            .unwrap_or_else(|| local_model.to_string());
+        let header = format_route_header(
+            &peer.label(),
+            link_header_token(peer.link_class),
+            &model,
+            tag,
+        );
+        let body = body_with_model(&body_bytes, &model_stem(&model));
+        let burst = Some((ctx.burst_activity.clone(), rows[index].0.uuid));
+        return proxy_upstream(
+            &api,
+            "/v1/chat/completions",
+            body,
+            Some(header),
+            true,
+            burst,
+        )
+        .await;
+    }
+
+    match decision_after_rank(
+        ApplianceDecision::Escalate {
+            tag: tag.to_string(),
+        },
+        None,
+        local_loaded,
+    ) {
+        Err(status) => json_response(status, &no_interactive_peer_body(tag)),
+        Ok(ApplianceDecision::Local { reason }) => {
+            let header =
+                format_route_header(&snap.label, "local", local_model, &route_text(reason, tag));
+            proxy_upstream(
+                &ctx.local_upstream(),
+                "/v1/chat/completions",
+                body_bytes,
+                Some(header),
+                true,
+                None,
+            )
+            .await
+        }
+        Ok(_) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &no_interactive_peer_body(tag),
+        ),
+    }
+}
+
+async fn ensure_peer_model(
+    ctx: &GatewayContext,
+    peer: &PeerNode,
+    chosen: &ChosenLoad,
+    snap: &ApplianceSnap,
+) -> Result<String, ()> {
+    if model_matches(&chosen.filename, &peer.active_model)
+        || model_matches(&model_stem(&chosen.filename), &peer.active_model)
+    {
+        return Ok(peer.api_endpoint());
+    }
+    let client = reqwest::Client::new();
+    let control = peer.control_endpoint();
+    let catalog = fetch_models(&client, &control).await.ok();
+    let present = catalog.as_ref().is_some_and(|catalog| {
+        catalog.models.iter().any(|entry| {
+            (!chosen.digest.is_empty() && entry.digest.eq_ignore_ascii_case(&chosen.digest))
+                || model_matches(&chosen.filename, &entry.filename)
+        })
+    });
+    if !present {
+        if chosen.digest.is_empty() {
+            return Err(());
+        }
+        let source_base = format!("http://127.0.0.1:{}", snap.control_port);
+        let _source = blob_url(&source_base, &chosen.digest).map_err(|_| ())?;
+        let request = BlobFetchRequest {
+            protocol_version: CONTROL_PLANE_VERSION,
+            requester_id: ctx.node_id,
+            digest: chosen.digest.clone(),
+            source_base_url: source_base,
+        };
+        let identity = if snap.pairing {
+            ctx.identity.as_deref()
+        } else {
+            None
+        };
+        let response = request_blob_fetch(&client, &control, &request, identity)
+            .await
+            .map_err(|_| ())?;
+        if !response.accepted {
+            return Err(());
+        }
+    }
+    let request = ModelLoadRequest {
+        protocol_version: CONTROL_PLANE_VERSION,
+        requester_id: ctx.node_id,
+        model_path: chosen.filename.clone(),
+        context_size: chosen.context_size,
+        gpu_layers: if peer.backend == AccelerationBackend::Vulkan {
+            snap.gpu_layers
+        } else {
+            0
+        },
+        threads: snap.threads.max(1),
+        rpc_workers: Vec::new(),
+        tags: chosen.tags.clone(),
+        target_port: None,
+        backend: chosen.backend.clone(),
+        moe_cache_ceil_mb: chosen.moe_cache_ceil_mb,
+    };
+    let loaded = if snap.pairing {
+        let identity = ctx.identity.as_ref().ok_or(())?;
+        dispatch_load_model_signed(&client, &control, &request, identity).await
+    } else {
+        dispatch_load_model(&client, &control, &request).await
+    }
+    .map_err(|_| ())?;
+    if !loaded.success {
+        return Err(());
+    }
+    if !loaded.api_endpoint.is_empty() && !loaded.api_endpoint.contains("0.0.0.0") {
+        Ok(loaded.api_endpoint)
+    } else {
+        Ok(peer.api_endpoint())
+    }
+}
+
+/// Unload burst peers that have been idle. The local front door is never in the map.
+pub async fn unload_idle_burst_peers(ctx: &GatewayContext) {
+    let Some(snap) = ctx.config.read().ok() else {
+        return;
+    };
+    if !snap.inference.appliance.enabled {
+        return;
+    }
+    let idle_secs = snap.inference.appliance.burst_idle_secs;
+    let pairing = snap.network.security.pairing_enforced();
+    drop(snap);
+    let expired = ctx.burst_activity.take_idle(idle_secs, ctx.node_id);
+    if expired.is_empty() {
+        return;
+    }
+    let Some(discovery) = &ctx.discovery else {
+        return;
+    };
+    let peers = discovery.get_active_peers().await;
+    let client = reqwest::Client::new();
+    for id in expired {
+        if id == ctx.node_id {
+            continue;
+        }
+        let Some(peer) = peers.iter().find(|peer| peer.uuid == id) else {
+            continue;
+        };
+        let request = ModelUnloadRequest {
+            protocol_version: CONTROL_PLANE_VERSION,
+            requester_id: ctx.node_id,
+            model_path: None,
+        };
+        let result = if pairing {
+            match ctx.identity.as_ref() {
+                Some(identity) => {
+                    dispatch_unload_model_signed(
+                        &client,
+                        &peer.control_endpoint(),
+                        &request,
+                        identity,
+                    )
+                    .await
+                }
+                None => dispatch_unload_model(&client, &peer.control_endpoint(), &request).await,
+            }
+        } else {
+            dispatch_unload_model(&client, &peer.control_endpoint(), &request).await
+        };
+        if let Err(err) = result {
+            warn!("burst idle unload for {} failed: {err}", peer.label());
+        }
+    }
+}
+
+/// Forwards upstream bytes. A successful SSE body that ends without `[DONE]`
+/// gains one status-role `peer lost` event. The prompt is not sent again.
+/// Burst activity is refreshed on each chunk and when the stream is dropped
+/// so a long reply is not treated as idle.
+struct PeerLostStream<S> {
+    inner: S,
+    carry: String,
+    saw_done: bool,
+    exhausted: bool,
+    annotate: bool,
+    burst: Option<(BurstActivity, Uuid)>,
+}
+
+impl<S> PeerLostStream<S> {
+    fn new(inner: S, annotate: bool, burst: Option<(BurstActivity, Uuid)>) -> Self {
+        Self {
+            inner,
+            carry: String::new(),
+            saw_done: false,
+            exhausted: false,
+            annotate,
+            burst,
+        }
+    }
+
+    fn touch(&self) {
+        if let Some((activity, id)) = &self.burst {
+            activity.touch(*id);
+        }
+    }
+}
+
+impl<S> Drop for PeerLostStream<S> {
+    fn drop(&mut self) {
+        self.touch();
+    }
+}
+
+impl<S> Stream for PeerLostStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.exhausted {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.touch();
+                if this.annotate && !this.saw_done && observe_stream_done(&mut this.carry, &bytes) {
+                    this.saw_done = true;
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                this.exhausted = true;
+                this.touch();
+                if !this.annotate || this.saw_done {
+                    Poll::Ready(None)
+                } else {
+                    this.saw_done = true;
+                    Poll::Ready(Some(Ok(Bytes::from(peer_lost_sse()))))
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 fn full_body(bytes: Bytes) -> RespBody {
     Full::new(bytes)
         .map_err(|never| match never {})
@@ -1500,5 +2372,26 @@ mod unit_tests {
         assert!(model_matches("phi.gguf", "/models/phi.gguf"));
         assert!(!model_matches("phi", "llama.gguf"));
         assert!(!model_matches("", "phi.gguf"));
+    }
+
+    #[test]
+    fn no_interactive_peer_stays_or_503() {
+        let tags = crate::appliance::front_door_tags(&[]);
+        let go = crate::appliance::decide_appliance(&tags, true, Some("coder"), None);
+        let stayed = decision_after_rank(go.clone(), None, true).expect("loaded model stays");
+        match stayed {
+            ApplianceDecision::Local { reason } => {
+                assert_eq!(reason.as_reason(), "no interactive peer");
+            }
+            other => panic!("expected local stay, got {other:?}"),
+        }
+        let status = decision_after_rank(go, None, false).expect_err("missing model is 503");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body = no_interactive_peer_body("coder");
+        assert_eq!(body["error"]["type"], "no_interactive_peer");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("coder"));
     }
 }

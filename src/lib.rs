@@ -1,4 +1,5 @@
 pub mod adb_links;
+pub mod appliance;
 pub mod bench;
 pub mod bmoe_client;
 pub mod client;

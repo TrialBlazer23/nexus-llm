@@ -3,12 +3,13 @@
 pub mod commands;
 pub mod keymap;
 
+use crate::appliance::warn_front_door_once;
 use crate::client::NexusClient;
 use crate::config::NexusConfig;
 use crate::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
 use crate::control_plane_server::{spawn as spawn_control_plane, ControlPlaneContext};
 use crate::discovery::{DiscoveryService, NodeRole};
-use crate::gateway::{spawn as spawn_gateway, GatewayContext};
+use crate::gateway::{spawn as spawn_gateway, unload_idle_burst_peers, GatewayContext};
 use crate::node_identity::NodeIdentity;
 use crate::registry_runtime::spawn_registry_runtime;
 use crate::supervisor::SupervisorManager;
@@ -2140,7 +2141,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         hub.config.network.control_port
     );
 
-    let gateway_handle = if hub.config.network.gateway_enabled {
+    let (gateway_handle, gateway_idle) = if hub.config.network.gateway_enabled {
         let gateway_addr = SocketAddr::from(([0, 0, 0, 0], hub.config.network.gateway_port));
         let gateway_ctx = Arc::new(
             GatewayContext::new(
@@ -2153,15 +2154,19 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
             .with_discovery(hub.discovery.clone())
             .with_identity(hub.identity.clone()),
         );
+        let idle = gateway_ctx.clone();
         let handle = spawn_gateway(gateway_addr, gateway_ctx);
         info!(
             "Hub mesh gateway listening on port {}",
             hub.config.network.gateway_port
         );
-        Some(handle)
+        (Some(handle), Some(idle))
     } else {
-        None
+        (None, None)
     };
+    if hub.config.inference.appliance.enabled {
+        warn_front_door_once(&hub.config);
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<HubCommand>(32);
     let (evt_tx, mut evt_rx) = mpsc::channel::<HubEvent>(64);
@@ -3604,6 +3609,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                 }
             }
             _ = refresh_interval.tick() => {
+                if let Some(ctx) = &gateway_idle {
+                    unload_idle_burst_peers(ctx).await;
+                }
                 let modal_open = hub.pending_download_modal.is_some()
                     || hub.pending_import_modal.is_some()
                     || hub.pending_delete_model.is_some()

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use nexus::appliance::hub_client_base_url;
 use nexus::bmoe_client::{should_use_bmoe, BmoeSessionConfig};
 use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
 use nexus::cluster::{plan_moe_spawn, MoeCacheCap};
@@ -306,10 +307,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _mdns = discovery.clone().start_mdns();
             discovery.send_probe().await;
 
-            // Order: default_host → PreferAdbTunnel USB → local mesh gateway
-            // (gateway resolves model→holder) → discovery → localhost api_port.
+            // Order: default_host pin, else local gateway when the appliance and
+            // gateway are both on. USB is a link, not the hub client URL, in that
+            // case. Otherwise keep discovery / USB / localhost.
             // Clone host-resolution inputs under the lock, then await without holding it.
-            let (default_host, prefer_adb, api_port, rpc_port, gateway_enabled, gateway_port) = {
+            let (
+                default_host,
+                prefer_adb,
+                api_port,
+                rpc_port,
+                gateway_enabled,
+                gateway_port,
+                appliance_enabled,
+            ) = {
                 let cfg = trust.config.read().unwrap();
                 (
                     cfg.network.default_host.clone(),
@@ -318,10 +328,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cfg.cluster.rpc_port,
                     cfg.network.gateway_enabled,
                     cfg.network.gateway_port,
+                    cfg.inference.appliance.enabled,
                 )
             };
-            let host = if let Some(dh) = default_host {
-                dh
+            let host = if let Some(pinned) = hub_client_base_url(
+                default_host.as_deref(),
+                appliance_enabled,
+                gateway_enabled,
+                gateway_port,
+            ) {
+                pinned
             } else {
                 let usb_ep = if prefer_adb {
                     AdbTunnelSupervisor::resolve_transport_endpoint(

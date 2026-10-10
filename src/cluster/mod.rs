@@ -6,7 +6,9 @@ mod rank;
 mod split;
 
 pub use memory::{estimate_compute_buffer_mb, MemoryPlan, MemoryPolicy, Remediation, Verdict};
-pub use moe_knobs::{plan_moe_stream_knobs, MoeStreamKnobPlan, MOE_COLD_START_TOK_S};
+pub use moe_knobs::{
+    plan_moe_stream_knobs, predict_moe_stream_tok_s, MoeStreamKnobPlan, MOE_COLD_START_TOK_S,
+};
 pub use rank::{
     classify_fit, link_quality_from_timings, rank_execution_plans, ExecutionPlan, LinkQuality,
     PlacementCandidate, PlacementRequest, PlanTarget,

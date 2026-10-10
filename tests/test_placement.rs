@@ -194,10 +194,19 @@ fn ranks_local_moe_stream_for_oversize_moe() {
     {
         assert!(moe_idx < dist_idx);
     }
-    // Cold start uses the 2.2 tok/s heuristic when no MoE bench sample exists.
+    // Cold-start uses active-params + flash I/O heuristic (A3B warm ≈ 2.2).
+    let expected = nexus::cluster::predict_moe_stream_tok_s(
+        &gguf,
+        match &plans[moe_idx].target {
+            PlanTarget::LocalMoeStream { cache_mb, .. } => *cache_mb,
+            _ => 0,
+        },
+        AccelerationBackend::ArmCpuDotProd,
+        None,
+    );
     assert!(
-        (plans[moe_idx].predicted_tok_s - 2.2).abs() < 0.01,
-        "expected cold-start 2.2, got {}",
+        (plans[moe_idx].predicted_tok_s - expected).abs() < 0.01,
+        "expected heuristic {expected}, got {}",
         plans[moe_idx].predicted_tok_s
     );
 }

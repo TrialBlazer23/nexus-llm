@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Active-params + flash I/O MoE cold-start scoring
+- Category: design-decision
+- Context: Phase 16.5 step 4 — cold-start MoE tok/s was a flat 2.2 for every (ctx, ceil), so joint knobs could not prefer warmer expert caches on throughput grounds, and denser top-k MoEs ranked identically to A3B.
+- Finding: GGUF already exposes `expert_count` / `expert_used_count` and expert tensor bytes. Measured `BACKEND_MOE_STREAM` samples must stay authoritative (not rescaled). Soft sqrt demotion on active fraction plus cache-vs-working-set I/O penalty (`0.55 + 0.45*hit`) matches soak (~2.2 A3B warm) while making ceil tok/s-sensitive.
+- Action: Add `predict_moe_stream_tok_s` in `cluster/moe_knobs.rs`; wire into `plan_moe_stream_knobs` cold-start path; keep `MOE_COLD_START_TOK_S = 2.2` as A3B reference.
+- Verification: Unit tests for measured override, A3B warm ≈2.2, higher top-k demotion, cold < warm, knob planner prefers warm ceil; `cargo test --locked` + clippy `-D warnings`.
+
 ## 2026-10-10 — RemoteMoeStream mesh placement (Phase 16.5 step 3)
 - Category: design-decision
 - Context: Peers advertise `moe_stream` but ranking only offered dense `PlanTarget::Remote`, which mmap-fit checks could mark as Fits for oversize MoE files; Hub remote load always sent `backend=auto` without planned ctx/ceil.

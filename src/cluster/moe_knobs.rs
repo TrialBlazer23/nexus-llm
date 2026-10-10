@@ -2,12 +2,16 @@
 
 use crate::bench::{BenchStore, BACKEND_MOE_STREAM};
 use crate::gguf::GgufMetadata;
-use crate::sysinfo::SystemProfile;
+use crate::sysinfo::{AccelerationBackend, SystemProfile};
 
 use super::{clamp_context_size, CONTEXT_STEP};
 
-/// Cold-start MoE flash-stream throughput when no bench sample exists.
+/// Reference MoE flash-stream throughput for A3B-class models (8/128 experts)
+/// with a warm expert cache on ArmDotProd (Phase 16 soak).
 pub const MOE_COLD_START_TOK_S: f32 = 2.2;
+
+/// Reference active-expert fraction for [`MOE_COLD_START_TOK_S`] (Qwen*30B-A3B).
+const REF_ACTIVE_FRAC: f32 = 8.0 / 128.0;
 
 /// One feasible (ctx, cache) point under stream LMK.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,10 +25,55 @@ pub struct MoeStreamKnobPlan {
     pub predicted_tok_s: f32,
 }
 
+/// Predict MoE flash-stream tok/s from measured bench or active-params + flash I/O.
+///
+/// Measured samples are returned unchanged. Cold-start uses `expert_used_count /
+/// expert_count`, a cache-vs-working-set I/O penalty, and a small backend nudge.
+pub fn predict_moe_stream_tok_s(
+    gguf: &GgufMetadata,
+    cache_mb: u64,
+    backend: AccelerationBackend,
+    measured: Option<f32>,
+) -> f32 {
+    if let Some(m) = measured.filter(|v| *v > 0.0) {
+        return m;
+    }
+
+    let used = gguf.expert_used_count.unwrap_or(8) as f32;
+    let total = gguf.expert_count.unwrap_or(128).max(1) as f32;
+    let active_frac = (used / total).clamp(1.0 / 256.0, 1.0);
+
+    let compute = MOE_COLD_START_TOK_S * (REF_ACTIVE_FRAC / active_frac).sqrt();
+
+    let expert_mb = {
+        let bytes = gguf.expert_weight_bytes();
+        if bytes > 0 {
+            bytes / (1024 * 1024)
+        } else {
+            gguf.file_size_bytes.saturating_mul(65) / 100 / (1024 * 1024)
+        }
+    } as f32;
+    let working_set_mb = (expert_mb * active_frac * 4.0).max(500.0);
+    let hit = if cache_mb == 0 {
+        0.0
+    } else {
+        ((cache_mb as f32) / working_set_mb).min(1.0)
+    };
+    let io_pen = 0.55 + 0.45 * hit;
+
+    let backend_nudge = match backend {
+        AccelerationBackend::ArmCpuDotProd | AccelerationBackend::Vulkan => 1.0,
+        AccelerationBackend::X86Baseline => 0.85,
+        AccelerationBackend::GenericCpu => 0.9,
+    };
+
+    (compute * io_pen * backend_nudge).clamp(0.3, 8.0)
+}
+
 /// Search a small grid of `(context_size, cache_ceil)` pairs and pick the best
 /// feasible plan under stream LMK.
 ///
-/// Scoring: higher measured/fallback tok/s, then higher context, then higher ceil.
+/// Scoring: higher measured/heuristic tok/s, then higher context, then higher ceil.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_moe_stream_knobs(
     gguf: &GgufMetadata,
@@ -55,8 +104,8 @@ pub fn plan_moe_stream_knobs(
             }
             let footprint = gguf.moe_stream_footprint_bytes(ctx, cache_mb);
             let footprint_mb = footprint / (1024 * 1024);
-            let tok =
-                measured_moe_tok_s(bench, model_key, node_id, ctx).unwrap_or(MOE_COLD_START_TOK_S);
+            let measured = measured_moe_tok_s(bench, model_key, node_id, ctx);
+            let tok = predict_moe_stream_tok_s(gguf, cache_mb, profile.detected_backend, measured);
             let candidate = MoeStreamKnobPlan {
                 context_size: ctx,
                 cache_ceil_mb: ceil,
@@ -232,7 +281,14 @@ mod tests {
         assert_eq!(plan.context_size, 4096);
         assert_eq!(plan.cache_ceil_mb, 3500);
         assert_eq!(plan.cache_mb, 3500);
-        assert!((plan.predicted_tok_s - MOE_COLD_START_TOK_S).abs() < 0.01);
+        let expected =
+            predict_moe_stream_tok_s(&gguf, 3500, AccelerationBackend::ArmCpuDotProd, None);
+        assert!(
+            (plan.predicted_tok_s - expected).abs() < 0.01,
+            "got {} expected {}",
+            plan.predicted_tok_s,
+            expected
+        );
         assert!(!matches!(plan.cache_ceil_mb, 1..=1999));
     }
 
@@ -300,7 +356,7 @@ mod tests {
         assert_eq!(at_2048.context_size, 2048);
         assert!((at_2048.predicted_tok_s - 3.5).abs() < 0.01);
 
-        // Measured 3.5 @ 2048 beats cold-start 2.2 @ 4096 under tok/s-first scoring.
+        // Measured 3.5 @ 2048 beats heuristic @ 4096 under tok/s-first scoring.
         let prefers_measured = plan_moe_stream_knobs(
             &gguf,
             &profile,
@@ -315,7 +371,7 @@ mod tests {
         assert_eq!(prefers_measured.context_size, 2048);
         assert!((prefers_measured.predicted_tok_s - 3.5).abs() < 0.01);
 
-        // Without a bench hit at the only remaining ctx, cold-start applies.
+        // Without a bench hit for this model, active-params heuristic applies.
         let mut store_4096_only = BenchStore {
             version: 1,
             entries: vec![],
@@ -345,6 +401,81 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(cold.context_size, 4096);
-        assert!((cold.predicted_tok_s - MOE_COLD_START_TOK_S).abs() < 0.01);
+        let expected = predict_moe_stream_tok_s(
+            &gguf,
+            cold.cache_mb,
+            AccelerationBackend::ArmCpuDotProd,
+            None,
+        );
+        assert!((cold.predicted_tok_s - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn measured_overrides_active_params_heuristic() {
+        let gguf = streamable_moe_gguf(12, 800);
+        let predicted =
+            predict_moe_stream_tok_s(&gguf, 0, AccelerationBackend::X86Baseline, Some(3.5));
+        assert!((predicted - 3.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn a3b_warm_cache_near_reference_tok_s() {
+        let gguf = streamable_moe_gguf(12, 800);
+        // working_set ≈ max(500, 12288 * 0.0625 * 4) = max(500, 3072) = 3072
+        let predicted =
+            predict_moe_stream_tok_s(&gguf, 3500, AccelerationBackend::ArmCpuDotProd, None);
+        assert!(
+            (predicted - MOE_COLD_START_TOK_S).abs() < 0.2,
+            "A3B warm cache should be near {MOE_COLD_START_TOK_S}, got {predicted}"
+        );
+    }
+
+    #[test]
+    fn higher_topk_demotes_tok_s() {
+        let mut a3b = streamable_moe_gguf(12, 800);
+        a3b.expert_used_count = Some(8);
+        let mut a8b = streamable_moe_gguf(12, 800);
+        a8b.expert_used_count = Some(16);
+        let a3b_tok =
+            predict_moe_stream_tok_s(&a3b, 3500, AccelerationBackend::ArmCpuDotProd, None);
+        let a8b_tok =
+            predict_moe_stream_tok_s(&a8b, 3500, AccelerationBackend::ArmCpuDotProd, None);
+        assert!(
+            a8b_tok < a3b_tok,
+            "higher top-k should demote: a8b={a8b_tok} a3b={a3b_tok}"
+        );
+    }
+
+    #[test]
+    fn cold_cache_slower_than_warm() {
+        let gguf = streamable_moe_gguf(12, 800);
+        let cold = predict_moe_stream_tok_s(&gguf, 0, AccelerationBackend::ArmCpuDotProd, None);
+        let warm = predict_moe_stream_tok_s(&gguf, 3500, AccelerationBackend::ArmCpuDotProd, None);
+        assert!(cold < warm, "cold={cold} should be < warm={warm}");
+    }
+
+    #[test]
+    fn knob_planner_prefers_warmer_ceil_on_tok_s() {
+        let gguf = streamable_moe_gguf(12, 800);
+        let profile = SystemProfile {
+            total_ram_mb: 16_000,
+            available_ram_mb: 14_000,
+            detected_backend: AccelerationBackend::ArmCpuDotProd,
+            recommended_threads: 4,
+        };
+        let plan = plan_moe_stream_knobs(&gguf, &profile, 75, 4096, 3500, None, "big-moe", "local")
+            .expect("plan");
+        assert!(
+            plan.cache_ceil_mb >= 2000,
+            "expected warm ceil winner, got {}",
+            plan.cache_ceil_mb
+        );
+        let cold_tok = predict_moe_stream_tok_s(&gguf, 0, AccelerationBackend::ArmCpuDotProd, None);
+        assert!(
+            plan.predicted_tok_s > cold_tok,
+            "winner tok/s {} should beat cold {}",
+            plan.predicted_tok_s,
+            cold_tok
+        );
     }
 }

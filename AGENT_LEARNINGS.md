@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Joint MoE (ctx, cache_ceil) planner wires into spawn
+- Category: design-decision
+- Context: Phase 16.5 step 2 — pick feasible stream LMK knobs and apply them at bmoe-cli spawn.
+- Finding: Ranking advertised a single ceil at fixed policy ctx; Hub hardcoded placement ctx=4096; load ignored `LocalMoeStream.ceil_mb` and re-derived via `from_profile`. `--cache-mb auto` could disagree with the LMK ceil commitment.
+- Action: Add `cluster::moe_knobs::plan_moe_stream_knobs` (grid + tok/s-then-ctx-then-ceil scoring); rank emits winner ctx/ceil; Hub passes `selected_context` and threads `moe_cache_ceil_mb` through `LoadModelLocal`/`HotSwapIntent`; `BmoeSessionConfig::from_profile_with_ceil` forces integer `--cache-mb` when ceil≥2000; CLI `nexus host` plans before spawn.
+- Verification: `cargo test --locked` green (moe_knobs unit tests + placement); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
 ## 2026-10-10 — MoE bench feedback closes LocalMoeStream ranking loop
 - Category: design-decision
 - Context: Implementing Phase 16.5 step 1 — feed BigMoe `BMOE_DONE` metrics into placement ranking.

@@ -8,6 +8,7 @@ use nexus::control_plane::{
 use nexus::control_plane_server::{spawn_ephemeral, ControlPlaneContext};
 use nexus::discovery::NodeRole;
 use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
+use nexus::sysinfo::{AccelerationBackend, SystemProfile};
 use nexus::trust_auth::TrustBootstrap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +45,12 @@ async fn control_plane_state_advertises_loaded_models() {
         true,
         Some("test_pubkey".into()),
         "192.168.1.100",
+        &SystemProfile {
+            total_ram_mb: 4_096,
+            available_ram_mb: 2_048,
+            detected_backend: AccelerationBackend::GenericCpu,
+            recommended_threads: 2,
+        },
     )
     .await;
 

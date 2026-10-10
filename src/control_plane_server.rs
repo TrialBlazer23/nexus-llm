@@ -621,6 +621,7 @@ async fn handle_state(
         ctx.rpc_ready,
         Some(ctx.identity.public_key_hex()),
         &ctx.api_host,
+        &profile,
     )
     .await;
     state.display_name = ctx.read_config().resolved_display_name();

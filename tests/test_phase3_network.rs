@@ -111,6 +111,9 @@ fn control_plane_validates_identity_protocol_and_policy() {
         battery_percent: None,
         power_source: nexus::sysinfo::PowerSource::Unknown,
         display_name: String::new(),
+        available_ram_mb: None,
+        total_ram_mb: None,
+        backend: None,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 

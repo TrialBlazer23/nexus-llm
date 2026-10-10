@@ -1,6 +1,6 @@
 use crate::discovery::{NodeRole, ServiceEndpoint};
 use crate::node_identity::NodeIdentity;
-use crate::sysinfo::{probe_power, PowerSource};
+use crate::sysinfo::{probe_power, PowerSource, SystemProfile};
 use crate::trust_auth::{apply_auth_headers, AuthError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,15 @@ pub struct ControlPlaneState {
     /// Operator name. Older peers omit it; missing JSON is empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub display_name: String,
+    /// Raw MemAvailable in MB. Same unit as beacon `free_ram_mb`. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_ram_mb: Option<u64>,
+    /// Raw MemTotal in MB. Same unit as beacon `total_ram_mb`. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_ram_mb: Option<u64>,
+    /// Bench backend key: `vulkan`, `arm-dotprod`, `x86-sse41`, or `cpu`. Older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,6 +159,7 @@ pub async fn build_control_plane_state(
     rpc_ready: bool,
     signing_public_key: Option<String>,
 ) -> ControlPlaneState {
+    let profile = SystemProfile::probe();
     build_control_plane_state_with_host(
         node_id,
         role,
@@ -159,6 +169,7 @@ pub async fn build_control_plane_state(
         rpc_ready,
         signing_public_key,
         "127.0.0.1",
+        &profile,
     )
     .await
 }
@@ -174,6 +185,7 @@ pub async fn build_control_plane_state_with_host(
     rpc_ready: bool,
     signing_public_key: Option<String>,
     api_host: &str,
+    profile: &SystemProfile,
 ) -> ControlPlaneState {
     let healthy = manager.is_healthy().await;
     let active_model = manager.active_model().await;
@@ -205,6 +217,9 @@ pub async fn build_control_plane_state_with_host(
         battery_percent: power.battery_percent,
         power_source: power.power_source,
         display_name: String::new(),
+        available_ram_mb: Some(profile.available_ram_mb),
+        total_ram_mb: Some(profile.total_ram_mb),
+        backend: Some(crate::bench::backend_key(profile.detected_backend).to_string()),
     }
 }
 
@@ -1609,5 +1624,48 @@ mod tests {
         let state: ControlPlaneState = serde_json::from_str(raw).expect("old peers still parse");
         assert_eq!(state.battery_percent, None);
         assert_eq!(state.power_source, crate::sysinfo::PowerSource::Unknown);
+        assert_eq!(state.available_ram_mb, None);
+        assert_eq!(state.total_ram_mb, None);
+        assert_eq!(state.backend, None);
+    }
+
+    #[tokio::test]
+    async fn build_state_advertises_probed_ram_and_backend() {
+        use crate::control_plane::build_control_plane_state_with_host;
+        use crate::discovery::NodeRole;
+        use crate::supervisor::SupervisorManager;
+        use crate::sysinfo::{AccelerationBackend, SystemProfile};
+        use uuid::Uuid;
+
+        let profile = SystemProfile {
+            total_ram_mb: 16_000,
+            available_ram_mb: 12_000,
+            detected_backend: AccelerationBackend::Vulkan,
+            recommended_threads: 4,
+        };
+        let state = build_control_plane_state_with_host(
+            Uuid::from_u128(1),
+            NodeRole::HOST,
+            vec!["inference".into()],
+            &SupervisorManager::new(),
+            9_000,
+            false,
+            None,
+            "127.0.0.1",
+            &profile,
+        )
+        .await;
+
+        assert_eq!(state.allocatable_memory_mb, 9_000);
+        assert_eq!(state.available_ram_mb, Some(12_000));
+        assert_eq!(state.total_ram_mb, Some(16_000));
+        assert_eq!(state.backend.as_deref(), Some("vulkan"));
+
+        let raw = serde_json::to_string(&state).expect("serialize");
+        let parsed: crate::control_plane::ControlPlaneState =
+            serde_json::from_str(&raw).expect("round trip");
+        assert_eq!(parsed.available_ram_mb, Some(12_000));
+        assert_eq!(parsed.total_ram_mb, Some(16_000));
+        assert_eq!(parsed.backend.as_deref(), Some("vulkan"));
     }
 }

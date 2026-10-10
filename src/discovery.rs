@@ -2139,6 +2139,9 @@ mod tests {
             battery_percent: Some(15),
             power_source: PowerSource::Ac,
             display_name: String::new(),
+            available_ram_mb: None,
+            total_ram_mb: None,
+            backend: None,
         };
         discovery
             .apply_verified_state(&state, &endpoint)
@@ -2267,6 +2270,9 @@ mod tests {
             battery_percent: Some(40),
             power_source: PowerSource::Battery,
             display_name: name.into(),
+            available_ram_mb: None,
+            total_ram_mb: None,
+            backend: None,
         }
     }
 

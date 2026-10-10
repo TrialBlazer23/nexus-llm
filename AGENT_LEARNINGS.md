@@ -25,6 +25,18 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Adaptive MoE loading roadmap after 30B-A3B soak
+- Category: research | design-decision
+- Context: Qwen*30B-A3B-class MoE verified on-device via BigMoe flash streaming at >2 tok/s (Phase 16 soak ~2.35 tok/s on S23; operator follow-up with Qwen2.5-30B-A3B). Question: how to make backend model handling more adaptive/smart for larger MoEs.
+- Finding: The hard path (stream LMK, `should_prefer_moe_stream`, `PlanTarget::LocalMoeStream`, no RPC+stream) already works. Remaining adaptivity gaps are closed-loop, not architecture:
+  1. Placement still hardcodes `predicted_tok_s = 2.2` for MoE stream; `BMOE_DONE.tok_s` / `cache_hit_pct` are not fed into `BenchStore`.
+  2. Expert cache ceil is a static ~45% of LMK budget; no joint optimization of `(context_size, cache_ceil)` under `resident + cache + KV`.
+  3. Peers advertise `moe_stream` but ranking never emits remote MoE-stream plans — oversize MoEs may still prefer dense RPC incorrectly.
+  4. Throughput heuristics ignore `expert_used_count` (A3B ≈ 3B active params + flash I/O), so ranking treats MoE like dense 30B.
+  5. Phase D (networked route-ahead, distributed expert affinity, Vulkan experts) remains correctly gated — local flash already wins at verified rates.
+- Action: Prefer a “Phase 16.5 adaptive MoE” track before Phase D: (a) MoE-aware bench feedback into `rank_execution_plans`, (b) joint ctx/cache Pareto under stream LMK, (c) `RemoteMoeStream` for `moe_stream` peers, (d) active-params + flash-I/O ranking, (e) hit%-driven cache governor with lossy only when chronically cold. Keep no-RPC+stream and external `bmoe-cli` constraints.
+- Verification: Research-only; no code change in this entry. SenseLab key `nexus-llm/moe/decision-adaptive-moe-roadmap-post-30b-a3b`.
+
 ## 2026-10-09 — Security Audit Hardening: Non-Poisoning Locks, Preset Routing, Doctor Probes, and Fuzzing
 - Category: design-decision | bug
 - Context: Addressing external technical audit feedback across security defaults, sync locks in async hyper handlers, dependency drift, pairing rate limiting, and parser attack surfaces.

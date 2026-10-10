@@ -54,6 +54,34 @@ impl SystemProfile {
         }
     }
 
+    /// Synthetic profile from mesh discovery (peer free/total RAM + advertised backend).
+    ///
+    /// Used only for client-side placement planning; the peer re-probes at load time.
+    pub fn from_advertised(
+        free_ram_mb: u64,
+        total_ram_mb: u64,
+        backend: AccelerationBackend,
+    ) -> Self {
+        let free = free_ram_mb.max(1);
+        let total = total_ram_mb.max(free);
+        Self {
+            total_ram_mb: total,
+            available_ram_mb: free,
+            detected_backend: backend,
+            recommended_threads: Self::recommended_threads_for_backend(backend),
+        }
+    }
+
+    /// Thread guidance when the host CPU is not probed locally (remote placement).
+    pub fn recommended_threads_for_backend(backend: AccelerationBackend) -> usize {
+        match backend {
+            AccelerationBackend::Vulkan => 4,
+            AccelerationBackend::ArmCpuDotProd => 6,
+            AccelerationBackend::X86Baseline => 2,
+            AccelerationBackend::GenericCpu => 4,
+        }
+    }
+
     /// Read `/proc/meminfo` and parse `MemTotal` and `MemAvailable` in MB.
     fn read_meminfo() -> (u64, u64) {
         if let Ok(content) = fs::read_to_string("/proc/meminfo") {
@@ -406,6 +434,18 @@ mod tests {
         assert!(profile.can_safely_moe_stream_pct(&gguf, 2048, 2000, 75));
         assert!(profile.should_prefer_moe_stream(&gguf, 2048, 2000, 75, true));
         assert!(!profile.should_prefer_moe_stream(&gguf, 2048, 2000, 75, false));
+    }
+
+    #[test]
+    fn from_advertised_uses_free_ram_for_lmk() {
+        let profile =
+            SystemProfile::from_advertised(10_000, 12_000, AccelerationBackend::ArmCpuDotProd);
+        assert_eq!(profile.available_ram_mb, 10_000);
+        assert_eq!(profile.total_ram_mb, 12_000);
+        assert_eq!(profile.recommended_threads, 6);
+        let gguf = streamable_moe_gguf(18);
+        assert!(!profile.can_safely_load_gguf_pct(&gguf, 2048, 75));
+        assert!(profile.can_safely_moe_stream_pct(&gguf, 2048, 2000, 75));
     }
 
     #[test]

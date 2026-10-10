@@ -25,6 +25,53 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — Hit%-driven MoE cache governor
+- Category: design-decision
+- Context: Phase 16.5 step 5 — `cache_hit_pct` was recorded in BenchStore but never biased ceil or lossy knobs at load time.
+- Finding: Warm hit (≥70%) can shrink default ceil 25%; cold (<40%) bumps toward 45% LMK headroom; chronically cold (<25% with ≥3 hit samples) may overlay session `drop_cold_experts=0.85` only when `quality_mode=lossy` and operator drop is unset. Never auto-flip Lossless→Lossy; never persist into TOML; load/plan only (no mid-session respawn).
+- Action: `BenchStore::lookup_moe_cache_hit`; `cluster::moe_governor::{govern_moe_stream, apply_moe_governor_to_config}`; bias `default_ceil` inside `plan_moe_stream_knobs`; apply lossy overlay at hub/control-plane/CLI/gateway spawn.
+- Verification: Governor unit tests + warm-hit planner shrink; `cargo test --locked`; clippy `-D warnings`.
+
+## 2026-10-10 — Active-params + flash I/O MoE cold-start scoring
+- Category: design-decision
+- Context: Phase 16.5 step 4 — cold-start MoE tok/s was a flat 2.2 for every (ctx, ceil), so joint knobs could not prefer warmer expert caches on throughput grounds, and denser top-k MoEs ranked identically to A3B.
+- Finding: GGUF already exposes `expert_count` / `expert_used_count` and expert tensor bytes. Measured `BACKEND_MOE_STREAM` samples must stay authoritative (not rescaled). Soft sqrt demotion on active fraction plus cache-vs-working-set I/O penalty (`0.55 + 0.45*hit`) matches soak (~2.2 A3B warm) while making ceil tok/s-sensitive.
+- Action: Add `predict_moe_stream_tok_s` in `cluster/moe_knobs.rs`; wire into `plan_moe_stream_knobs` cold-start path; keep `MOE_COLD_START_TOK_S = 2.2` as A3B reference.
+- Verification: Unit tests for measured override, A3B warm ≈2.2, higher top-k demotion, cold < warm, knob planner prefers warm ceil; `cargo test --locked` + clippy `-D warnings`.
+
+## 2026-10-10 — RemoteMoeStream mesh placement (Phase 16.5 step 3)
+- Category: design-decision
+- Context: Peers advertise `moe_stream` but ranking only offered dense `PlanTarget::Remote`, which mmap-fit checks could mark as Fits for oversize MoE files; Hub remote load always sent `backend=auto` without planned ctx/ceil.
+- Finding: Client-side placement needs a synthetic `SystemProfile::from_advertised(free, total, backend)`; remote dense plans for stream-capable peers must be suppressed when dense LMK fails; control-plane load must re-run `plan_moe_stream_knobs` on the peer and spawn via `from_profile_with_ceil`. Cross-node MoE bench stays on each device's `BenchStore` (`node_id=local`) in v1 — remote ranking uses cold-start tok/s unless samples were recorded under the peer label locally.
+- Action: Add `PlanTarget::RemoteMoeStream`, `TargetExecutionNode::RemoteMoeStream`, `ModelLoadRequest.moe_cache_ceil_mb`, Hub `LoadModelRemote` with `backend=bmoe`; reject RPC+MoE on control plane.
+- Verification: `cargo test --locked` (including `ranks_remote_moe_stream_on_capable_peer_when_local_too_small`, `no_remote_moe_stream_*`, `from_advertised_uses_free_ram_for_lmk`); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
+## 2026-10-10 — Joint MoE (ctx, cache_ceil) planner wires into spawn
+- Category: design-decision
+- Context: Phase 16.5 step 2 — pick feasible stream LMK knobs and apply them at bmoe-cli spawn.
+- Finding: Ranking advertised a single ceil at fixed policy ctx; Hub hardcoded placement ctx=4096; load ignored `LocalMoeStream.ceil_mb` and re-derived via `from_profile`. `--cache-mb auto` could disagree with the LMK ceil commitment.
+- Action: Add `cluster::moe_knobs::plan_moe_stream_knobs` (grid + tok/s-then-ctx-then-ceil scoring); rank emits winner ctx/ceil; Hub passes `selected_context` and threads `moe_cache_ceil_mb` through `LoadModelLocal`/`HotSwapIntent`; `BmoeSessionConfig::from_profile_with_ceil` forces integer `--cache-mb` when ceil≥2000; CLI `nexus host` plans before spawn.
+- Verification: `cargo test --locked` green (moe_knobs unit tests + placement); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
+## 2026-10-10 — MoE bench feedback closes LocalMoeStream ranking loop
+- Category: design-decision
+- Context: Implementing Phase 16.5 step 1 — feed BigMoe `BMOE_DONE` metrics into placement ranking.
+- Finding: Dense llama-server already wrote wall-clock SSE rates into `BenchStore`; MoE adapter discarded `tok_s`/`cache_hit_pct`, and `LocalMoeStream` always ranked at hardcoded `2.2`. Chat MoE labels mapped to `GenericCpu` ("cpu"), which would poison dense entries if recorded.
+- Action: Add `BACKEND_MOE_STREAM = "moe-stream"` string-key APIs + optional `cache_hit_pct` on samples; record from bmoe Done paths with `node_id="local"` and real context; rank via measured lookup with `2.2` cold-start fallback; skip chat bench writes when backend label contains `"moe"`.
+- Verification: `cargo test --locked` green (including `local_moe_stream_uses_measured_bench_tok_s`, `moe_stream_key_records_cache_hit_average`, `moe_bench_sample_from_done_filters`); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
+## 2026-10-10 — Adaptive MoE loading roadmap after 30B-A3B soak
+- Category: research | design-decision
+- Context: Qwen*30B-A3B-class MoE verified on-device via BigMoe flash streaming at >2 tok/s (Phase 16 soak ~2.35 tok/s on S23; operator follow-up with Qwen2.5-30B-A3B). Question: how to make backend model handling more adaptive/smart for larger MoEs.
+- Finding: The hard path (stream LMK, `should_prefer_moe_stream`, `PlanTarget::LocalMoeStream`, no RPC+stream) already works. Remaining adaptivity gaps are closed-loop, not architecture:
+  1. Placement still hardcodes `predicted_tok_s = 2.2` for MoE stream; `BMOE_DONE.tok_s` / `cache_hit_pct` are not fed into `BenchStore`.
+  2. Expert cache ceil is a static ~45% of LMK budget; no joint optimization of `(context_size, cache_ceil)` under `resident + cache + KV`.
+  3. Peers advertise `moe_stream` but ranking never emits remote MoE-stream plans — oversize MoEs may still prefer dense RPC incorrectly.
+  4. Throughput heuristics ignore `expert_used_count` (A3B ≈ 3B active params + flash I/O), so ranking treats MoE like dense 30B.
+  5. Phase D (networked route-ahead, distributed expert affinity, Vulkan experts) remains correctly gated — local flash already wins at verified rates.
+- Action: Prefer a “Phase 16.5 adaptive MoE” track before Phase D: (a) MoE-aware bench feedback into `rank_execution_plans`, (b) joint ctx/cache Pareto under stream LMK, (c) `RemoteMoeStream` for `moe_stream` peers, (d) active-params + flash-I/O ranking, (e) hit%-driven cache governor with lossy only when chronically cold. Keep no-RPC+stream and external `bmoe-cli` constraints.
+- Verification: Research-only; no code change in this entry. SenseLab key `nexus-llm/moe/decision-adaptive-moe-roadmap-post-30b-a3b`.
+
 ## 2026-10-09 — Security Audit Hardening: Non-Poisoning Locks, Preset Routing, Doctor Probes, and Fuzzing
 - Category: design-decision | bug
 - Context: Addressing external technical audit feedback across security defaults, sync locks in async hyper handlers, dependency drift, pairing rate limiting, and parser attack surfaces.

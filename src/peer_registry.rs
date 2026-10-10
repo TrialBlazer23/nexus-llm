@@ -166,6 +166,8 @@ impl PeerRegistry {
         }
         let battery_percent = endpoint.battery_percent;
         let power_source = endpoint.power_source;
+        let display_name = endpoint.display_name.clone();
+        let control_port = endpoint.control_port;
         merge_endpoint(&mut peer.endpoint, endpoint);
         // State overwrites a TXT hint, including a null percent and unknown power.
         peer.endpoint.battery_percent = battery_percent;
@@ -174,10 +176,38 @@ impl PeerRegistry {
         peer.lifecycle = PeerLifecycle::Healthy;
         peer.last_seen = now;
         peer.last_verified = Some(now);
+        if !display_name.trim().is_empty() {
+            peer.endpoint.display_name = display_name;
+        }
+        if control_port > 0 {
+            peer.endpoint.control_port = control_port;
+        }
         if !peer.sources.contains(&ObservationSource::ControlPlane) {
             peer.sources.push(ObservationSource::ControlPlane);
         }
         Ok(())
+    }
+
+    /// Refresh `last_seen` without replacing the stored address.
+    pub fn keep_fresh(&mut self, node_id: Uuid, now: Instant) -> bool {
+        let Some(peer) = self.peers.get_mut(&node_id) else {
+            return false;
+        };
+        if matches!(
+            peer.lifecycle,
+            PeerLifecycle::Removed | PeerLifecycle::Rejected
+        ) {
+            return false;
+        }
+        peer.last_seen = now;
+        if peer.lifecycle == PeerLifecycle::Stale {
+            peer.lifecycle = if peer.verified {
+                PeerLifecycle::Healthy
+            } else {
+                PeerLifecycle::Verifying
+            };
+        }
+        true
     }
 
     pub fn reject(&mut self, node_id: Uuid, reason: impl Into<String>, now: Instant) {

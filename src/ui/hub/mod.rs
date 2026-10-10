@@ -2148,6 +2148,19 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     true
 }
 
+/// Tunnel tab refresh. Probes every authorized serial immediately, then redraws host ports.
+async fn probe_tunnel_tab(hub: &mut HubApp) {
+    let forwards = crate::registry_runtime::probe_usb_peers(
+        &hub.discovery,
+        hub.identity.as_ref(),
+        hub.discovery.node_uuid(),
+        true,
+    )
+    .await;
+    hub.tunnel_view.apply_forwards(forwards);
+    hub.tunnel_view.refresh();
+}
+
 /// Launch and execute the main unified hub event loop.
 pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Error>> {
     hub.cluster_view.set_local_identity(hub.identity.clone());
@@ -3005,7 +3018,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                 let _ = cmd_tx.try_send(HubCommand::RefreshCluster);
                             }
                             HubAction::TabSettings => hub.set_tab(HubTab::Settings),
-                            HubAction::TabTunnel => hub.set_tab(HubTab::Tunnel),
+                            HubAction::TabTunnel => {
+                                hub.set_tab(HubTab::Tunnel);
+                                probe_tunnel_tab(&mut hub).await;
+                            },
                             HubAction::TabAgents => {
                                 hub.agents_view.refresh();
                                 hub.set_tab(HubTab::Agents);
@@ -3529,8 +3545,11 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             }
                         }
                         HubTab::Tunnel => match key.code {
-                            KeyCode::Char('r') | KeyCode::Char('R') => hub.tunnel_view.refresh(),
-                            KeyCode::Char('s') | KeyCode::Char('S') => hub.tunnel_view.setup_tunnel(),
+                            KeyCode::Char('r') | KeyCode::Char('R') => probe_tunnel_tab(&mut hub).await,
+                            KeyCode::Char('f')
+                            | KeyCode::Char('F')
+                            | KeyCode::Char('s')
+                            | KeyCode::Char('S') => probe_tunnel_tab(&mut hub).await,
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 hub.tunnel_view.teardown_tunnel()
                             }

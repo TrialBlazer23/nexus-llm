@@ -612,7 +612,7 @@ async fn handle_state(
     let profile = SystemProfile::probe();
     let allocatable =
         profile.max_allowed_memory_bytes_pct(ctx.memory_budget_percent) / (1024 * 1024);
-    let state = build_control_plane_state_with_host(
+    let mut state = build_control_plane_state_with_host(
         ctx.node_id,
         ctx.role,
         ctx.capabilities.clone(),
@@ -623,6 +623,7 @@ async fn handle_state(
         &ctx.api_host,
     )
     .await;
+    state.display_name = ctx.read_config().resolved_display_name();
     json_response(StatusCode::OK, &state)
 }
 

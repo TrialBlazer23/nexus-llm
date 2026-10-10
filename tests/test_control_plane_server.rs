@@ -110,6 +110,8 @@ async fn control_plane_http_load_fails_without_binary_and_unload_succeeds() {
             target_port: None,
             backend: "auto".to_string(),
             moe_cache_ceil_mb: None,
+            cache_type_k: None,
+            cache_type_v: None,
         },
     )
     .await

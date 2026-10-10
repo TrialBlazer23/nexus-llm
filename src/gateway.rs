@@ -6,8 +6,8 @@
 //! `control_port` (signed control plane).
 
 use crate::appliance::{
-    catalog_filename_for_digest, cold_predict_tok_s, decide_appliance, format_route_header,
-    front_door_tags, link_header_token, load_presets, observe_stream_done,
+    apply_front_door_rung, catalog_filename_for_digest, cold_predict_tok_s, decide_appliance,
+    format_route_header, front_door_tags, link_header_token, load_presets, observe_stream_done,
     pantry_reverse_device_port, pantry_source_base, peer_lost_sse, plan_front_door,
     preset_tags_for_file, score_burst_candidate, tier2_model_id, warn_front_door_once,
     ApplianceDecision, BurstActivity, RouteStay, PANTRY_CATALOG_INTERVAL, PANTRY_CATALOG_WAIT,
@@ -1195,6 +1195,63 @@ struct ConfigUpdateRequest {
     pub moe_route_ahead: Option<u32>,
 }
 
+/// Apply a settings patch onto a copy. The live config changes only after `NexusConfig::validate`.
+fn apply_settings_update(
+    cfg: &mut NexusConfig,
+    payload: &ConfigUpdateRequest,
+) -> Result<(), String> {
+    let mut next = cfg.clone();
+    if let Some(enabled) = payload.prompt_cache_enabled {
+        next.inference.cache.prompt_cache_enabled = enabled;
+    }
+    if let Some(path) = payload.slot_save_path.clone() {
+        next.inference.cache.slot_save_path = path;
+    }
+    if let Some(max_mb) = payload.max_cache_mb {
+        next.inference.cache.max_cache_mb = max_mb;
+    }
+    if let Some(floor) = payload.battery_floor_percent {
+        next.hardware.safety.battery_floor_percent = floor;
+    }
+    if let Some(action) = payload.battery_action.clone() {
+        next.hardware.safety.battery_action = action;
+    }
+    if let Some(ram) = payload.max_ram_usage_percent {
+        next.hardware.safety.max_ram_usage_percent = ram;
+    }
+    if let Some(enabled) = payload.moe_enabled {
+        next.inference.moe.enabled = enabled;
+    }
+    if let Some(cache_mb) = payload.moe_cache_mb.clone() {
+        next.inference.moe.cache_mb = cache_mb;
+    }
+    if let Some(ceil) = payload.moe_cache_ceil_mb {
+        next.inference.moe.cache_ceil_mb = ceil;
+    }
+    if let Some(mode) = payload.moe_quality_mode.as_deref() {
+        match mode.to_ascii_lowercase().as_str() {
+            "lossy" => next.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossy,
+            "lossless" => next.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossless,
+            _ => {}
+        }
+    }
+    if let Some(overlap) = payload.moe_overlap {
+        next.inference.moe.overlap = overlap;
+    }
+    if let Some(drop) = payload.moe_drop_cold_experts.clone() {
+        next.inference.moe.drop_cold_experts = if drop.is_empty() { None } else { Some(drop) };
+    }
+    if let Some(sub) = payload.moe_expert_substitute.clone() {
+        next.inference.moe.expert_substitute = if sub.is_empty() { None } else { Some(sub) };
+    }
+    if let Some(n) = payload.moe_route_ahead {
+        next.inference.moe.route_ahead = if n == 0 { None } else { Some(n) };
+    }
+    next.validate().map_err(|err| err.to_string())?;
+    *cfg = next;
+    Ok(())
+}
+
 async fn handle_config_get(ctx: Arc<GatewayContext>) -> Response<RespBody> {
     let cfg = ctx.config.read().unwrap();
     json_response(
@@ -1256,54 +1313,8 @@ async fn handle_config_update(
     };
 
     let mut cfg = ctx.config.write().unwrap();
-    if let Some(enabled) = payload.prompt_cache_enabled {
-        cfg.inference.cache.prompt_cache_enabled = enabled;
-    }
-    if let Some(path) = payload.slot_save_path {
-        cfg.inference.cache.slot_save_path = path;
-    }
-    if let Some(max_mb) = payload.max_cache_mb {
-        cfg.inference.cache.max_cache_mb = max_mb;
-    }
-    if let Some(floor) = payload.battery_floor_percent {
-        cfg.hardware.safety.battery_floor_percent = floor;
-    }
-    if let Some(action) = payload.battery_action {
-        cfg.hardware.safety.battery_action = action;
-    }
-    if let Some(ram) = payload.max_ram_usage_percent {
-        cfg.hardware.safety.max_ram_usage_percent = ram;
-    }
-    if let Some(enabled) = payload.moe_enabled {
-        cfg.inference.moe.enabled = enabled;
-    }
-    if let Some(cache_mb) = payload.moe_cache_mb {
-        cfg.inference.moe.cache_mb = cache_mb;
-    }
-    if let Some(ceil) = payload.moe_cache_ceil_mb {
-        cfg.inference.moe.cache_ceil_mb = ceil;
-    }
-    if let Some(mode) = payload.moe_quality_mode {
-        match mode.to_ascii_lowercase().as_str() {
-            "lossy" => cfg.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossy,
-            "lossless" => cfg.inference.moe.quality_mode = crate::config::MoeQualityMode::Lossless,
-            _ => {}
-        }
-    }
-    if let Some(overlap) = payload.moe_overlap {
-        cfg.inference.moe.overlap = overlap;
-    }
-    if let Some(drop) = payload.moe_drop_cold_experts {
-        cfg.inference.moe.drop_cold_experts = if drop.is_empty() { None } else { Some(drop) };
-    }
-    if let Some(sub) = payload.moe_expert_substitute {
-        cfg.inference.moe.expert_substitute = if sub.is_empty() { None } else { Some(sub) };
-    }
-    if let Some(n) = payload.moe_route_ahead {
-        cfg.inference.moe.route_ahead = if n == 0 { None } else { Some(n) };
-    }
-    if let Err(e) = cfg.inference.moe.validate() {
-        return json_response(StatusCode::BAD_REQUEST, &json!({"error": e.to_string()}));
+    if let Err(err) = apply_settings_update(&mut cfg, &payload) {
+        return json_response(StatusCode::BAD_REQUEST, &json!({"error": err}));
     }
 
     if let Err(e) = cfg.save() {
@@ -1588,6 +1599,28 @@ struct ChosenLoad {
     backend: String,
     moe_cache_ceil_mb: Option<u64>,
     tags: Vec<String>,
+    /// Dense ladder dtype. MoE plans leave this empty; llama-server then keeps its default.
+    kv_dtype: Option<KvCacheDtype>,
+}
+
+/// Full Vulkan offload. A CPU front door must not copy `gpu_layers = 0` onto a Vulkan phone.
+fn peer_offload_layers(backend: AccelerationBackend) -> u32 {
+    match backend {
+        AccelerationBackend::Vulkan => 99,
+        AccelerationBackend::ArmCpuDotProd
+        | AccelerationBackend::X86Baseline
+        | AccelerationBackend::GenericCpu => 0,
+    }
+}
+
+fn cache_type_pair(dtype: Option<KvCacheDtype>) -> (Option<String>, Option<String>) {
+    match dtype {
+        Some(dtype) => {
+            let arg = dtype.as_llama_arg().to_string();
+            (Some(arg.clone()), Some(arg))
+        }
+        None => (None, None),
+    }
 }
 
 struct PantryRow {
@@ -1609,7 +1642,6 @@ struct ApplianceSnap {
     control_port: u16,
     label: String,
     pairing: bool,
-    gpu_layers: u32,
     threads: usize,
     moe: crate::config::MoeConfig,
 }
@@ -1628,7 +1660,6 @@ fn read_appliance_snap(ctx: &GatewayContext) -> Option<ApplianceSnap> {
         control_port: cfg.network.control_port,
         label: cfg.resolved_display_name(),
         pairing: cfg.network.security.pairing_enforced(),
-        gpu_layers: cfg.hardware.acceleration.gpu_layers,
         threads: cfg.hardware.acceleration.cpu_threads,
         moe: cfg.inference.moe.clone(),
     })
@@ -1891,6 +1922,7 @@ fn plan_tagged_file(
             backend: "bmoe".to_string(),
             moe_cache_ceil_mb: Some(plan.cache_mb),
             tags: row.tags.clone(),
+            kv_dtype: None,
         });
     }
     let choice = plan_fit_ladder(
@@ -1909,6 +1941,7 @@ fn plan_tagged_file(
         backend: "auto".to_string(),
         moe_cache_ceil_mb: None,
         tags: row.tags.clone(),
+        kv_dtype: Some(choice.kv_dtype),
     })
 }
 
@@ -2248,22 +2281,21 @@ async fn ensure_peer_model(
         // `accepted` only queues the write. Load the filename the catalog shows after it lands.
         poll_catalog_for_digest(&client, &control, &chosen.digest).await?
     };
+    let (cache_type_k, cache_type_v) = cache_type_pair(chosen.kv_dtype);
     let request = ModelLoadRequest {
         protocol_version: CONTROL_PLANE_VERSION,
         requester_id: ctx.node_id,
         model_path: load_name.clone(),
         context_size: chosen.context_size,
-        gpu_layers: if peer.backend == AccelerationBackend::Vulkan {
-            snap.gpu_layers
-        } else {
-            0
-        },
+        gpu_layers: peer_offload_layers(peer.backend),
         threads: snap.threads.max(1),
         rpc_workers: Vec::new(),
         tags: chosen.tags.clone(),
         target_port: None,
         backend: chosen.backend.clone(),
         moe_cache_ceil_mb: chosen.moe_cache_ceil_mb,
+        cache_type_k,
+        cache_type_v,
     };
     let loaded = if snap.pairing {
         let identity = ctx.identity.as_ref().ok_or(())?;
@@ -2337,17 +2369,13 @@ pub async fn load_appliance_front_door(
     let mut server = LlamaServerConfig::new(binary, &plan.model_path, host, port);
     server.gpu_layers = gpu_layers;
     server.threads = threads;
-    server.context_size = plan.context_size;
     server.use_mmap = cfg.hardware.safety.mmap;
     server.use_mlock = cfg.hardware.safety.mlock;
     server.cpu_threads_batch = cfg.hardware.acceleration.cpu_threads_batch.max(1);
     server.fallback_to_cpu = cfg.hardware.acceleration.fallback_to_cpu;
     server.memory_budget_percent = cfg.hardware.safety.max_ram_usage_percent;
     server.tags = plan.tags.clone();
-    if plan.kv_q8 {
-        server.cache_type_k = Some("q8_0".to_string());
-        server.cache_type_v = Some("q8_0".to_string());
-    }
+    apply_front_door_rung(&mut server, &plan);
     if cfg.inference.cache.prompt_cache_enabled {
         server.slot_save_path = Some(PathBuf::from(&cfg.inference.cache.slot_save_path));
     }
@@ -2550,6 +2578,158 @@ fn full_body(bytes: Bytes) -> RespBody {
     Full::new(bytes)
         .map_err(|never| match never {})
         .boxed_unsync()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{NodeRole, StatusFlags};
+    use crate::sysinfo::PowerSource;
+    use std::collections::HashMap;
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    fn dense_950() -> GgufMetadata {
+        GgufMetadata {
+            version: 3,
+            tensor_count: 0,
+            kv_count: 0,
+            metadata: HashMap::new(),
+            architecture: Some("llama".into()),
+            model_name: Some("coder".into()),
+            context_length: Some(4096),
+            block_count: Some(28),
+            head_count: Some(12),
+            head_count_kv: Some(12),
+            embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
+            file_size_bytes: 950 * 1024 * 1024,
+            tensors: vec![],
+            quant_label: Some("Q4_K".into()),
+        }
+    }
+
+    fn snap() -> ApplianceSnap {
+        ApplianceSnap {
+            floor: 3.0,
+            battery_floor: 20,
+            battery_action: "decline".into(),
+            max_ram: 75,
+            mmap: true,
+            mlock: false,
+            presets_dir: PathBuf::from("presets"),
+            models_dir: PathBuf::from("models"),
+            control_port: 9998,
+            label: "hub".into(),
+            pairing: false,
+            threads: 2,
+            moe: NexusConfig::default().inference.moe,
+        }
+    }
+
+    fn peer(backend: AccelerationBackend) -> PeerNode {
+        PeerNode {
+            uuid: Uuid::from_u128(9),
+            addr: "10.0.0.8:8080".parse().unwrap(),
+            role: NodeRole::HOST,
+            status: StatusFlags::READY,
+            api_port: 8080,
+            rpc_port: 50052,
+            control_port: 9998,
+            total_ram_mb: 4_000,
+            free_ram_mb: 2_000,
+            backend,
+            thermal_index: 0,
+            active_model: String::new(),
+            display_name: "phone".into(),
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            link_class: LinkClass::Usb,
+            usb_serial: Some("serial-a".into()),
+            usb_api_endpoint: Some("http://127.0.0.1:18080".into()),
+            usb_control_endpoint: Some("http://127.0.0.1:18081".into()),
+            battery_percent: Some(80),
+            power_source: PowerSource::Ac,
+            last_seen: Instant::now(),
+        }
+    }
+
+    fn empty_update(battery_action: Option<String>) -> ConfigUpdateRequest {
+        ConfigUpdateRequest {
+            prompt_cache_enabled: None,
+            slot_save_path: None,
+            max_cache_mb: None,
+            battery_floor_percent: None,
+            battery_action,
+            max_ram_usage_percent: None,
+            moe_enabled: None,
+            moe_cache_mb: None,
+            moe_cache_ceil_mb: None,
+            moe_quality_mode: None,
+            moe_overlap: None,
+            moe_drop_cold_experts: None,
+            moe_expert_substitute: None,
+            moe_route_ahead: None,
+        }
+    }
+
+    #[test]
+    fn remote_load_request_carries_ladder_kv_dtype() {
+        let row = PantryRow {
+            filename: "coder.gguf".into(),
+            digest: "abc".into(),
+            tags: vec!["coder".into()],
+            meta: dense_950(),
+        };
+        let cpu = peer(AccelerationBackend::X86Baseline);
+        let chosen = plan_tagged_file(&row, &cpu, &snap(), None).expect("2048 q8 fits");
+        assert_eq!(chosen.context_size, 2048);
+        assert_eq!(chosen.kv_dtype, Some(KvCacheDtype::Q8_0));
+        let (cache_type_k, cache_type_v) = cache_type_pair(chosen.kv_dtype);
+        let phone = peer(AccelerationBackend::Vulkan);
+        let request = ModelLoadRequest {
+            protocol_version: CONTROL_PLANE_VERSION,
+            requester_id: Uuid::from_u128(1),
+            model_path: chosen.filename.clone(),
+            context_size: chosen.context_size,
+            gpu_layers: peer_offload_layers(phone.backend),
+            threads: 2,
+            rpc_workers: Vec::new(),
+            tags: chosen.tags.clone(),
+            target_port: None,
+            backend: chosen.backend.clone(),
+            moe_cache_ceil_mb: chosen.moe_cache_ceil_mb,
+            cache_type_k,
+            cache_type_v,
+        };
+        assert_eq!(request.context_size, 2048);
+        assert_eq!(request.cache_type_k.as_deref(), Some("q8_0"));
+        assert_eq!(request.cache_type_v.as_deref(), Some("q8_0"));
+        assert_eq!(request.gpu_layers, 99);
+        assert_eq!(peer_offload_layers(AccelerationBackend::X86Baseline), 0);
+        assert_eq!(peer_offload_layers(cpu.backend), 0);
+    }
+
+    #[test]
+    fn handle_config_update_does_not_persist_sleep_battery_action() {
+        let path = std::env::temp_dir().join(format!(
+            "nexus-config-sleep-{}-{}.toml",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut cfg = NexusConfig::default();
+        cfg.save_to_path(&path).expect("seed config");
+        let before = std::fs::read(&path).expect("read seed");
+        let err = apply_settings_update(&mut cfg, &empty_update(Some("sleep".into())))
+            .expect_err("sleep is not a battery action");
+        assert!(err.contains("sleep"), "{err}");
+        assert_eq!(cfg.hardware.safety.battery_action, "decline");
+        assert_eq!(std::fs::read(&path).expect("reread"), before);
+        let text = String::from_utf8_lossy(&before);
+        assert!(!text.contains("sleep"));
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 fn json_response(status: StatusCode, value: &impl serde::Serialize) -> Response<RespBody> {

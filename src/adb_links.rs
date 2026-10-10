@@ -271,6 +271,65 @@ pub fn adb_forward_dry_run(flag: Option<&str>) -> bool {
     flag == Some("1")
 }
 
+/// `adb forward --list` rows: `<serial> tcp:<host> tcp:<device>`.
+pub fn parse_adb_forward_list(stdout: &str) -> Vec<(String, u16)> {
+    let mut rows = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(serial) = parts.next() else {
+            continue;
+        };
+        let Some(host) = parts.next() else {
+            continue;
+        };
+        let Some(port_text) = host.strip_prefix("tcp:") else {
+            continue;
+        };
+        let Ok(port) = port_text.parse::<u16>() else {
+            continue;
+        };
+        rows.push((serial.to_string(), port));
+    }
+    rows
+}
+
+/// Doctor lines for cache rows that share a UUID. The first serial in sorted order is kept.
+pub fn duplicate_link_warnings(cache: &AdbLinkCache) -> Vec<String> {
+    let mut pairs: Vec<(String, Uuid)> = cache
+        .links
+        .iter()
+        .map(|link| (link.serial.clone(), link.node_id))
+        .collect();
+    pairs.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    let losers = AdbLinkCache::duplicate_uuid_losers(&pairs);
+    let mut lines = Vec::new();
+    for loser in losers {
+        let Some(node_id) = cache
+            .links
+            .iter()
+            .find(|link| link.serial == loser)
+            .map(|link| link.node_id)
+        else {
+            continue;
+        };
+        let Some(kept) = pairs
+            .iter()
+            .find(|(_, id)| *id == node_id)
+            .map(|(serial, _)| serial.clone())
+        else {
+            continue;
+        };
+        lines.push(format!(
+            "usb duplicate uuid: kept {kept}, tore down {loser}"
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

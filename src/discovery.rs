@@ -472,6 +472,285 @@ pub fn sync_peer_usb_links(
     }
 }
 
+/// One serial whose control forward answered `POST /nexus/control/v1/state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbProbeHit {
+    pub serial: String,
+    pub host_api: u16,
+    pub host_control: u16,
+    pub device_api: u16,
+    pub device_control: u16,
+    pub device_rpc: u16,
+    pub state: crate::control_plane::ControlPlaneState,
+}
+
+/// Argv lists to run, peers that were USB-only and are gone, and the serials that won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbFold {
+    pub teardown: Vec<Vec<String>>,
+    pub dropped: Vec<Uuid>,
+    pub winner_serials: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Stored device ports, then the local defaults when those differ. One attempt when they match.
+pub fn device_port_attempts(
+    stored: Option<(u16, u16, u16)>,
+    default_api: u16,
+    default_control: u16,
+    default_rpc: u16,
+) -> Vec<(u16, u16, u16)> {
+    let defaults = (default_api, default_control, default_rpc);
+    match stored {
+        Some(stored) if stored != defaults => vec![stored, defaults],
+        Some(stored) => vec![stored],
+        None => vec![defaults],
+    }
+}
+
+/// USB forward is the live link. Beacon age does not retire it.
+pub fn usb_link_healthy(peer: &PeerNode) -> bool {
+    peer.link_class == LinkClass::Usb
+        && peer.usb_api_endpoint.is_some()
+        && peer.usb_control_endpoint.is_some()
+}
+
+/// Keep a peer whose beacon is fresh, or whose USB forward is still healthy.
+pub fn peer_still_active(peer: &PeerNode, timeout: Duration, now: Instant) -> bool {
+    usb_link_healthy(peer) || now.saturating_duration_since(peer.last_seen) <= timeout
+}
+
+fn addr_is_usb_only(addr: SocketAddr) -> bool {
+    addr.ip().is_unspecified() || addr.ip().is_loopback()
+}
+
+fn push_remove(teardown: &mut Vec<Vec<String>>, serial: &str, port: u16) {
+    let argv = crate::adb_links::remove_forward_argv(serial, port);
+    if !teardown.contains(&argv) {
+        teardown.push(argv);
+    }
+}
+
+fn mb_u32(mb: u64) -> u32 {
+    u32::try_from(mb).unwrap_or(u32::MAX)
+}
+
+fn backend_hint(capabilities: &[String]) -> Option<AccelerationBackend> {
+    capabilities
+        .iter()
+        .find_map(|cap| match cap.to_ascii_lowercase().as_str() {
+            "vulkan" => Some(AccelerationBackend::Vulkan),
+            "arm_dotprod" | "arm-dotprod" => Some(AccelerationBackend::ArmCpuDotProd),
+            "x86_baseline" | "x86-baseline" => Some(AccelerationBackend::X86Baseline),
+            _ => None,
+        })
+}
+
+fn status_from_state(
+    state: &crate::control_plane::ControlPlaneState,
+    previous: StatusFlags,
+) -> StatusFlags {
+    let mut bits = previous.0;
+    if state.ready {
+        bits |= StatusFlags::READY.0;
+    } else {
+        bits &= !StatusFlags::READY.0;
+    }
+    if state.inferring {
+        bits |= StatusFlags::INFERRING.0;
+    } else {
+        bits &= !StatusFlags::INFERRING.0;
+    }
+    if state.rpc_ready {
+        bits |= StatusFlags::RPC_READY.0;
+    } else {
+        bits &= !StatusFlags::RPC_READY.0;
+    }
+    if state
+        .capabilities
+        .iter()
+        .any(|cap| cap.eq_ignore_ascii_case("vulkan"))
+    {
+        bits |= StatusFlags::VULKAN_ACTIVE.0;
+    }
+    StatusFlags(bits)
+}
+
+fn stale_seen() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(3_600))
+        .unwrap_or_else(Instant::now)
+}
+
+fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit) {
+    let id = hit.state.node_id;
+    if let Some(peer) = peers.get_mut(&id) {
+        if !hit.state.display_name.trim().is_empty() {
+            peer.display_name = hit.state.display_name.clone();
+        }
+        let mem = mb_u32(hit.state.allocatable_memory_mb);
+        peer.free_ram_mb = mem;
+        if peer.total_ram_mb == 0 {
+            peer.total_ram_mb = mem;
+        }
+        if hit
+            .state
+            .capabilities
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("moe_stream"))
+        {
+            peer.moe_stream = true;
+        }
+        peer.battery_percent = hit.state.battery_percent;
+        peer.power_source = hit.state.power_source;
+        peer.role = hit.state.role;
+        peer.status = status_from_state(&hit.state, peer.status);
+        if let Some(model) = &hit.state.active_model {
+            peer.active_model = model.clone();
+        }
+        if let Some(backend) = backend_hint(&hit.state.capabilities) {
+            peer.backend = backend;
+        }
+        peer.apply_usb_probe(&hit.serial, hit.host_api, hit.host_control);
+        return;
+    }
+
+    let mem = mb_u32(hit.state.allocatable_memory_mb);
+    let rpc_port = if hit.state.rpc_ready {
+        hit.device_rpc
+    } else {
+        0
+    };
+    let mut peer = PeerNode {
+        uuid: id,
+        addr: SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            hit.device_api,
+        ),
+        role: hit.state.role,
+        status: status_from_state(&hit.state, StatusFlags(0)),
+        api_port: hit.device_api,
+        rpc_port,
+        control_port: hit.device_control,
+        total_ram_mb: mem,
+        free_ram_mb: mem,
+        backend: backend_hint(&hit.state.capabilities).unwrap_or(AccelerationBackend::GenericCpu),
+        thermal_index: 0,
+        active_model: hit.state.active_model.clone().unwrap_or_default(),
+        display_name: hit.state.display_name.clone(),
+        moe_stream: hit
+            .state
+            .capabilities
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("moe_stream")),
+        moe_cache_ceil_mb: 0,
+        link_class: LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: hit.state.battery_percent,
+        power_source: hit.state.power_source,
+        last_seen: stale_seen(),
+    };
+    peer.apply_usb_probe(&hit.serial, hit.host_api, hit.host_control);
+    peers.insert(id, peer);
+}
+
+/// Merge successful probes into peers and the serial cache. Does not spawn `adb`.
+///
+/// Hits are ordered by serial. The first serial for a UUID wins. Later serials are
+/// torn down with `adb -s`. A serial missing from `present_serials` loses its cache
+/// row, its forwards, and its USB endpoint. A real Wi-Fi address stays.
+pub fn fold_usb_probes(
+    peers: &mut HashMap<Uuid, PeerNode>,
+    cache: &mut crate::adb_links::AdbLinkCache,
+    hits: &[UsbProbeHit],
+    present_serials: &[String],
+    listed_forwards: &[(String, u16)],
+) -> UsbFold {
+    use std::collections::HashSet;
+
+    let mut ordered: Vec<&UsbProbeHit> = hits.iter().collect();
+    ordered.sort_by(|left, right| left.serial.as_bytes().cmp(right.serial.as_bytes()));
+
+    let mut kept_serial: HashMap<Uuid, String> = HashMap::new();
+    let mut teardown = Vec::new();
+    let mut warnings = Vec::new();
+    let mut winner_serials = Vec::new();
+
+    for hit in ordered {
+        if let Some(kept) = kept_serial.get(&hit.state.node_id).cloned() {
+            let message = format!("usb duplicate uuid: kept {kept}, tore down {}", hit.serial);
+            warn!("{message}");
+            warnings.push(message);
+            cache.upsert(crate::adb_links::AdbLinkRecord {
+                serial: hit.serial.clone(),
+                node_id: hit.state.node_id,
+                device_api_port: hit.device_api,
+                device_control_port: hit.device_control,
+                device_rpc_port: hit.device_rpc,
+            });
+            push_remove(&mut teardown, &hit.serial, hit.host_api);
+            push_remove(&mut teardown, &hit.serial, hit.host_control);
+            continue;
+        }
+        kept_serial.insert(hit.state.node_id, hit.serial.clone());
+        winner_serials.push(hit.serial.clone());
+        cache.upsert(crate::adb_links::AdbLinkRecord {
+            serial: hit.serial.clone(),
+            node_id: hit.state.node_id,
+            device_api_port: hit.device_api,
+            device_control_port: hit.device_control,
+            device_rpc_port: hit.device_rpc,
+        });
+        apply_probe_hit(peers, hit);
+    }
+
+    cache.retain_present(present_serials);
+
+    let present: HashSet<&str> = present_serials.iter().map(String::as_str).collect();
+    let winners: HashSet<&str> = winner_serials.iter().map(String::as_str).collect();
+    let stale_ids: Vec<Uuid> = peers
+        .iter()
+        .filter_map(|(id, peer)| {
+            let serial = peer.usb_serial.as_deref()?;
+            if winners.contains(serial) {
+                None
+            } else {
+                Some(*id)
+            }
+        })
+        .collect();
+    let mut dropped = Vec::new();
+    for id in stale_ids {
+        let usb_only = {
+            let Some(peer) = peers.get_mut(&id) else {
+                continue;
+            };
+            let usb_only = addr_is_usb_only(peer.addr);
+            peer.clear_usb();
+            usb_only
+        };
+        if usb_only {
+            peers.remove(&id);
+            dropped.push(id);
+        }
+    }
+
+    for (serial, port) in listed_forwards {
+        if !present.contains(serial.as_str()) {
+            push_remove(&mut teardown, serial, *port);
+        }
+    }
+
+    UsbFold {
+        teardown,
+        dropped,
+        winner_serials,
+        warnings,
+    }
+}
+
 impl PeerNode {
     pub fn is_rpc_ready(&self) -> bool {
         self.status.is_rpc_ready() && self.rpc_port > 0
@@ -569,6 +848,10 @@ pub struct DiscoveryService {
     mdns_enabled: Arc<RwLock<bool>>,
     /// Cached link-quality probes (Phase 11).
     link_quality: Arc<RwLock<HashMap<Uuid, crate::cluster::LinkQuality>>>,
+    /// Last time this process spawned `adb` for a USB probe. Hub ticks share it.
+    usb_probe_at: std::sync::Mutex<Option<Instant>>,
+    /// One probe at a time. The background tick uses `try_lock`; a Tunnel refresh waits.
+    usb_probe_lock: tokio::sync::Mutex<()>,
 }
 
 impl DiscoveryService {
@@ -619,7 +902,56 @@ impl DiscoveryService {
             last_unicast_replies: Arc::new(RwLock::new(HashMap::new())),
             mdns_enabled: Arc::new(RwLock::new(mdns_enabled_val)),
             link_quality: Arc::new(RwLock::new(HashMap::new())),
+            usb_probe_at: std::sync::Mutex::new(None),
+            usb_probe_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// `Some` when this caller may spawn `adb`. The guard is held for the whole probe.
+    ///
+    /// A background tick skips the turn when a probe is already running or the last one
+    /// was under 5 seconds ago. `force` waits for the lock and ignores the gap.
+    pub async fn usb_probe_permit(&self, force: bool) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = if force {
+            self.usb_probe_lock.lock().await
+        } else {
+            match self.usb_probe_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            }
+        };
+        let gap = Duration::from_secs(5);
+        let mut last = self
+            .usb_probe_at
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if !force {
+            if let Some(prev) = *last {
+                if prev.elapsed() < gap {
+                    return None;
+                }
+            }
+        }
+        *last = Some(Instant::now());
+        Some(guard)
+    }
+
+    /// Apply a pure USB fold, then drop USB-only peers whose cable is gone.
+    pub async fn apply_folded_usb_probes(
+        &self,
+        cache: &mut crate::adb_links::AdbLinkCache,
+        hits: &[UsbProbeHit],
+        present_serials: &[String],
+        listed_forwards: &[(String, u16)],
+    ) -> UsbFold {
+        let fold = {
+            let mut peers = self.peers.write().await;
+            fold_usb_probes(&mut peers, cache, hits, present_serials, listed_forwards)
+        };
+        for id in &fold.dropped {
+            self.remove_peer(*id).await;
+        }
+        fold
     }
 
     pub fn node_uuid(&self) -> Uuid {
@@ -1083,7 +1415,8 @@ impl DiscoveryService {
         let timeout = Duration::from_millis(self.cfg().network.peer_timeout_ms);
         let mut peers = self.peers.write().await;
 
-        peers.retain(|_, peer| peer.last_seen.elapsed() <= timeout);
+        let now = Instant::now();
+        peers.retain(|_, peer| peer_still_active(peer, timeout, now));
         peers.values().cloned().collect()
     }
 
@@ -1309,6 +1642,15 @@ impl DiscoveryService {
             ObservationSource::Udp,
             Instant::now(),
         ) {
+            if matches!(
+                error,
+                crate::peer_registry::RegistryError::EndpointConflict(_)
+            ) {
+                self.registry
+                    .write()
+                    .await
+                    .keep_fresh(beacon.uuid, Instant::now());
+            }
             warn!("Rejected UDP peer observation: {}", error);
         }
         event
@@ -1430,6 +1772,12 @@ impl DiscoveryService {
             .await
             .apply_event(event, source, Instant::now())
         {
+            if matches!(e, crate::peer_registry::RegistryError::EndpointConflict(_)) {
+                self.registry
+                    .write()
+                    .await
+                    .keep_fresh(endpoint.node_id, Instant::now());
+            }
             warn!(
                 "Rejected {} peer observation: {}",
                 match source {
@@ -1790,6 +2138,7 @@ mod tests {
             signing_public_key: None,
             battery_percent: Some(15),
             power_source: PowerSource::Ac,
+            display_name: String::new(),
         };
         discovery
             .apply_verified_state(&state, &endpoint)
@@ -1900,5 +2249,217 @@ mod tests {
         sync_peer_usb_links(&mut peers, &cache, &[]);
         assert_eq!(peers[&id].link_class, LinkClass::Wifi);
         assert_eq!(peers[&id].api_endpoint(), "http://192.168.1.20:8080");
+    }
+
+    fn probe_state(id: Uuid, name: &str) -> crate::control_plane::ControlPlaneState {
+        crate::control_plane::ControlPlaneState {
+            node_id: id,
+            protocol_version: 1,
+            role: NodeRole::HOST,
+            capabilities: vec!["inference".into()],
+            ready: true,
+            inferring: false,
+            rpc_ready: false,
+            allocatable_memory_mb: 1500,
+            active_model: None,
+            loaded_models: Vec::new(),
+            signing_public_key: None,
+            battery_percent: Some(40),
+            power_source: PowerSource::Battery,
+            display_name: name.into(),
+        }
+    }
+
+    fn hit(
+        serial: &str,
+        host_api: u16,
+        state: crate::control_plane::ControlPlaneState,
+    ) -> UsbProbeHit {
+        UsbProbeHit {
+            serial: serial.into(),
+            host_api,
+            host_control: host_api + 1,
+            device_api: 8080,
+            device_control: 9998,
+            device_rpc: 50052,
+            state,
+        }
+    }
+
+    #[test]
+    fn port_attempts_retry_defaults_once() {
+        assert_eq!(
+            device_port_attempts(Some((1, 2, 3)), 8080, 9998, 50052),
+            vec![(1, 2, 3), (8080, 9998, 50052)]
+        );
+        assert_eq!(
+            device_port_attempts(Some((8080, 9998, 50052)), 8080, 9998, 50052),
+            vec![(8080, 9998, 50052)]
+        );
+        assert_eq!(
+            device_port_attempts(None, 8080, 9998, 50052),
+            vec![(8080, 9998, 50052)]
+        );
+    }
+
+    #[test]
+    fn usb_peer_survives_beacon_timeout() {
+        let mut peer = usb_fixture();
+        peer.apply_usb_probe("serial-a", 18080, 18081);
+        peer.last_seen = Instant::now() - Duration::from_secs(60);
+        let now = Instant::now();
+        assert!(peer_still_active(&peer, Duration::from_millis(6000), now));
+        assert_eq!(peer.link_class, LinkClass::Usb);
+        peer.clear_usb();
+        assert!(!peer_still_active(&peer, Duration::from_millis(6000), now));
+        peer.last_seen = now;
+        assert!(peer_still_active(&peer, Duration::from_millis(6000), now));
+    }
+
+    #[test]
+    fn two_serial_probe_keeps_first_uuid_and_leaves_wifi_addr() {
+        use crate::adb_links::{AdbLinkCache, AdbLinkRecord};
+        use std::collections::HashMap;
+
+        let shared = Uuid::from_u128(7);
+        let vanished = Uuid::from_u128(8);
+        let failed = Uuid::from_u128(9);
+        let created = Uuid::from_u128(11);
+
+        let mut wifi = usb_fixture();
+        wifi.uuid = shared;
+        let seen = wifi.last_seen;
+        let mut gone = usb_fixture();
+        gone.uuid = vanished;
+        gone.addr = "10.0.0.8:8080".parse().unwrap();
+        gone.apply_usb_probe("serial-old", 18084, 18085);
+        let mut missed = usb_fixture();
+        missed.uuid = failed;
+        missed.addr = "10.0.0.9:8080".parse().unwrap();
+        missed.apply_usb_probe("serial-d", 18086, 18087);
+
+        let mut peers = HashMap::new();
+        peers.insert(shared, wifi);
+        peers.insert(vanished, gone);
+        peers.insert(failed, missed);
+
+        let mut cache = AdbLinkCache {
+            links: vec![
+                AdbLinkRecord {
+                    serial: "serial-old".into(),
+                    node_id: vanished,
+                    device_api_port: 8080,
+                    device_control_port: 9998,
+                    device_rpc_port: 50052,
+                },
+                AdbLinkRecord {
+                    serial: "serial-d".into(),
+                    node_id: failed,
+                    device_api_port: 1,
+                    device_control_port: 2,
+                    device_rpc_port: 3,
+                },
+            ],
+        };
+        let hits = vec![
+            hit("serial-b", 18082, probe_state(shared, "phone-b")),
+            hit("serial-a", 18080, probe_state(shared, "phone-a")),
+            hit("serial-c", 18088, probe_state(created, "phone-c")),
+        ];
+        let present = vec![
+            "serial-a".into(),
+            "serial-b".into(),
+            "serial-c".into(),
+            "serial-d".into(),
+        ];
+        let listed = vec![
+            ("serial-old".into(), 18084u16),
+            ("serial-old".into(), 18085),
+        ];
+        let fold = fold_usb_probes(&mut peers, &mut cache, &hits, &present, &listed);
+
+        let winner = &peers[&shared];
+        assert_eq!(winner.link_class, LinkClass::Usb);
+        assert_eq!(winner.usb_serial.as_deref(), Some("serial-a"));
+        assert_eq!(
+            winner.usb_api_endpoint.as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        assert_eq!(
+            winner.usb_control_endpoint.as_deref(),
+            Some("http://127.0.0.1:18081")
+        );
+        assert_eq!(winner.api_endpoint(), "http://127.0.0.1:18080");
+        assert_eq!(winner.addr, "192.168.1.20:9999".parse().unwrap());
+        assert_eq!(winner.last_seen, seen);
+        assert_eq!(winner.display_name, "phone-a");
+        assert_eq!(cache.ports_for("serial-a"), Some((8080, 9998, 50052)));
+        assert_eq!(cache.ports_for("serial-b"), Some((8080, 9998, 50052)));
+        let doctor = crate::adb_links::duplicate_link_warnings(&cache);
+        assert!(doctor
+            .iter()
+            .any(|line| line.contains("kept serial-a") && line.contains("tore down serial-b")));
+
+        assert!(fold.winner_serials.contains(&"serial-a".to_string()));
+        assert!(!fold.winner_serials.contains(&"serial-b".to_string()));
+        assert!(fold
+            .warnings
+            .iter()
+            .any(|line| { line.contains("serial-a") && line.contains("serial-b") }));
+        assert!(fold.teardown.iter().any(|argv| {
+            argv.iter().any(|arg| arg == "-s")
+                && argv.iter().any(|arg| arg == "serial-b")
+                && argv.iter().any(|arg| arg == "tcp:18082")
+        }));
+        assert!(!fold
+            .teardown
+            .iter()
+            .any(|argv| { argv.iter().any(|arg| arg == "serial-a") }));
+        assert!(fold
+            .teardown
+            .iter()
+            .all(|argv| argv.iter().any(|arg| arg == "-s")));
+        assert!(fold.teardown.iter().all(|argv| {
+            let remove = argv.iter().position(|arg| arg == "--remove");
+            let scoped = argv.iter().position(|arg| arg == "-s");
+            match (remove, scoped) {
+                (Some(remove_at), Some(serial_at)) => serial_at < remove_at,
+                _ => true,
+            }
+        }));
+
+        let stayed = &peers[&vanished];
+        assert_eq!(stayed.link_class, LinkClass::Wifi);
+        assert!(stayed.usb_serial.is_none());
+        assert!(stayed.usb_api_endpoint.is_none());
+        assert_eq!(stayed.addr, "10.0.0.8:8080".parse().unwrap());
+        assert_eq!(stayed.api_endpoint(), "http://10.0.0.8:8080");
+        assert!(cache.ports_for("serial-old").is_none());
+        assert!(fold.teardown.iter().any(|argv| {
+            argv.iter().any(|arg| arg == "serial-old") && argv.iter().any(|arg| arg == "-s")
+        }));
+
+        assert_eq!(cache.ports_for("serial-d"), Some((1, 2, 3)));
+        let skipped = &peers[&failed];
+        assert_eq!(skipped.link_class, LinkClass::Wifi);
+        assert!(skipped.usb_api_endpoint.is_none());
+        assert_eq!(skipped.addr, "10.0.0.9:8080".parse().unwrap());
+
+        let fresh = &peers[&created];
+        assert_eq!(fresh.link_class, LinkClass::Usb);
+        assert_eq!(fresh.usb_serial.as_deref(), Some("serial-c"));
+        assert_eq!(
+            fresh.usb_api_endpoint.as_deref(),
+            Some("http://127.0.0.1:18088")
+        );
+        assert!(fresh.addr.ip().is_unspecified());
+        assert_eq!(cache.ports_for("serial-c"), Some((8080, 9998, 50052)));
+
+        let present_now = vec!["serial-a".into(), "serial-d".into()];
+        let fold_gone = fold_usb_probes(&mut peers, &mut cache, &[], &present_now, &[]);
+        assert!(!peers.contains_key(&created));
+        assert!(fold_gone.dropped.contains(&created));
+        assert_eq!(peers[&shared].link_class, LinkClass::Wifi);
+        assert_eq!(peers[&shared].addr, "192.168.1.20:9999".parse().unwrap());
     }
 }

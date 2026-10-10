@@ -110,6 +110,7 @@ fn control_plane_validates_identity_protocol_and_policy() {
         signing_public_key: None,
         battery_percent: None,
         power_source: nexus::sysinfo::PowerSource::Unknown,
+        display_name: String::new(),
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 
@@ -263,6 +264,8 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
         target_port: Some(8081),
         backend: "auto".to_string(),
         moe_cache_ceil_mb: Some(3500),
+        cache_type_k: None,
+        cache_type_v: None,
     };
 
     // Serialize and deserialize round-trip

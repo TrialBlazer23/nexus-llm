@@ -1074,6 +1074,8 @@ async fn run_remote_load(
         target_port: None,
         backend: backend.to_string(),
         moe_cache_ceil_mb,
+        cache_type_k: None,
+        cache_type_v: None,
     };
 
     info!("Dispatching remote model load to {endpoint}: {req:?}");

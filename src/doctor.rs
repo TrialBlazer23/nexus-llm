@@ -159,13 +159,19 @@ fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
         .collect();
     let skipped_refs: Vec<&str> = skipped.iter().map(String::as_str).collect();
     // This process has no peer registry. Wi-Fi labels stay empty rather than inventing names.
-    doctor_appliance_lines(
+    let mut lines = doctor_appliance_lines(
         orchestrator.as_deref(),
         config.inference.appliance.floor_tok_s(),
         &usb,
         &[],
         &skipped_refs,
-    )
+    );
+    if let Ok(cache) =
+        crate::adb_links::AdbLinkCache::load(&crate::adb_links::AdbLinkCache::default_path())
+    {
+        lines.extend(crate::adb_links::duplicate_link_warnings(&cache));
+    }
+    lines
 }
 
 /// Authorized forwards, plus serials dropped by `max_devices`.

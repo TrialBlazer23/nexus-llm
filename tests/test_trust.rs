@@ -181,6 +181,8 @@ async fn control_plane_rejects_unsigned_load_when_pairing_enforced() {
             target_port: None,
             backend: "auto".to_string(),
             moe_cache_ceil_mb: None,
+            cache_type_k: None,
+            cache_type_v: None,
         },
     )
     .await
@@ -240,6 +242,8 @@ async fn pairing_grants_remote_load() {
         target_port: None,
         backend: "auto".to_string(),
         moe_cache_ceil_mb: None,
+        cache_type_k: None,
+        cache_type_v: None,
     };
     let load = dispatch_load_model_signed(&client, &base, &load_req, &client_trust.identity)
         .await

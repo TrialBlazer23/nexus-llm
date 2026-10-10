@@ -641,9 +641,40 @@ pub struct FrontDoorPlan {
     pub filename: String,
     pub model_path: PathBuf,
     pub tags: Vec<String>,
+    /// Context the fit ladder accepted. Not the operator request when a lower rung was required.
     pub context_size: usize,
-    /// True when the file only fits the 1024 / Q8 KV rung.
-    pub kv_q8: bool,
+    /// KV dtype the ladder accepted. `None` for a MoE stream plan, which has no llama cache flag.
+    pub kv_dtype: Option<KvCacheDtype>,
+}
+
+/// Copy the accepted rung onto a llama-server config. Cache flags are set only when the dtype is `Some`.
+pub fn apply_front_door_rung(
+    server: &mut crate::supervisor::LlamaServerConfig,
+    plan: &FrontDoorPlan,
+) {
+    server.context_size = plan.context_size;
+    if let Some(dtype) = plan.kv_dtype {
+        let arg = dtype.as_llama_arg().to_string();
+        server.cache_type_k = Some(arg.clone());
+        server.cache_type_v = Some(arg);
+    }
+}
+
+/// Dense ladder result for one file at `policy`. The closure in [`plan_front_door`] uses this.
+pub fn front_door_rung_for(
+    meta: &GgufMetadata,
+    profile: &SystemProfile,
+    policy: &MemoryPolicy,
+    floor: f32,
+) -> Option<(usize, KvCacheDtype)> {
+    plan_fit_ladder(
+        std::slice::from_ref(meta),
+        profile,
+        policy,
+        floor,
+        |_, _, _| floor,
+    )
+    .map(|choice| (choice.context_size, choice.kv_dtype))
 }
 
 /// Section 10.2 choice, including the path and the rung that fit.
@@ -673,16 +704,19 @@ pub fn plan_front_door(cfg: &NexusConfig) -> Option<FrontDoorPlan> {
         tags: Vec<String>,
         fits_pin_policy: bool,
         fits_1024_q8: bool,
+        /// Rung that accepted the file. Pin walk wins over the 1024 walk.
+        pin_rung: Option<(usize, Option<KvCacheDtype>)>,
+        low_rung: Option<(usize, Option<KvCacheDtype>)>,
     }
     let mut owned = Vec::new();
     for entry in &index.models {
         let Ok(meta) = GgufMetadata::open(&entry.path) else {
             continue;
         };
-        let fits = |policy: &MemoryPolicy| -> bool {
+        let accept = |policy: &MemoryPolicy| -> Option<(usize, Option<KvCacheDtype>)> {
             if meta.streamable_moe() {
                 let key = crate::cluster::moe_model_key(&meta);
-                return plan_moe_spawn(
+                let plan = plan_moe_spawn(
                     &meta,
                     &profile,
                     &cfg.inference.moe,
@@ -692,25 +726,23 @@ pub fn plan_front_door(cfg: &NexusConfig) -> Option<FrontDoorPlan> {
                     &key,
                     "local",
                     MoeCacheCap::None,
-                )
-                .is_some();
+                )?;
+                return Some((plan.context_size, None));
             }
-            plan_fit_ladder(
-                std::slice::from_ref(&meta),
-                &profile,
-                policy,
-                floor,
-                |_, _, _| floor,
-            )
-            .is_some()
+            let (context_size, kv_dtype) = front_door_rung_for(&meta, &profile, policy, floor)?;
+            Some((context_size, Some(kv_dtype)))
         };
+        let pin_rung = accept(&operator);
+        let low_rung = accept(&q8);
         owned.push(Owned {
             name: entry.filename.clone(),
             path: entry.path.clone(),
             weights_bytes: meta.weights_bytes().max(entry.size_bytes),
             tags: preset_tags_for_file(&entry.filename, entry.model_name.as_deref(), &presets),
-            fits_pin_policy: fits(&operator),
-            fits_1024_q8: fits(&q8),
+            fits_pin_policy: pin_rung.is_some(),
+            fits_1024_q8: low_rung.is_some(),
+            pin_rung,
+            low_rung,
         });
     }
     let views: Vec<FrontDoorFile<'_>> = owned
@@ -725,13 +757,14 @@ pub fn plan_front_door(cfg: &NexusConfig) -> Option<FrontDoorPlan> {
         .collect();
     let name = select_front_door(&cfg.inference.appliance.orchestrator, &views)?;
     let file = owned.iter().find(|file| file.name == name)?;
-    let pin_fit = file.fits_pin_policy;
+    // The boolean only selects the file. Spawn uses the rung that actually fit.
+    let (context_size, kv_dtype) = file.pin_rung.or(file.low_rung)?;
     Some(FrontDoorPlan {
         filename: file.name.clone(),
         model_path: file.path.clone(),
         tags: front_door_tags(&file.tags),
-        context_size: if pin_fit { 4096 } else { 1024 },
-        kv_q8: !pin_fit,
+        context_size,
+        kv_dtype,
     })
 }
 
@@ -1008,5 +1041,74 @@ mod tests {
         assert!(pantry_source_base(LinkClass::Wifi, "127.0.0.1", phone_control, port).is_err());
         let usb = pantry_source_base(LinkClass::Usb, "10.0.0.4", phone_control, port).unwrap();
         assert_eq!(usb, format!("http://127.0.0.1:{port}"));
+    }
+
+    #[test]
+    fn front_door_spawn_uses_the_2048_q8_rung() {
+        use crate::supervisor::LlamaServerConfig;
+        use std::collections::HashMap;
+
+        let meta = GgufMetadata {
+            version: 3,
+            tensor_count: 0,
+            kv_count: 0,
+            metadata: HashMap::new(),
+            architecture: Some("llama".into()),
+            model_name: Some("coder".into()),
+            context_length: Some(4096),
+            block_count: Some(28),
+            head_count: Some(12),
+            head_count_kv: Some(12),
+            embedding_length: Some(1536),
+            expert_count: None,
+            expert_used_count: None,
+            file_size_bytes: 950 * 1024 * 1024,
+            tensors: vec![],
+            quant_label: Some("Q4_K".into()),
+        };
+        let profile = SystemProfile {
+            total_ram_mb: 4_000,
+            available_ram_mb: 2_000,
+            detected_backend: AccelerationBackend::X86Baseline,
+            recommended_threads: 2,
+        };
+        let policy = MemoryPolicy {
+            max_ram_usage_percent: 75,
+            mmap: true,
+            mlock: false,
+            kv_dtype: KvCacheDtype::F16,
+            context_size: 4096,
+            batch_size: 512,
+        };
+        let (context_size, kv_dtype) =
+            front_door_rung_for(&meta, &profile, &policy, 3.0).expect("2048 q8 fits");
+        assert_eq!(context_size, 2048);
+        assert_eq!(kv_dtype, KvCacheDtype::Q8_0);
+        let plan = FrontDoorPlan {
+            filename: "coder.gguf".into(),
+            model_path: PathBuf::from("coder.gguf"),
+            tags: vec!["general".into()],
+            context_size,
+            kv_dtype: Some(kv_dtype),
+        };
+        let mut server = LlamaServerConfig::new(
+            Path::new("llama-server"),
+            &plan.model_path,
+            "127.0.0.1",
+            8081,
+        );
+        assert_eq!(server.context_size, 4096);
+        apply_front_door_rung(&mut server, &plan);
+        assert_eq!(server.context_size, 2048);
+        assert_eq!(server.cache_type_k.as_deref(), Some("q8_0"));
+        assert_eq!(server.cache_type_v.as_deref(), Some("q8_0"));
+        let args = server.build_args(0);
+        assert!(args.windows(2).any(|pair| pair == ["-c", "2048"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--cache-type-k", "q8_0"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--cache-type-v", "q8_0"]));
     }
 }

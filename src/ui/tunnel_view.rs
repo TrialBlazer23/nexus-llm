@@ -1,3 +1,4 @@
+use crate::adb_links::HostForward;
 use crate::tunnel::{AdbDeviceInfo, AdbTunnelSupervisor, TunnelStatus};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -12,6 +13,7 @@ pub struct TunnelView {
     pub api_port: u16,
     pub rpc_port: u16,
     pub devices: Vec<AdbDeviceInfo>,
+    pub forwards: Vec<HostForward>,
     pub status: Option<TunnelStatus>,
     pub status_message: Option<(String, Color)>,
     /// `PeerNode::label` by ADB serial. The `model:` token is not stored here.
@@ -25,6 +27,7 @@ impl TunnelView {
             api_port,
             rpc_port,
             devices,
+            forwards: Vec::new(),
             status: None,
             status_message: None,
             nexus_labels: HashMap::new(),
@@ -56,26 +59,36 @@ impl TunnelView {
         self.devices = AdbTunnelSupervisor::list_devices().unwrap_or_default();
     }
 
-    pub fn setup_tunnel(&mut self) {
-        match AdbTunnelSupervisor::setup_tunnel(self.api_port, self.rpc_port, None) {
-            Ok(status) => {
-                self.status = Some(status);
-                self.status_message = Some((
-                    format!(
-                        "Tunnels active: Forward {} -> {}, Reverse {} -> {}",
-                        self.api_port, self.api_port, self.rpc_port, self.rpc_port
-                    ),
-                    Color::Green,
-                ));
-            }
-            Err(e) => {
-                self.status_message = Some((format!("Failed to setup tunnel: {}", e), Color::Red));
-            }
+    /// Record the host forwards from the all-serial probe. Each row uses that serial's host port.
+    pub fn apply_forwards(&mut self, forwards: Vec<HostForward>) {
+        let count = forwards.len();
+        self.forwards = forwards;
+        if self.forwards.is_empty() {
+            self.status = None;
+            self.status_message = Some((
+                "No USB peer answered the control probe".to_string(),
+                Color::Yellow,
+            ));
+            return;
         }
+        let host_api = self.forwards[0].host_api;
+        self.status = Some(TunnelStatus {
+            is_active: true,
+            api_forwarded: true,
+            rpc_reversed: false,
+            api_port: host_api,
+            rpc_port: self.rpc_port,
+            device: None,
+        });
+        self.status_message = Some((
+            format!("Tunnels active for {count} serial(s)"),
+            Color::Green,
+        ));
     }
 
     pub fn teardown_tunnel(&mut self) {
         let _ = AdbTunnelSupervisor::teardown_tunnel(self.api_port, self.rpc_port);
+        self.forwards.clear();
         self.status = None;
         self.status_message = Some(("Tunnels removed successfully".to_string(), Color::Yellow));
     }
@@ -144,31 +157,40 @@ impl TunnelView {
         );
         frame.render_widget(dev_block, chunks[0]);
 
-        // 2. Port Mappings & Tunnel Status block
-        let (api_fwd_str, api_color) = if self.status.as_ref().is_some_and(|s| s.api_forwarded) {
-            ("ACTIVE: 127.0.0.1:8080 -> Target Phone 8080", Color::Green)
+        // 2. Port Mappings & Tunnel Status block. Host ports come from the probe, per serial.
+        let mut mapping_lines = Vec::new();
+        if self.forwards.is_empty() {
+            mapping_lines.push(Line::from(vec![
+                Span::styled(
+                    " API REST / SSE Forward: ",
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::styled(
+                    "INACTIVE (Press 'F' to activate)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         } else {
-            ("INACTIVE (Press 'F' to activate)", Color::DarkGray)
-        };
-
-        let (rpc_rev_str, rpc_color) = if self.status.as_ref().is_some_and(|s| s.rpc_reversed) {
-            (
-                "ACTIVE: Target Phone 50052 -> 127.0.0.1:50052",
-                Color::Green,
-            )
-        } else {
-            ("INACTIVE (Press 'F' to activate)", Color::DarkGray)
-        };
-
-        let mapping_lines = vec![
-            Line::from(vec![
-                Span::styled(" API REST / SSE Forward: ", Style::default().fg(Color::LightBlue)),
-                Span::styled(api_fwd_str, Style::default().fg(api_color).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" RPC Layer Reverse:      ", Style::default().fg(Color::LightBlue)),
-                Span::styled(rpc_rev_str, Style::default().fg(rpc_color).add_modifier(Modifier::BOLD)),
-            ]),
+            for line in forward_mapping_lines(&self.forwards) {
+                mapping_lines.push(Line::from(Span::styled(
+                    format!(" API  {line}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+        mapping_lines.push(Line::from(vec![
+            Span::styled(
+                " RPC Layer Reverse:      ",
+                Style::default().fg(Color::LightBlue),
+            ),
+            Span::styled(
+                "per serial, not required for a burst peer",
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+        mapping_lines.extend(vec![
             Line::from(vec![
                 Span::styled("\n Transport Characteristics:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]),
@@ -178,7 +200,7 @@ impl TunnelView {
             Line::from(vec![
                 Span::styled("   • High-bandwidth tensor transfer for RPC layer offloading between Node A and Node B", Style::default().fg(Color::Gray)),
             ]),
-        ];
+        ]);
 
         let map_block = Paragraph::new(mapping_lines).block(
             Block::default()
@@ -196,7 +218,7 @@ impl TunnelView {
             )
         } else {
             Span::styled(
-                " [F] Setup All Tunnels  |  [T] Teardown Tunnels  |  [R] Rescan Devices",
+                " [F/S] Setup All Tunnels  |  [T] Teardown Tunnels  |  [R] Rescan Devices",
                 Style::default().fg(Color::White),
             )
         };
@@ -209,6 +231,14 @@ impl TunnelView {
         );
         frame.render_widget(footer_block, chunks[2]);
     }
+}
+
+/// One mapping row per serial. The host port is the allocated forward, not a shared 8080.
+pub fn forward_mapping_lines(forwards: &[HostForward]) -> Vec<String> {
+    forwards
+        .iter()
+        .map(|forward| format!("{}  127.0.0.1:{}", forward.serial, forward.host_api))
+        .collect()
 }
 
 /// One Tunnel-tab row. The ADB model is only the parenthetical subtitle.
@@ -243,5 +273,25 @@ mod tests {
         assert_eq!(denied, "serial-c  unauthorized");
         let named = tunnel_row_line("serial-b", true, Some("Bar"), Some("node-bbbbbbbb"));
         assert_eq!(named, "serial-b  node-bbbbbbbb  (Bar)");
+    }
+
+    #[test]
+    fn mapping_lines_use_each_serial_host_port() {
+        use crate::adb_links::HostForward;
+        let lines = super::forward_mapping_lines(&[
+            HostForward {
+                serial: "serial-a".into(),
+                host_api: 18080,
+                host_control: 18081,
+            },
+            HostForward {
+                serial: "serial-b".into(),
+                host_api: 18082,
+                host_control: 18083,
+            },
+        ]);
+        assert_eq!(lines[0], "serial-a  127.0.0.1:18080");
+        assert_eq!(lines[1], "serial-b  127.0.0.1:18082");
+        assert!(lines.iter().all(|line| !line.contains("127.0.0.1:8080")));
     }
 }

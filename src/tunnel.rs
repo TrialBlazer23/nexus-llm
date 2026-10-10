@@ -414,6 +414,27 @@ fn load_link_cache() -> AdbLinkCache {
 }
 
 /// Spawn `adb`. A non-zero exit is `Ok(false)` plus a warning. A missing binary is `AdbNotFound`.
+pub fn run_adb_command(args: &[String]) -> Result<bool, TunnelError> {
+    run_adb(args)
+}
+
+/// `adb forward --list` stdout. `AdbNotFound` means the caller must not clear Wi-Fi peers.
+pub fn read_forward_list() -> Result<String, TunnelError> {
+    let output = match Command::new("adb").args(["forward", "--list"]).output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TunnelError::AdbNotFound);
+        }
+        Err(err) => return Err(TunnelError::Io(err)),
+    };
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(TunnelError::CommandFailed(err.trim().to_string()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Spawn `adb`. A non-zero exit is `Ok(false)` plus a warning. A missing binary is `AdbNotFound`.
 fn run_adb(args: &[String]) -> Result<bool, TunnelError> {
     let output = match Command::new("adb").args(args).output() {
         Ok(output) => output,

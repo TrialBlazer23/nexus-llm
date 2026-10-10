@@ -45,6 +45,9 @@ pub struct ControlPlaneState {
     /// Older peers omit this field; missing JSON is [`PowerSource::Unknown`].
     #[serde(default)]
     pub power_source: PowerSource,
+    /// Operator name. Older peers omit it; missing JSON is empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +204,7 @@ pub async fn build_control_plane_state_with_host(
         signing_public_key,
         battery_percent: power.battery_percent,
         power_source: power.power_source,
+        display_name: String::new(),
     }
 }
 
@@ -464,6 +468,12 @@ pub struct ModelLoadRequest {
     /// Client-planned MoE expert cache ceiling (MiB); peer re-plans under stream LMK.
     #[serde(default)]
     pub moe_cache_ceil_mb: Option<u64>,
+    /// Ladder KV dtype (`q8_0`, `f16`). Omitted by older clients; both caches use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_k: Option<String>,
+    /// Same dtype as `cache_type_k`. Kept separate so the peer can pass llama-server flags through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_type_v: Option<String>,
 }
 
 fn default_backend_auto() -> String {
@@ -1204,8 +1214,8 @@ pub async fn handle_load_model_with_moe(
         use_mlock: false,
         cpu_threads_batch: request.threads,
         fallback_to_cpu: true,
-        cache_type_k: None,
-        cache_type_v: None,
+        cache_type_k: request.cache_type_k.clone(),
+        cache_type_v: request.cache_type_v.clone(),
         memory_budget_percent,
         tags: request.tags.clone(),
         slot_save_path: std::env::var("NEXUS_SLOT_CACHE_DIR")

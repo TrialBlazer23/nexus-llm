@@ -1318,7 +1318,9 @@ pub fn route_notice_line(header: &str, tok_s: f32) -> Option<String> {
         _ => link_status_word(LinkClass::Local),
     };
     let tag = route.split(';').next().unwrap_or(route.as_str()).trim();
-    let extra = if link_token == "usb" || link_token == "wifi" {
+    let extra = if route.to_ascii_lowercase().contains("no interactive peer") {
+        Some("no interactive peer".to_string())
+    } else if link_token == "usb" || link_token == "wifi" {
         Some(format!("escalated, route={tag}"))
     } else {
         None
@@ -1386,6 +1388,24 @@ mod tests {
             crate::appliance::format_route_header("macbook", "local", "general-1.7b", "general");
         let stay = route_notice_line(&local, 6.2).expect("local route");
         assert_eq!(stay, "macbook · general-1.7b · local · 6 tok/s");
+
+        let stayed = crate::appliance::format_route_header(
+            "macbook",
+            "local",
+            "general-1.7b",
+            "coder; reason=no interactive peer",
+        );
+        let local_miss = route_notice_line(&stayed, 6.2).expect("local fallback");
+        assert_eq!(
+            local_miss,
+            "macbook · general-1.7b · local · 6 tok/s · no interactive peer"
+        );
+        let notice = ChatEntry::status(local_miss);
+        assert!(notice.message.is_status());
+        let cleaned =
+            ChatApp::clean_conversation_messages(&[ChatEntry::user("write code"), notice], None);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].content, "write code");
     }
 
     #[test]

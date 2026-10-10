@@ -136,8 +136,51 @@ impl BmoeSessionConfig {
         memory_budget_percent: u8,
         tags: Vec<String>,
     ) -> Self {
-        let cache_ceil_mb =
-            moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent);
+        Self::from_profile_with_ceil(
+            binary,
+            model,
+            host,
+            port,
+            context_size,
+            threads,
+            moe,
+            profile,
+            memory_budget_percent,
+            tags,
+            None,
+        )
+    }
+
+    /// Like [`from_profile`], but applies a planned cache ceiling (and matches `--cache-mb`).
+    ///
+    /// When `cache_ceil_override` is `Some(ceil)` with `ceil >= 2000`, both `--cache-ceil-mb`
+    /// and `--cache-mb` are set to that integer so LMK and BigMoe agree. `Some(0)` forces
+    /// cache off. `None` keeps `MoeConfig::derive_cache_ceil_mb` + configured `cache_mb`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_profile_with_ceil(
+        binary: impl Into<PathBuf>,
+        model: impl Into<PathBuf>,
+        host: impl Into<String>,
+        port: u16,
+        context_size: usize,
+        threads: usize,
+        mut moe: MoeConfig,
+        profile: &SystemProfile,
+        memory_budget_percent: u8,
+        tags: Vec<String>,
+        cache_ceil_override: Option<u64>,
+    ) -> Self {
+        let cache_ceil_mb = match cache_ceil_override {
+            Some(ceil) => {
+                if ceil >= 2000 {
+                    moe.cache_mb = ceil.to_string();
+                } else if ceil == 0 {
+                    moe.cache_mb = "0".into();
+                }
+                ceil
+            }
+            None => moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent),
+        };
         Self {
             binary_path: binary.into(),
             model_path: model.into(),
@@ -911,6 +954,35 @@ mod tests {
         assert!(args.contains(&"3500".into()));
         assert!(!args.iter().any(|a| a == "--drop-cold-experts"));
         assert!(!args.iter().any(|a| a == "--route-ahead"));
+    }
+
+    #[test]
+    fn from_profile_with_ceil_forces_cache_mb() {
+        let profile = SystemProfile {
+            total_ram_mb: 12_000,
+            available_ram_mb: 10_000,
+            detected_backend: crate::sysinfo::AccelerationBackend::ArmCpuDotProd,
+            recommended_threads: 4,
+        };
+        let cfg = BmoeSessionConfig::from_profile_with_ceil(
+            "bmoe-cli",
+            "/models/qwen.gguf",
+            "127.0.0.1",
+            8080,
+            2048,
+            4,
+            MoeConfig::default(),
+            &profile,
+            75,
+            Vec::new(),
+            Some(2800),
+        );
+        assert_eq!(cfg.cache_ceil_mb, 2800);
+        assert_eq!(cfg.moe.cache_mb, "2800");
+        let args = cfg.build_args();
+        assert!(args.contains(&"--cache-mb".into()));
+        assert!(args.contains(&"2800".into()));
+        assert!(args.contains(&"--cache-ceil-mb".into()));
     }
 
     #[test]

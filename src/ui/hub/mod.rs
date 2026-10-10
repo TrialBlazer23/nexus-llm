@@ -115,6 +115,8 @@ pub enum TargetExecutionNode {
         allocatable_mb: u64,
         cache_mb: u64,
         ceil_mb: u64,
+        /// Planned context size from the joint MoE knob planner.
+        context_size: usize,
         predicted_label: String,
     },
     Remote {
@@ -164,11 +166,12 @@ impl TargetExecutionNode {
                 allocatable_mb,
                 cache_mb,
                 ceil_mb,
+                context_size,
                 predicted_label,
             } => {
                 format!(
-                    "💾 Local MoE stream (cache {} / ceil {} MB) - {} MB LMK | {}",
-                    cache_mb, ceil_mb, allocatable_mb, predicted_label
+                    "💾 Local MoE stream (ctx {} | cache {} / ceil {} MB) - {} MB LMK | {}",
+                    context_size, cache_mb, ceil_mb, allocatable_mb, predicted_label
                 )
             }
             Self::Distributed {
@@ -215,6 +218,8 @@ pub struct HotSwapIntent {
     pub gpu_layers: Option<u32>,
     pub context_size: usize,
     pub extra_args: Vec<String>,
+    /// Planned BigMoe cache ceiling when loading via MoE stream (`None` = derive).
+    pub moe_cache_ceil_mb: Option<u64>,
 }
 
 /// State for Hugging Face quant selection modal (Phase 3).
@@ -482,8 +487,9 @@ impl HubApp {
             supervisor: self.supervisor.clone(),
             identity: self.identity.clone(),
         };
+        let desired_context = self.models_view.selected_context;
         self.pending_target_selection =
-            Some(commands::build_target_selection(&ctx, model_path).await);
+            Some(commands::build_target_selection(&ctx, model_path, desired_context).await);
     }
 
     /// Unload the active model (tests + direct callers). Event-loop path uses HubCommand::Unload.
@@ -1799,7 +1805,10 @@ impl HubApp {
                 self.chat.handle_slash_command(&cmd);
             }
             PaletteAction::SelectModel(path) => {
-                let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection { model_path: path });
+                let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection {
+                    model_path: path,
+                    desired_context: self.models_view.selected_context,
+                });
             }
             PaletteAction::ConnectPeer(label, ep) => {
                 self.chat.client = NexusClient::new(ep.clone());
@@ -2646,19 +2655,25 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     }
                                                 }
                                             }
-                                            TargetExecutionNode::LocalMoeStream { ceil_mb, .. } => {
+                                            TargetExecutionNode::LocalMoeStream {
+                                                ceil_mb,
+                                                context_size: moe_ctx,
+                                                ..
+                                            } => {
                                                 hub.chat.set_target_hardware(
                                                     "Local Host",
                                                     format!(
-                                                        "Local MoE flash-stream (ceil {} MB)",
-                                                        ceil_mb
+                                                        "Local MoE flash-stream (ctx {} | ceil {} MB)",
+                                                        moe_ctx, ceil_mb
                                                     ),
                                                 );
-                                                match request_load_or_hot_swap(
+                                                match request_load_or_hot_swap_with_args(
                                                     &hub.supervisor,
                                                     state.model_path.clone(),
                                                     Some(0),
-                                                    ctx_size,
+                                                    *moe_ctx,
+                                                    Vec::new(),
+                                                    Some(*ceil_mb),
                                                 )
                                                 .await
                                                 {
@@ -2711,6 +2726,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     Some(*gpu_layers),
                                                     ctx_size,
                                                     extra_args.clone(),
+                                                    None,
                                                 )
                                                 .await
                                                 {
@@ -2752,7 +2768,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                             path: intent.path,
                                             gpu_layers: intent.gpu_layers,
                                             context_size: intent.context_size,
-                                            extra_args: Vec::new(),
+                                            extra_args: intent.extra_args,
+                                            moe_cache_ceil_mb: intent.moe_cache_ceil_mb,
                                         });
                                     }
                                 }
@@ -2768,7 +2785,8 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     path: intent.path,
                                     gpu_layers: intent.gpu_layers,
                                     context_size: intent.context_size,
-                                    extra_args: Vec::new(),
+                                    extra_args: intent.extra_args,
+                                    moe_cache_ceil_mb: intent.moe_cache_ceil_mb,
                                 });
                             }
                         } else if matches!(key.code, KeyCode::Char('N')) {
@@ -2908,7 +2926,10 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                             HubAction::ModelsEnter => {
                                 if let Some(m) = hub.models_view.selected_model() {
                                     let path = m.path.clone();
-                                    let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection { model_path: path });
+                                    let _ = cmd_tx.try_send(HubCommand::OpenTargetSelection {
+                                        model_path: path,
+                                        desired_context: hub.models_view.selected_context,
+                                    });
                                 } else {
                                     hub.status_message = Some((
                                         "Model not local — press [T] to pull from a peer first".into(),

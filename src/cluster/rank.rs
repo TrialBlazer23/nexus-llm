@@ -1,6 +1,6 @@
 //! Link-quality probing and predicted-throughput ranking (Phase 11 §3.6 / §3.8).
 
-use crate::bench::{BenchStore, BACKEND_MOE_STREAM};
+use crate::bench::BenchStore;
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use std::time::{Duration, Instant};
@@ -221,54 +221,52 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
 
     // --- Local MoE flash-stream (prefer over dense RPC for streamable MoE) ---
     if req.moe_stream_enabled && req.gguf.streamable_moe() {
-        let ceil = if req.moe_cache_ceil_mb > 0 {
+        let default_ceil = if req.moe_cache_ceil_mb > 0 {
             req.moe_cache_ceil_mb
         } else {
             ((local_budget_mb.saturating_mul(45)) / 100)
                 .max(2000)
                 .min(local_budget_mb)
         };
-        let cache_mb = if ceil >= 2000 { ceil } else { 0 };
-        let stream_ok = req.local_profile.can_safely_moe_stream_pct(
+        // Only advertise MoE stream when dense local would fail LMK at the desired ctx.
+        let dense_fits = req.local_profile.can_safely_load_gguf_pct(
             req.gguf,
             req.policy.context_size,
-            cache_mb.max(2000),
             req.policy.max_ram_usage_percent,
         );
-        if stream_ok {
-            let dense_fits = req.local_profile.can_safely_load_gguf_pct(
+        if !dense_fits {
+            if let Some(knobs) = super::plan_moe_stream_knobs(
                 req.gguf,
-                req.policy.context_size,
+                &req.local_profile,
                 req.policy.max_ram_usage_percent,
-            );
-            // Only advertise MoE stream when dense local would fail LMK.
-            if !dense_fits {
-                let mut mem =
-                    MemoryPlan::from_gguf(req.gguf, &req.local_profile, &req.policy, false);
+                req.policy.context_size,
+                default_ceil,
+                req.bench,
+                &model_key,
+                &req.local_name,
+            ) {
+                let mut policy = req.policy.clone();
+                policy.context_size = knobs.context_size;
+                let mut mem = MemoryPlan::from_gguf(req.gguf, &req.local_profile, &policy, false);
                 mem.remediations.insert(
                     0,
                     super::memory::Remediation::EnableMoeStream {
-                        cache_ceil_mb: ceil,
+                        cache_ceil_mb: knobs.cache_ceil_mb,
                     },
                 );
-                // Prefer measured BMOE_DONE tok/s; cold-start fallback ~1–3 tok/s class.
-                let tok = measured_moe_tok_s(
-                    req.bench,
-                    &model_key,
-                    &req.local_name,
-                    req.policy.context_size,
-                )
-                .unwrap_or(2.2);
                 plans.push(ExecutionPlan {
                     target: PlanTarget::LocalMoeStream {
-                        cache_mb,
-                        ceil_mb: ceil,
+                        cache_mb: knobs.cache_mb,
+                        ceil_mb: knobs.cache_ceil_mb,
                     },
                     memory: mem,
                     split: None,
-                    context_size: req.policy.context_size,
-                    predicted_tok_s: tok,
-                    link_notes: vec![format!("moe-stream cache-ceil={ceil}MB")],
+                    context_size: knobs.context_size,
+                    predicted_tok_s: knobs.predicted_tok_s,
+                    link_notes: vec![format!(
+                        "moe-stream ctx={} cache-ceil={}MB",
+                        knobs.context_size, knobs.cache_ceil_mb
+                    )],
                     llama_extra_args: vec![],
                     gpu_layers: 0,
                 });
@@ -459,22 +457,6 @@ fn measured_tok_s(
     store
         .lookup_gen_tok_s(model_id, node_id, backend, context_size)
         .or_else(|| store.lookup_gen_tok_s_any_node(model_id, backend, context_size))
-}
-
-/// Measured BigMoe flash-stream throughput (`BACKEND_MOE_STREAM` key).
-fn measured_moe_tok_s(
-    bench: Option<&BenchStore>,
-    model_id: &str,
-    node_id: &str,
-    context_size: usize,
-) -> Option<f32> {
-    let store = bench?;
-    store
-        .lookup_gen_tok_s_by_key(model_id, node_id, BACKEND_MOE_STREAM, context_size)
-        .or_else(|| {
-            store.lookup_gen_tok_s_any_node_by_key(model_id, BACKEND_MOE_STREAM, context_size)
-        })
-        .filter(|v| *v > 0.0)
 }
 
 fn predict_local_tok_s(

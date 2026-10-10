@@ -284,4 +284,8 @@ fn local_moe_stream_uses_measured_bench_tok_s() {
         "expected measured 3.5, got {}",
         moe.predicted_tok_s
     );
+    assert_eq!(
+        moe.context_size, 2048,
+        "ExecutionPlan.context_size must match knob winner"
+    );
 }

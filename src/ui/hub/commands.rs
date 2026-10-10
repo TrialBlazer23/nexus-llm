@@ -31,6 +31,8 @@ pub enum HubCommand {
     /// Open target-selection modal (probe peers off the UI thread).
     OpenTargetSelection {
         model_path: PathBuf,
+        /// Operator-selected context used as the MoE knob planner's desired ctx.
+        desired_context: usize,
     },
     /// Load locally with optional GPU-layer override (0 = CPU safe mode).
     LoadModelLocal {
@@ -39,6 +41,8 @@ pub enum HubCommand {
         context_size: usize,
         /// Precomputed llama-server extras (e.g. ranked distributed `--rpc` args).
         extra_args: Vec<String>,
+        /// Planned BigMoe cache ceiling (`None` = derive / re-plan at load).
+        moe_cache_ceil_mb: Option<u64>,
     },
     /// Dispatch remote load via signed/unsigned control plane.
     LoadModelRemote {
@@ -200,8 +204,11 @@ pub fn spawn_hub_worker(
         let mut active_download_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                HubCommand::OpenTargetSelection { model_path } => {
-                    let state = build_target_selection(&ctx, model_path).await;
+                HubCommand::OpenTargetSelection {
+                    model_path,
+                    desired_context,
+                } => {
+                    let state = build_target_selection(&ctx, model_path, desired_context).await;
                     let _ = evt_tx.send(HubEvent::TargetSelectionReady(state)).await;
                 }
                 HubCommand::LoadModelLocal {
@@ -209,8 +216,18 @@ pub fn spawn_hub_worker(
                     gpu_layers,
                     context_size,
                     extra_args,
+                    moe_cache_ceil_mb,
                 } => {
-                    run_local_load(&ctx, &evt_tx, path, gpu_layers, context_size, extra_args).await;
+                    run_local_load(
+                        &ctx,
+                        &evt_tx,
+                        path,
+                        gpu_layers,
+                        context_size,
+                        extra_args,
+                        moe_cache_ceil_mb,
+                    )
+                    .await;
                 }
                 HubCommand::LoadModelRemote {
                     endpoint,
@@ -817,6 +834,7 @@ async fn run_refresh_catalog(ctx: &HubWorkerCtx, evt_tx: &mpsc::Sender<HubEvent>
 pub(crate) async fn build_target_selection(
     ctx: &HubWorkerCtx,
     model_path: PathBuf,
+    desired_context: usize,
 ) -> TargetSelectionState {
     use crate::cluster::{
         rank_execution_plans, LinkQuality, MemoryPolicy, NodeBudget, PlacementCandidate,
@@ -839,7 +857,7 @@ pub(crate) async fn build_target_selection(
     } else {
         99
     };
-    let ctx_size = 4096usize; // refined by selected_context at confirm time
+    let ctx_size = desired_context.max(512);
 
     let mut placement_candidates = Vec::new();
     let peers = ctx.discovery.get_active_peers().await;
@@ -918,6 +936,7 @@ pub(crate) async fn build_target_selection(
                             allocatable_mb: local_cap_mb,
                             cache_mb,
                             ceil_mb,
+                            context_size: plan.context_size,
                             predicted_label: label,
                         });
                     }
@@ -1112,6 +1131,7 @@ async fn run_local_load(
     custom_gpu_layers: Option<u32>,
     context_size: usize,
     precomputed_extra_args: Vec<String>,
+    moe_cache_ceil_mb: Option<u64>,
 ) {
     let _ = evt_tx
         .send(HubEvent::ModelLoadProgress {
@@ -1160,17 +1180,25 @@ async fn run_local_load(
                     phase: "Selecting BigMoe flash-stream backend (local MoE)…".to_string(),
                 })
                 .await;
-            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
+            let (spawn_ctx, ceil_override) = resolve_moe_spawn_knobs(
+                &gguf,
+                &profile,
+                &ctx.config,
+                context_size,
+                moe_cache_ceil_mb,
+            );
+            let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
                 PathBuf::from(&ctx.config.inference.moe.bmoe_binary),
                 model_path.clone(),
                 ctx.config.network.api_host.clone(),
                 ctx.config.network.api_port,
-                context_size,
+                spawn_ctx,
                 threads,
                 ctx.config.inference.moe.clone(),
                 &profile,
                 ctx.config.hardware.safety.max_ram_usage_percent,
                 Vec::new(),
+                ceil_override,
             );
             let _ = evt_tx
                 .send(HubEvent::ModelLoadProgress {
@@ -1415,7 +1443,8 @@ pub async fn request_load_or_hot_swap(
     gpu_layers: Option<u32>,
     context_size: usize,
 ) -> Result<HubCommand, HotSwapIntent> {
-    request_load_or_hot_swap_with_args(supervisor, path, gpu_layers, context_size, Vec::new()).await
+    request_load_or_hot_swap_with_args(supervisor, path, gpu_layers, context_size, Vec::new(), None)
+        .await
 }
 
 pub async fn request_load_or_hot_swap_with_args(
@@ -1424,6 +1453,7 @@ pub async fn request_load_or_hot_swap_with_args(
     gpu_layers: Option<u32>,
     context_size: usize,
     extra_args: Vec<String>,
+    moe_cache_ceil_mb: Option<u64>,
 ) -> Result<HubCommand, HotSwapIntent> {
     if supervisor.is_running().await {
         Err(HotSwapIntent {
@@ -1431,6 +1461,7 @@ pub async fn request_load_or_hot_swap_with_args(
             gpu_layers,
             context_size,
             extra_args,
+            moe_cache_ceil_mb,
         })
     } else {
         Ok(HubCommand::LoadModelLocal {
@@ -1438,7 +1469,45 @@ pub async fn request_load_or_hot_swap_with_args(
             gpu_layers,
             context_size,
             extra_args,
+            moe_cache_ceil_mb,
         })
+    }
+}
+
+/// Resolve MoE spawn knobs: honor an explicit planned ceil, else re-run the joint planner.
+fn resolve_moe_spawn_knobs(
+    gguf: &crate::gguf::GgufMetadata,
+    profile: &SystemProfile,
+    config: &NexusConfig,
+    desired_ctx: usize,
+    moe_cache_ceil_mb: Option<u64>,
+) -> (usize, Option<u64>) {
+    if let Some(ceil) = moe_cache_ceil_mb {
+        return (desired_ctx, Some(ceil));
+    }
+    let default_ceil = config.inference.moe.derive_cache_ceil_mb(
+        profile.available_ram_mb,
+        config.hardware.safety.max_ram_usage_percent,
+    );
+    let model_key = gguf
+        .model_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| gguf.quant_label.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let bench = crate::bench::BenchStore::load_default().ok();
+    match crate::cluster::plan_moe_stream_knobs(
+        gguf,
+        profile,
+        config.hardware.safety.max_ram_usage_percent,
+        desired_ctx,
+        default_ceil,
+        bench.as_ref(),
+        &model_key,
+        "local",
+    ) {
+        Some(knobs) => (knobs.context_size, Some(knobs.cache_ceil_mb)),
+        None => (desired_ctx, None),
     }
 }
 

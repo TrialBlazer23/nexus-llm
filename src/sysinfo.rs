@@ -387,8 +387,9 @@ fn status_is_ac(status: &str) -> bool {
 ///
 /// The first type equal to `Battery` (ASCII case-insensitive) supplies the
 /// percent. A non-integer capacity is `None` and does not fail the parse.
-/// A discharging battery is [`PowerSource::Battery`] even when another supply
-/// reports `Charging`, `Full`, or `Not charging`. No entries, and supplies
+/// Any entry whose status is `Charging`, `Full`, or `Not charging` is
+/// [`PowerSource::Ac`], even when the battery is `Discharging`. Otherwise a
+/// discharging battery is [`PowerSource::Battery`]. No entries, and supplies
 /// with no battery, are [`PowerSource::Ac`] with a null percent.
 pub fn parse_power_supply(entries: &[(&str, &str, &str)]) -> PowerReading {
     if entries.is_empty() {
@@ -404,10 +405,11 @@ pub fn parse_power_supply(entries: &[(&str, &str, &str)]) -> PowerReading {
     let battery_percent = battery.and_then(|(_, capacity, _)| capacity.trim().parse::<u8>().ok());
     let battery_status = battery.map(|(_, _, status)| status.trim()).unwrap_or("");
 
-    let power_source = if battery_status == "Discharging" {
-        PowerSource::Battery
-    } else if entries.iter().any(|(_, _, status)| status_is_ac(status)) {
+    // AC status on any supply wins over a discharging battery.
+    let power_source = if entries.iter().any(|(_, _, status)| status_is_ac(status)) {
         PowerSource::Ac
+    } else if battery_status == "Discharging" {
+        PowerSource::Battery
     } else if battery.is_some() {
         PowerSource::Unknown
     } else {
@@ -567,6 +569,15 @@ mod tests {
     fn battery_parse_prefers_battery_type() {
         use crate::sysinfo::{parse_power_supply, PowerSource};
         let entries = [("Mains", "", "Charging"), ("Battery", "40", "Discharging")];
+        let reading = parse_power_supply(&entries);
+        assert_eq!(reading.battery_percent, Some(40));
+        assert_eq!(reading.power_source, PowerSource::Ac);
+    }
+
+    #[test]
+    fn battery_when_only_supply_is_discharging() {
+        use crate::sysinfo::{parse_power_supply, PowerSource};
+        let entries = [("Battery", "40", "Discharging")];
         let reading = parse_power_supply(&entries);
         assert_eq!(reading.battery_percent, Some(40));
         assert_eq!(reading.power_source, PowerSource::Battery);

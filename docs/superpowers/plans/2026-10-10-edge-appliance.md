@@ -157,13 +157,16 @@ git commit -m "feat(config): add appliance and adb link settings"
 #[test]
 fn battery_parse_prefers_battery_type() {
     use crate::sysinfo::{parse_power_supply, PowerSource};
-    let entries = [
+    // External power wins over a discharging battery entry.
+    let plugged = [
         ("Mains", "", "Charging"),
         ("Battery", "40", "Discharging"),
     ];
-    let reading = parse_power_supply(&entries);
+    let reading = parse_power_supply(&plugged);
     assert_eq!(reading.battery_percent, Some(40));
-    assert_eq!(reading.power_source, PowerSource::Battery);
+    assert_eq!(reading.power_source, PowerSource::Ac);
+    let unplugged = [("Battery", "40", "Discharging")];
+    assert_eq!(parse_power_supply(&unplugged).power_source, PowerSource::Battery);
 }
 
 #[test]

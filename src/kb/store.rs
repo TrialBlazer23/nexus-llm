@@ -103,7 +103,8 @@ impl KnowledgeStore {
     pub fn hash_content(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let digest = hasher.finalize();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     // --- Document Chunks ---

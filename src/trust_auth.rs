@@ -98,7 +98,7 @@ pub fn canonical_signing_message(
     nonce: &str,
     signer_id: Uuid,
 ) -> String {
-    let body_hash = hex_encode(&Sha256::digest(body));
+    let body_hash = hex_encode(Sha256::digest(body).as_ref());
     format!(
         "{CONTROL_AUTH_VERSION}\n{method}\n{path}\n{body_hash}\n{timestamp}\n{nonce}\n{signer_id}"
     )

@@ -521,7 +521,7 @@ impl ModelDownloader {
             }
         }
 
-        let actual_hash = format!("{:x}", hasher.finalize());
+        let actual_hash = hex_digest(hasher.finalize());
         if let Some(expected_hash) = expected {
             if actual_hash != expected_hash {
                 let _ = tokio::fs::remove_file(part_path).await;
@@ -553,8 +553,16 @@ impl ModelDownloader {
             }
             hasher.update(&buffer[..n]);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(hex_digest(hasher.finalize()))
     }
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Returns true if the URL points to a Hugging Face domain (*.huggingface.co or *.hf.co).
@@ -739,7 +747,7 @@ mod tests {
         let data = b"the quick brown fox jumps over the lazy dog";
         let mut hasher = Sha256::new();
         hasher.update(data);
-        let incremental = format!("{:x}", hasher.finalize());
+        let incremental = hex_digest(hasher.finalize());
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("f.bin");
         std::fs::write(&path, data).unwrap();

@@ -449,6 +449,9 @@ pub struct ModelLoadRequest {
     /// Force inference backend: `"auto"` (default), `"llama"`, or `"bmoe"`.
     #[serde(default = "default_backend_auto")]
     pub backend: String,
+    /// Client-planned MoE expert cache ceiling (MiB); peer re-plans under stream LMK.
+    #[serde(default)]
+    pub moe_cache_ceil_mb: Option<u64>,
 }
 
 fn default_backend_auto() -> String {
@@ -1083,17 +1086,77 @@ pub async fn handle_load_model_with_moe(
     };
 
     if want_bmoe {
-        let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile(
+        if !request.rpc_workers.is_empty() {
+            return ModelLoadResponse {
+                protocol_version: CONTROL_PLANE_VERSION,
+                success: false,
+                active_model: String::new(),
+                api_endpoint: String::new(),
+                error_message: Some(
+                    "MoE flash-stream cannot be combined with RPC layer offload".into(),
+                ),
+            };
+        }
+        let meta = match gguf.as_ref() {
+            Some(m) if m.streamable_moe() => m,
+            _ => {
+                return ModelLoadResponse {
+                    protocol_version: CONTROL_PLANE_VERSION,
+                    success: false,
+                    active_model: String::new(),
+                    api_endpoint: String::new(),
+                    error_message: Some("bmoe load requires a streamable MoE GGUF".into()),
+                };
+            }
+        };
+        let model_key = meta
+            .model_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| meta.quant_label.clone())
+            .unwrap_or_else(|| model_name.clone());
+        let default_ceil = request
+            .moe_cache_ceil_mb
+            .filter(|&c| c > 0)
+            .unwrap_or_else(|| {
+                moe.derive_cache_ceil_mb(profile.available_ram_mb, memory_budget_percent)
+            });
+        let bench = crate::bench::BenchStore::load_default().ok();
+        let knobs = match crate::cluster::plan_moe_stream_knobs(
+            meta,
+            &profile,
+            memory_budget_percent,
+            request.context_size,
+            default_ceil,
+            bench.as_ref(),
+            &model_key,
+            "local",
+        ) {
+            Some(k) => k,
+            None => {
+                return ModelLoadResponse {
+                    protocol_version: CONTROL_PLANE_VERSION,
+                    success: false,
+                    active_model: String::new(),
+                    api_endpoint: String::new(),
+                    error_message: Some(
+                        "MoE stream LMK: no feasible (context, cache) plan on this node".into(),
+                    ),
+                };
+            }
+        };
+        let bmoe_cfg = crate::bmoe_client::BmoeSessionConfig::from_profile_with_ceil(
             std::path::PathBuf::from(&moe.bmoe_binary),
             model_path.clone(),
             api_host,
             port,
-            request.context_size,
+            knobs.context_size,
             request.threads,
             moe.clone(),
             &profile,
             memory_budget_percent,
             request.tags.clone(),
+            Some(knobs.cache_ceil_mb),
         );
         return match manager.spawn_bmoe(bmoe_cfg).await {
             Ok(slot_port) => ModelLoadResponse {

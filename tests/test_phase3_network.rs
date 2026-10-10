@@ -246,6 +246,7 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
         tags: vec!["general".to_string()],
         target_port: Some(8081),
         backend: "auto".to_string(),
+        moe_cache_ceil_mb: Some(3500),
     };
 
     // Serialize and deserialize round-trip
@@ -253,6 +254,20 @@ async fn control_plane_model_dispatch_serialization_and_handling() {
     let deserialized: ModelLoadRequest =
         serde_json::from_str(&json).expect("Deserialization failed");
     assert_eq!(load_req, deserialized);
+
+    let legacy_json = r#"{
+        "protocol_version": 1,
+        "requester_id": "550e8400-e29b-41d4-a716-446655440000",
+        "model_path": "m.gguf",
+        "context_size": 2048,
+        "gpu_layers": 0,
+        "threads": 4,
+        "rpc_workers": [],
+        "tags": [],
+        "backend": "bmoe"
+    }"#;
+    let legacy: ModelLoadRequest = serde_json::from_str(legacy_json).expect("legacy JSON");
+    assert_eq!(legacy.moe_cache_ceil_mb, None);
 
     // Test server handler with SupervisorManager (expect model not found error for non-existent model)
     let manager = SupervisorManager::new();

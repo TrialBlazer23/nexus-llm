@@ -53,6 +53,8 @@ pub enum HubCommand {
         model_name: String,
         context_size: usize,
         gpu_layers: u32,
+        /// Planned BigMoE cache ceiling for remote MoE stream loads.
+        moe_cache_ceil_mb: Option<u64>,
     },
     Unload {
         active_model_name: String,
@@ -237,6 +239,7 @@ pub fn spawn_hub_worker(
                     model_name,
                     context_size,
                     gpu_layers,
+                    moe_cache_ceil_mb,
                 } => {
                     run_remote_load(
                         &ctx,
@@ -248,6 +251,7 @@ pub fn spawn_hub_worker(
                         &model_name,
                         context_size,
                         gpu_layers,
+                        moe_cache_ceil_mb,
                     )
                     .await;
                 }
@@ -883,6 +887,8 @@ pub(crate) async fn build_target_selection(
                 is_local: false,
                 thermal_index: p.thermal_index,
                 moe_stream: p.moe_stream,
+                moe_cache_ceil_mb: p.moe_cache_ceil_mb as u64,
+                total_ram_mb: p.total_ram_mb as u64,
             });
         }
     }
@@ -949,6 +955,25 @@ pub(crate) async fn build_target_selection(
                                 api_endpoint: p.api_endpoint(),
                                 free_ram_mb: p.free_ram_mb,
                                 backend: p.backend.to_string(),
+                                predicted_label: label,
+                            });
+                        }
+                    }
+                    PlanTarget::RemoteMoeStream {
+                        peer_name,
+                        cache_mb,
+                        ceil_mb,
+                    } => {
+                        if let Some(p) = peers.iter().find(|p| p.label() == peer_name) {
+                            candidates.push(TargetExecutionNode::RemoteMoeStream {
+                                uuid: p.uuid,
+                                name: peer_name,
+                                endpoint: p.control_endpoint(),
+                                api_endpoint: p.api_endpoint(),
+                                free_ram_mb: p.free_ram_mb,
+                                cache_mb,
+                                ceil_mb,
+                                context_size: plan.context_size,
                                 predicted_label: label,
                             });
                         }
@@ -1033,6 +1058,7 @@ async fn run_remote_load(
     model_name: &str,
     context_size: usize,
     gpu_layers: u32,
+    moe_cache_ceil_mb: Option<u64>,
 ) {
     let _ = evt_tx
         .send(HubEvent::ModelLoadProgress {
@@ -1050,7 +1076,8 @@ async fn run_remote_load(
         rpc_workers: Vec::new(),
         tags: Vec::new(),
         target_port: None,
-        backend: "auto".to_string(),
+        backend: backend.to_string(),
+        moe_cache_ceil_mb,
     };
 
     info!("Dispatching remote model load to {endpoint}: {req:?}");

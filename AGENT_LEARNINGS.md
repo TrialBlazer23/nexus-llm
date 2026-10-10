@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — RemoteMoeStream mesh placement (Phase 16.5 step 3)
+- Category: design-decision
+- Context: Peers advertise `moe_stream` but ranking only offered dense `PlanTarget::Remote`, which mmap-fit checks could mark as Fits for oversize MoE files; Hub remote load always sent `backend=auto` without planned ctx/ceil.
+- Finding: Client-side placement needs a synthetic `SystemProfile::from_advertised(free, total, backend)`; remote dense plans for stream-capable peers must be suppressed when dense LMK fails; control-plane load must re-run `plan_moe_stream_knobs` on the peer and spawn via `from_profile_with_ceil`. Cross-node MoE bench stays on each device's `BenchStore` (`node_id=local`) in v1 — remote ranking uses cold-start tok/s unless samples were recorded under the peer label locally.
+- Action: Add `PlanTarget::RemoteMoeStream`, `TargetExecutionNode::RemoteMoeStream`, `ModelLoadRequest.moe_cache_ceil_mb`, Hub `LoadModelRemote` with `backend=bmoe`; reject RPC+MoE on control plane.
+- Verification: `cargo test --locked` (including `ranks_remote_moe_stream_on_capable_peer_when_local_too_small`, `no_remote_moe_stream_*`, `from_advertised_uses_free_ram_for_lmk`); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
 ## 2026-10-10 — Joint MoE (ctx, cache_ceil) planner wires into spawn
 - Category: design-decision
 - Context: Phase 16.5 step 2 — pick feasible stream LMK knobs and apply them at bmoe-cli spawn.

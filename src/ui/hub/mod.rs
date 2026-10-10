@@ -128,6 +128,17 @@ pub enum TargetExecutionNode {
         backend: String,
         predicted_label: String,
     },
+    RemoteMoeStream {
+        uuid: Uuid,
+        name: String,
+        endpoint: String,
+        api_endpoint: String,
+        free_ram_mb: u32,
+        cache_mb: u64,
+        ceil_mb: u64,
+        context_size: usize,
+        predicted_label: String,
+    },
     Distributed {
         worker_names: Vec<String>,
         predicted_label: String,
@@ -196,6 +207,20 @@ impl TargetExecutionNode {
                 format!(
                     "📱 {} ({}) - {} MB free | {} | {}",
                     name, endpoint, free_ram_mb, backend, predicted_label
+                )
+            }
+            Self::RemoteMoeStream {
+                name,
+                cache_mb,
+                ceil_mb,
+                context_size,
+                free_ram_mb,
+                predicted_label,
+                ..
+            } => {
+                format!(
+                    "💾 {} MoE stream (ctx {} | cache {} / ceil {} MB) - {} MB free | {}",
+                    name, context_size, cache_mb, ceil_mb, free_ram_mb, predicted_label
                 )
             }
         }
@@ -2708,6 +2733,35 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     model_name: state.model_name.clone(),
                                                     context_size: ctx_size,
                                                     gpu_layers,
+                                                    moe_cache_ceil_mb: None,
+                                                });
+                                            }
+                                            TargetExecutionNode::RemoteMoeStream {
+                                                endpoint,
+                                                api_endpoint,
+                                                name,
+                                                context_size: moe_ctx,
+                                                ceil_mb,
+                                                ..
+                                            } => {
+                                                hub.chat.set_target_hardware(
+                                                    name,
+                                                    format!(
+                                                        "Remote MoE flash-stream (ctx {} | ceil {} MB)",
+                                                        moe_ctx, ceil_mb
+                                                    ),
+                                                );
+                                                hub.load_phase =
+                                                    Some(format!("Queued remote MoE stream on {name}…"));
+                                                let _ = cmd_tx.try_send(HubCommand::LoadModelRemote {
+                                                    endpoint: endpoint.clone(),
+                                                    api_endpoint: api_endpoint.clone(),
+                                                    name: name.clone(),
+                                                    backend: "bmoe".into(),
+                                                    model_name: state.model_name.clone(),
+                                                    context_size: *moe_ctx,
+                                                    gpu_layers: 0,
+                                                    moe_cache_ceil_mb: Some(*ceil_mb),
                                                 });
                                             }
                                             TargetExecutionNode::Distributed {
@@ -3330,6 +3384,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                     model_name,
                                                     context_size: hub.models_view.selected_context,
                                                     gpu_layers,
+                                                    moe_cache_ceil_mb: None,
                                                 });
                                             } else {
                                                 hub.cluster_view.status_message = Some(("Select a model in [F2] Models first".to_string(), Color::Yellow));

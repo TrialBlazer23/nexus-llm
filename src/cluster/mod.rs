@@ -12,8 +12,9 @@ pub use moe_plan::{
     plan_moe_spawn, predict_moe_stream_tok_s, MoeCacheCap, MoeScoreSource, MoeSpawnPlan,
 };
 pub use rank::{
-    classify_fit, link_quality_from_timings, rank_execution_plans, ExecutionPlan, LinkQuality,
-    PlacementCandidate, PlacementRequest, PlanTarget,
+    battery_gate, classify_fit, cold_start_scale, link_quality_from_timings, rank_execution_plans,
+    select_burst_winner, thermal_eligible, BatteryGate, BurstScore, ExecutionPlan, LinkClass,
+    LinkQuality, PlacementCandidate, PlacementRequest, PlanTarget,
 };
 pub use split::{plan_tensor_byte_split, MultiWorkerSplit, SplitError};
 

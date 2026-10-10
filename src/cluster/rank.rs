@@ -154,6 +154,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
 
     let offload_available = req.enable_rpc && !rpc_workers.is_empty();
     let model_key = moe_model_key(req.gguf);
+    let weights_gib = req.gguf.weights_bytes() as f32 / (1024.0 * 1024.0 * 1024.0);
 
     // --- Local GPU ---
     if req.local_gpu_layers > 0 {
@@ -176,6 +177,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                         req.local_profile.detected_backend,
                         req.policy.context_size,
                     ),
+                    weights_gib,
                 );
                 plans.push(ExecutionPlan {
                     target: PlanTarget::LocalGpu {
@@ -215,6 +217,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     cpu_profile.detected_backend,
                     req.policy.context_size,
                 ),
+                weights_gib,
             );
             plans.push(ExecutionPlan {
                 target: PlanTarget::LocalCpu,
@@ -323,6 +326,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     c.backend,
                     req.policy.context_size,
                 ),
+                weights_gib,
             );
             if c.link.unknown {
                 tok *= 0.85;
@@ -395,6 +399,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                         req.local_profile.detected_backend,
                         req.policy.context_size,
                     ),
+                    weights_gib,
                 );
                 let predicted = compute_tok.min(min_net);
                 let args = split.build_llama_args();
@@ -533,6 +538,93 @@ fn moe_stream_execution(
     })
 }
 
+/// Link used when ranking a burst candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkClass {
+    Local,
+    Usb,
+    Wifi,
+}
+
+/// One burst candidate. `score_millis` is thousandths of a tok/s so tests avoid `f32` equality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BurstScore {
+    pub name: String,
+    pub link: LinkClass,
+    pub score_millis: u32,
+    pub eligible: bool,
+}
+
+/// Placement battery gate. Callers turn `Throttle` into `score_millis / 2` and `Decline` into `eligible: false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryGate {
+    Eligible,
+    Throttle,
+    Decline,
+}
+
+/// `None` percent is eligible for every action. Below `floor`, only `decline` and `throttle` change the gate.
+pub fn battery_gate(percent: Option<u8>, floor: u8, action: &str) -> BatteryGate {
+    let Some(percent) = percent else {
+        return BatteryGate::Eligible;
+    };
+    if percent >= floor {
+        return BatteryGate::Eligible;
+    }
+    match action {
+        "decline" => BatteryGate::Decline,
+        "throttle" => BatteryGate::Throttle,
+        _ => BatteryGate::Eligible,
+    }
+}
+
+/// Thermal index at or below 75 may take a new load.
+pub fn thermal_eligible(thermal_index: u8) -> bool {
+    thermal_index <= 75
+}
+
+/// Cold-start size scale. A measured sample returns `1.0` so it is not scaled again.
+pub fn cold_start_scale(weights_gib: f32, measured: bool) -> f32 {
+    if measured {
+        1.0
+    } else {
+        1.0 / weights_gib.max(0.25)
+    }
+}
+
+/// USB wins inside `score >= 0.85 * best_wifi` (`best_wifi` is 0 when no eligible Wi-Fi plan exists).
+/// Otherwise the highest remaining eligible score wins. Ineligible rows are skipped.
+/// Equal scores keep the earlier row.
+pub fn select_burst_winner(plans: &[BurstScore]) -> Option<usize> {
+    let score = |plan: &BurstScore| plan.score_millis as f32 / 1000.0;
+    let best_wifi = plans
+        .iter()
+        .filter(|plan| plan.eligible && plan.link == LinkClass::Wifi)
+        .map(score)
+        .fold(0.0, f32::max);
+    let band = 0.85 * best_wifi;
+    highest_score(plans, |plan| {
+        plan.link == LinkClass::Usb && score(plan) >= band
+    })
+    .or_else(|| highest_score(plans, |_| true))
+}
+
+/// Highest eligible score that also passes `extra`. Ties keep the earlier index.
+fn highest_score(plans: &[BurstScore], extra: impl Fn(&BurstScore) -> bool) -> Option<usize> {
+    let mut winner: Option<(usize, f32)> = None;
+    for (index, plan) in plans.iter().enumerate() {
+        if !plan.eligible || !extra(plan) {
+            continue;
+        }
+        let value = plan.score_millis as f32 / 1000.0;
+        match winner {
+            Some((_, best)) if value <= best => {}
+            _ => winner = Some((index, value)),
+        }
+    }
+    winner.map(|(index, _)| index)
+}
+
 fn measured_tok_s(
     bench: Option<&BenchStore>,
     model_id: &str,
@@ -552,16 +644,19 @@ fn predict_local_tok_s(
     layer_frac: f32,
     thermal: u8,
     measured: Option<f32>,
+    weights_gib: f32,
 ) -> f32 {
     let base = if let Some(m) = measured.filter(|v| *v > 0.0) {
         m
     } else {
-        match backend {
+        let prior = match backend {
             AccelerationBackend::Vulkan => 28.0,
             AccelerationBackend::ArmCpuDotProd => 12.0,
             AccelerationBackend::X86Baseline => 4.0,
             AccelerationBackend::GenericCpu => 6.0,
-        }
+        };
+        // Unmeasured prior only. A positive bench sample is not scaled again.
+        prior * cold_start_scale(weights_gib, false)
     };
     // Measured values already include quant/runtime effects; only scale by
     // layer fraction and thermal when using heuristics or partial offload.
@@ -701,5 +796,124 @@ mod tests {
         let u = network_bound_tok_s(&unknown, 8192.0, 1.0);
         let k = network_bound_tok_s(&known, 8192.0, 1.0);
         assert!(k > u);
+    }
+
+    #[test]
+    fn cold_start_shrinks_with_weight_gib() {
+        assert!((cold_start_scale(1.0, false) - 1.0).abs() < 0.001);
+        assert!((cold_start_scale(4.0, false) - 0.25).abs() < 0.001);
+        assert!((cold_start_scale(4.0, true) - 1.0).abs() < 0.001);
+        assert!((cold_start_scale(0.1, false) - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn usb_band_matches_the_spec_table() {
+        let plans = [
+            BurstScore {
+                name: "usb".into(),
+                link: LinkClass::Usb,
+                score_millis: 8000,
+                eligible: true,
+            },
+            BurstScore {
+                name: "wifi".into(),
+                link: LinkClass::Wifi,
+                score_millis: 8000,
+                eligible: true,
+            },
+        ];
+        assert_eq!(select_burst_winner(&plans).unwrap(), 0);
+
+        let slower_usb = [
+            BurstScore {
+                name: "usb".into(),
+                link: LinkClass::Usb,
+                score_millis: 6000,
+                eligible: true,
+            },
+            BurstScore {
+                name: "wifi".into(),
+                link: LinkClass::Wifi,
+                score_millis: 8000,
+                eligible: true,
+            },
+        ];
+        assert_eq!(
+            select_burst_winner(&slower_usb).map(|i| plans_name(&slower_usb, i)),
+            Some("wifi")
+        );
+
+        let edge = [
+            BurstScore {
+                name: "usb".into(),
+                link: LinkClass::Usb,
+                score_millis: 7000,
+                eligible: true,
+            },
+            BurstScore {
+                name: "wifi".into(),
+                link: LinkClass::Wifi,
+                score_millis: 8000,
+                eligible: true,
+            },
+        ];
+        // 7000 >= 0.85 * 8000
+        assert_eq!(select_burst_winner(&edge).unwrap(), 0);
+
+        let hot = [
+            BurstScore {
+                name: "usb".into(),
+                link: LinkClass::Usb,
+                score_millis: 8000,
+                eligible: false,
+            },
+            BurstScore {
+                name: "wifi".into(),
+                link: LinkClass::Wifi,
+                score_millis: 8000,
+                eligible: true,
+            },
+        ];
+        assert_eq!(select_burst_winner(&hot).unwrap(), 1);
+
+        let two_usb = [
+            BurstScore {
+                name: "slow-cable".into(),
+                link: LinkClass::Usb,
+                score_millis: 7000,
+                eligible: true,
+            },
+            BurstScore {
+                name: "fast-cable".into(),
+                link: LinkClass::Usb,
+                score_millis: 9000,
+                eligible: true,
+            },
+            BurstScore {
+                name: "wifi".into(),
+                link: LinkClass::Wifi,
+                score_millis: 8000,
+                eligible: true,
+            },
+        ];
+        assert_eq!(select_burst_winner(&two_usb).unwrap(), 1);
+    }
+
+    fn plans_name(plans: &[BurstScore], index: usize) -> &str {
+        &plans[index].name
+    }
+
+    #[test]
+    fn battery_and_thermal_gates() {
+        assert_eq!(battery_gate(None, 20, "decline"), BatteryGate::Eligible);
+        assert_eq!(battery_gate(Some(19), 20, "decline"), BatteryGate::Decline);
+        assert_eq!(
+            battery_gate(Some(19), 20, "throttle"),
+            BatteryGate::Throttle
+        );
+        assert_eq!(battery_gate(Some(19), 20, "ignore"), BatteryGate::Eligible);
+        assert_eq!(battery_gate(Some(20), 20, "decline"), BatteryGate::Eligible);
+        assert!(!thermal_eligible(76));
+        assert!(thermal_eligible(75));
     }
 }

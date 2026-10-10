@@ -1,6 +1,12 @@
+use crate::adb_links::{
+    adb_forward_dry_run, plan_forward_argvs, remove_forward_argv, resolve_device_forward_ports,
+    AdbLinkCache,
+};
 use std::process::Command;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+pub use crate::adb_links::{allocate_forwards, parse_adb_devices_l, HostForward};
 
 pub const DEFAULT_API_PORT: u16 = 8080;
 pub const DEFAULT_RPC_PORT: u16 = 50052;
@@ -102,108 +108,98 @@ impl AdbTunnelSupervisor {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut devices = Vec::new();
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.starts_with("List of devices") || line.is_empty() {
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let serial = parts[0].to_string();
-                let state = parts[1];
-                let authorized = state == "device";
-
-                let mut model = None;
-                let mut product = None;
-
-                for part in &parts[2..] {
-                    if let Some(m) = part.strip_prefix("model:") {
-                        model = Some(m.to_string());
-                    } else if let Some(p) = part.strip_prefix("product:") {
-                        product = Some(p.to_string());
-                    }
-                }
-
-                devices.push(AdbDeviceInfo {
-                    serial,
-                    model,
-                    product,
-                    authorized,
-                });
-            }
-        }
-
-        Ok(devices)
+        Ok(parse_adb_devices_l(&stdout))
     }
 
-    /// Setup ADB forward (Mac -> Phone API) and reverse (Phone -> Mac RPC).
+    /// Setup one USB link.
+    ///
+    /// `specific_serial == None` uses only `allocate_forwards(...)[0]` (sorted serial,
+    /// host ports from config). No authorized device returns `NoDeviceConnected`.
+    /// Device API/control ports come from the serial cache, otherwise `api_port` and
+    /// the configured control port. RPC reverse stays on this one serial.
     pub fn setup_tunnel(
         api_port: u16,
         rpc_port: u16,
         specific_serial: Option<&str>,
     ) -> Result<TunnelStatus, TunnelError> {
         let devices = Self::list_devices()?;
-        let target_device = if let Some(serial) = specific_serial {
-            devices.into_iter().find(|d| d.serial == serial)
-        } else {
-            devices.into_iter().find(|d| d.authorized)
-        };
+        let (host_port_base, max_devices, control_port) = adb_host_settings();
+        let forward = select_one_forward(&devices, host_port_base, max_devices, specific_serial)?;
+        let device = devices.into_iter().find(|d| d.serial == forward.serial);
 
-        let device = match target_device {
-            Some(d) => d,
-            None => return Err(TunnelError::NoDeviceConnected),
-        };
+        let cache = load_link_cache();
+        let (device_api, device_control) =
+            resolve_device_forward_ports(&cache, &forward.serial, api_port, control_port);
+        let device_rpc = cache
+            .ports_for(&forward.serial)
+            .map(|(_api, _control, rpc)| rpc)
+            .unwrap_or(rpc_port);
 
-        let serial_args: &[&str] = &["-s", &device.serial];
+        let api_args =
+            crate::adb_links::forward_argv(&forward.serial, forward.host_api, device_api);
+        let control_args =
+            crate::adb_links::forward_argv(&forward.serial, forward.host_control, device_control);
+        let reverse_args = reverse_argv(&forward.serial, device_rpc, rpc_port);
 
-        // 1. Forward API port: adb -s <serial> forward tcp:<port> tcp:<port>
-        let forward_arg = format!("tcp:{}", api_port);
-        let mut fwd_cmd = Command::new("adb");
-        fwd_cmd
-            .args(serial_args)
-            .args(["forward", &forward_arg, &forward_arg]);
-        let fwd_out = fwd_cmd.output().map_err(TunnelError::Io)?;
-        let api_forwarded = fwd_out.status.success();
-        if !api_forwarded {
-            warn!(
-                "Failed to forward ADB port {}: {}",
-                api_port,
-                String::from_utf8_lossy(&fwd_out.stderr)
-            );
-        }
-
-        // 2. Reverse RPC port: adb -s <serial> reverse tcp:<port> tcp:<port>
-        let reverse_arg = format!("tcp:{}", rpc_port);
-        let mut rev_cmd = Command::new("adb");
-        rev_cmd
-            .args(serial_args)
-            .args(["reverse", &reverse_arg, &reverse_arg]);
-        let rev_out = rev_cmd.output().map_err(TunnelError::Io)?;
-        let rpc_reversed = rev_out.status.success();
-        if !rpc_reversed {
-            warn!(
-                "Failed to reverse ADB port {}: {}",
-                rpc_port,
-                String::from_utf8_lossy(&rev_out.stderr)
-            );
-        }
+        let api_forwarded = run_adb(&api_args)?;
+        let _ = run_adb(&control_args)?;
+        let rpc_reversed = run_adb(&reverse_args)?;
 
         info!(
-            "ADB Tunnel active for device {} (Model: {:?}): Forward {}:{}, Reverse {}:{}",
-            device.serial, device.model, api_port, api_port, rpc_port, rpc_port
+            "ADB Tunnel active for device {} (Model: {:?}): Forward {}:{}, Control {}:{}, Reverse {}:{}",
+            forward.serial,
+            device.as_ref().and_then(|d| d.model.as_deref()),
+            forward.host_api,
+            device_api,
+            forward.host_control,
+            device_control,
+            device_rpc,
+            rpc_port
         );
 
         Ok(TunnelStatus {
             is_active: api_forwarded,
             api_forwarded,
             rpc_reversed,
-            api_port,
+            api_port: forward.host_api,
             rpc_port,
-            device: Some(device),
+            device,
         })
+    }
+
+    /// Forward every allocated serial.
+    ///
+    /// When `NEXUS_ADB_DRY_RUN=1`, the forward argument list is built and `adb` is not spawned.
+    /// Device ports come from the serial cache, otherwise `device_api` and `device_control`.
+    pub fn setup_all_tunnels(
+        devices: &[AdbDeviceInfo],
+        host_port_base: u16,
+        max_devices: u8,
+        device_api: u16,
+        device_control: u16,
+    ) -> Vec<HostForward> {
+        let (forwards, skipped) = allocate_forwards(devices, host_port_base, max_devices);
+        if !skipped.is_empty() {
+            warn!(
+                "ADB max_devices cap skipped serials: {}",
+                skipped.join(", ")
+            );
+        }
+        let cache = load_link_cache();
+        let commands = plan_forward_argvs(&forwards, &cache, device_api, device_control);
+        if adb_forward_dry_run(std::env::var("NEXUS_ADB_DRY_RUN").ok().as_deref()) {
+            debug!(
+                "NEXUS_ADB_DRY_RUN=1; built {} adb forward commands without spawning",
+                commands.len()
+            );
+            return forwards;
+        }
+        for args in &commands {
+            if let Err(err) = run_adb(args) {
+                warn!("ADB forward could not start: {err}");
+            }
+        }
+        forwards
     }
 
     /// Lightweight check: whether an ADB forward for `api_port` is already listed.
@@ -222,25 +218,60 @@ impl AdbTunnelSupervisor {
             .any(|line| line.contains(&needle))
     }
 
-    /// Teardown ADB port forwarding and reverse tunnels.
+    /// Teardown forwards for each currently allocated serial.
+    ///
+    /// `adb forward --remove` is always `adb -s <serial> forward --remove tcp:<host_port>`
+    /// for both host ports. An unscoped `forward --remove` would drop every phone.
     pub fn teardown_tunnel(api_port: u16, rpc_port: u16) -> Result<(), TunnelError> {
-        let forward_arg = format!("tcp:{}", api_port);
-        let _ = Command::new("adb")
-            .args(["forward", "--remove", &forward_arg])
-            .output();
-
-        let reverse_arg = format!("tcp:{}", rpc_port);
-        let _ = Command::new("adb")
-            .args(["reverse", "--remove", &reverse_arg])
-            .output();
-
-        debug!("ADB tunnels removed for ports {}, {}", api_port, rpc_port);
+        let devices = match Self::list_devices() {
+            Ok(devices) => devices,
+            Err(err) => {
+                warn!("ADB teardown skipped; device list failed: {err}");
+                return Ok(());
+            }
+        };
+        let (host_port_base, max_devices, _) = adb_host_settings();
+        let (forwards, _) = allocate_forwards(&devices, host_port_base, max_devices);
+        let cache = load_link_cache();
+        for forward in &forwards {
+            let _ = Self::teardown_serial(&forward.serial, forward.host_api, forward.host_control);
+            let device_rpc = cache
+                .ports_for(&forward.serial)
+                .map(|(_api, _control, rpc)| rpc)
+                .unwrap_or(rpc_port);
+            let reverse = remove_reverse_argv(&forward.serial, device_rpc);
+            if let Err(err) = run_adb(&reverse) {
+                warn!(
+                    "ADB reverse --remove could not start for {}: {err}",
+                    forward.serial
+                );
+            }
+        }
+        debug!(
+            "ADB tunnels removed for {} serial(s); api hint {api_port}, rpc {rpc_port}",
+            forwards.len()
+        );
         Ok(())
     }
 
-    /// Resolve effective API endpoint based on TransportMode.
-    /// If Auto: attempts USB tunnel first; if USB device connected, returns ("http://127.0.0.1:8080", is_usb=true).
-    /// If no device or Wifi mode, returns None (allowing caller to use UDP discovery).
+    /// Remove both host forwards for one serial. Always passes `-s`.
+    pub fn teardown_serial(
+        serial: &str,
+        host_api: u16,
+        host_control: u16,
+    ) -> Result<(), TunnelError> {
+        for port in [host_api, host_control] {
+            let args = remove_forward_argv(serial, port);
+            if let Err(err) = run_adb(&args) {
+                warn!("ADB forward --remove tcp:{port} for {serial} could not start: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the API endpoint for `mode`.
+    /// USB and Auto return `http://127.0.0.1:<host_api>` when the single forward is active.
+    /// Wifi, or no authorized device, returns None so the caller can use discovery.
     pub fn resolve_transport_endpoint(
         mode: TransportMode,
         api_port: u16,
@@ -250,7 +281,7 @@ impl AdbTunnelSupervisor {
             TransportMode::Wifi => (None, false),
             TransportMode::Usb => match Self::setup_tunnel(api_port, rpc_port, None) {
                 Ok(status) if status.is_active => {
-                    (Some(format!("http://127.0.0.1:{}", api_port)), true)
+                    (Some(format!("http://127.0.0.1:{}", status.api_port)), true)
                 }
                 _ => (None, false),
             },
@@ -258,13 +289,243 @@ impl AdbTunnelSupervisor {
                 if Self::is_adb_available() {
                     if let Ok(status) = Self::setup_tunnel(api_port, rpc_port, None) {
                         if status.is_active {
-                            info!("Zero-latency USB cable detected via ADB: routing over 127.0.0.1:{}", api_port);
-                            return (Some(format!("http://127.0.0.1:{}", api_port)), true);
+                            info!(
+                                "Zero-latency USB cable detected via ADB: routing over 127.0.0.1:{}",
+                                status.api_port
+                            );
+                            return (Some(format!("http://127.0.0.1:{}", status.api_port)), true);
                         }
                     }
                 }
                 (None, false)
             }
         }
+    }
+}
+
+/// First allocated forward, or the named serial when it received a host port.
+fn select_one_forward(
+    devices: &[AdbDeviceInfo],
+    host_port_base: u16,
+    max_devices: u8,
+    specific_serial: Option<&str>,
+) -> Result<HostForward, TunnelError> {
+    let (forwards, _) = allocate_forwards(devices, host_port_base, max_devices);
+    let chosen = match specific_serial {
+        Some(serial) => forwards
+            .into_iter()
+            .find(|forward| forward.serial == serial),
+        None => forwards.into_iter().next(),
+    };
+    chosen.ok_or(TunnelError::NoDeviceConnected)
+}
+
+/// Host-port block and control-port fallback without writing config or identity files.
+fn adb_host_settings() -> (u16, u8, u16) {
+    let path = std::env::var("NEXUS_CONFIG")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::config::NexusConfig::default_config_path);
+    let cfg = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| toml::from_str::<crate::config::NexusConfig>(&content).ok())
+        .unwrap_or_default();
+    (
+        cfg.cluster.adb.host_port_base,
+        cfg.cluster.adb.max_devices,
+        cfg.network.control_port,
+    )
+}
+
+fn load_link_cache() -> AdbLinkCache {
+    AdbLinkCache::load(&AdbLinkCache::default_path()).unwrap_or_else(|err| {
+        warn!("ADB link cache unavailable, using local device ports: {err}");
+        AdbLinkCache::default()
+    })
+}
+
+/// Spawn `adb`. A non-zero exit is `Ok(false)` plus a warning. A missing binary is `AdbNotFound`.
+fn run_adb(args: &[String]) -> Result<bool, TunnelError> {
+    let output = match Command::new("adb").args(args).output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TunnelError::AdbNotFound);
+        }
+        Err(err) => return Err(TunnelError::Io(err)),
+    };
+    if output.status.success() {
+        return Ok(true);
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    warn!(
+        "ADB command failed (adb {}): {}",
+        args.join(" "),
+        err.trim()
+    );
+    Ok(false)
+}
+
+fn reverse_argv(serial: &str, device_port: u16, local_port: u16) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "reverse".to_string(),
+        format!("tcp:{device_port}"),
+        format!("tcp:{local_port}"),
+    ]
+}
+
+fn remove_reverse_argv(serial: &str, device_port: u16) -> Vec<String> {
+    vec![
+        "-s".to_string(),
+        serial.to_string(),
+        "reverse".to_string(),
+        "--remove".to_string(),
+        format!("tcp:{device_port}"),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_keeps_unauthorized_and_allocate_skips_them() {
+        let stdout = "\
+List of devices attached
+serial-b device usb:1-1 product:foo model:Bar
+serial-a device usb:1-2 product:foo model:Baz
+serial-c unauthorized usb:1-3
+";
+        let devices = parse_adb_devices_l(stdout);
+        assert_eq!(devices.len(), 3);
+        let (forwards, skipped) = allocate_forwards(&devices, 18080, 8);
+        assert!(skipped.is_empty());
+        assert_eq!(forwards[0].serial, "serial-a");
+        assert_eq!(forwards[0].host_api, 18080);
+        assert_eq!(forwards[0].host_control, 18081);
+        assert_eq!(forwards[1].serial, "serial-b");
+        assert_eq!(forwards[1].host_api, 18082);
+        assert_eq!(forwards[1].host_control, 18083);
+        assert!(!forwards.iter().any(|f| f.serial == "serial-c"));
+    }
+
+    #[test]
+    fn max_devices_reports_skipped_serials() {
+        let stdout = "\
+serial-a device
+serial-b device
+serial-c device
+";
+        let devices = parse_adb_devices_l(stdout);
+        let (forwards, skipped) = allocate_forwards(&devices, 18080, 2);
+        assert_eq!(forwards.len(), 2);
+        assert_eq!(skipped, vec!["serial-c".to_string()]);
+    }
+
+    #[test]
+    fn parse_reads_model_product_and_only_device_is_authorized() {
+        let devices = parse_adb_devices_l(
+            "serial-b device usb:1-1 product:foo model:Bar\nserial-c offline\n",
+        );
+        assert!(devices[0].authorized);
+        assert_eq!(devices[0].product.as_deref(), Some("foo"));
+        assert_eq!(devices[0].model.as_deref(), Some("Bar"));
+        assert!(!devices[1].authorized);
+        assert!(devices[1].model.is_none());
+        assert!(devices[1].product.is_none());
+    }
+
+    #[test]
+    fn skipped_serials_follow_byte_sort() {
+        let devices = parse_adb_devices_l("serial-c device\nserial-a device\nserial-b device\n");
+        let (forwards, skipped) = allocate_forwards(&devices, 18080, 1);
+        assert_eq!(forwards[0].serial, "serial-a");
+        assert_eq!(forwards[0].host_api, 18080);
+        assert_eq!(forwards[0].host_control, 18081);
+        assert_eq!(
+            skipped,
+            vec!["serial-b".to_string(), "serial-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn allocate_skips_ports_that_do_not_fit_in_u16() {
+        let devices = parse_adb_devices_l("serial-a device\nserial-b device\n");
+        let (forwards, skipped) = allocate_forwards(&devices, u16::MAX, 2);
+        assert!(forwards.is_empty());
+        assert_eq!(
+            skipped,
+            vec!["serial-a".to_string(), "serial-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn none_serial_uses_only_the_first_allocated_forward() {
+        let devices =
+            parse_adb_devices_l("serial-b device\nserial-a device\nserial-c unauthorized\n");
+        let forward = select_one_forward(&devices, 18080, 8, None).unwrap();
+        assert_eq!(forward.serial, "serial-a");
+        assert_eq!(forward.host_api, 18080);
+        assert_eq!(forward.host_control, 18081);
+        let err = select_one_forward(&[], 18080, 8, None).unwrap_err();
+        assert!(matches!(err, TunnelError::NoDeviceConnected));
+        let unauthorized = select_one_forward(&devices, 18080, 8, Some("serial-c")).unwrap_err();
+        assert!(matches!(unauthorized, TunnelError::NoDeviceConnected));
+        let named = select_one_forward(&devices, 18080, 8, Some("serial-b")).unwrap();
+        assert_eq!(named.serial, "serial-b");
+        assert_eq!(named.host_api, 18082);
+        assert_eq!(named.host_control, 18083);
+    }
+
+    #[test]
+    fn forward_args_prefer_cache_and_remove_names_the_serial() {
+        use crate::adb_links::AdbLinkRecord;
+        use uuid::Uuid;
+
+        let devices = parse_adb_devices_l("serial-b device\nserial-a device\n");
+        let (forwards, skipped) = allocate_forwards(&devices, 18080, 8);
+        assert!(skipped.is_empty());
+        let mut cache = AdbLinkCache::default();
+        cache.upsert(AdbLinkRecord {
+            serial: "serial-b".into(),
+            node_id: Uuid::nil(),
+            device_api_port: 7000,
+            device_control_port: 7001,
+            device_rpc_port: 50052,
+        });
+        let cmds = plan_forward_argvs(&forwards, &cache, 8080, 9998);
+        assert_eq!(
+            cmds,
+            vec![
+                args(&["-s", "serial-a", "forward", "tcp:18080", "tcp:8080"]),
+                args(&["-s", "serial-a", "forward", "tcp:18081", "tcp:9998"]),
+                args(&["-s", "serial-b", "forward", "tcp:18082", "tcp:7000"]),
+                args(&["-s", "serial-b", "forward", "tcp:18083", "tcp:7001"]),
+            ]
+        );
+        let (api, control) = resolve_device_forward_ports(&cache, "serial-a", 8080, 9998);
+        assert_eq!((api, control), (8080, 9998));
+        let remove = remove_forward_argv("serial-a", 18080);
+        assert_eq!(
+            remove,
+            args(&["-s", "serial-a", "forward", "--remove", "tcp:18080"])
+        );
+        let serial_at = remove.iter().position(|part| part == "-s").unwrap();
+        let forward_at = remove.iter().position(|part| part == "forward").unwrap();
+        assert!(serial_at < forward_at);
+    }
+
+    #[test]
+    fn dry_run_flag_is_only_the_digit_one() {
+        assert!(adb_forward_dry_run(Some("1")));
+        assert!(!adb_forward_dry_run(Some("true")));
+        assert!(!adb_forward_dry_run(Some("")));
+        assert!(!adb_forward_dry_run(None));
+    }
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
     }
 }

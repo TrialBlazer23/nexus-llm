@@ -50,8 +50,12 @@ fn memory_plan_beats_heuristic_for_small_model() {
         batch_size: 512,
     };
     let plan = MemoryPlan::from_gguf(&gguf, &profile, &policy, false);
-    assert!(
-        matches!(plan.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv),
+    // F16 full-file load (~906 + ~672 + 256) is over the 1500 MB budget.
+    // Q8 KV (~336) still fits: 906 + 336 + 256 = 1498 <= 1500.
+    assert!(plan.headroom_mb < 0, "headroom {}", plan.headroom_mb);
+    assert_eq!(
+        plan.verdict,
+        Verdict::FitsIfQuantizedKv,
         "got {:?}",
         plan.verdict
     );

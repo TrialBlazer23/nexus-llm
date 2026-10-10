@@ -139,28 +139,9 @@ impl MemoryPlan {
         let kv_cache_mb = kv_bytes / (1024 * 1024);
         let compute_buffer_mb = estimate_compute_buffer_mb(backend, policy.batch_size);
 
-        let required = weights_resident_mb
-            .saturating_add(kv_cache_mb)
-            .saturating_add(compute_buffer_mb);
-        // When mmap: still reserve a fraction of weight pages as soft pressure.
-        let soft_weight_pressure = if policy.mmap && !policy.mlock {
-            // Count ~10% of weights as working set for fit checks that include file size.
-            (weights_mb / 10).max(1).min(weights_mb)
-        } else {
-            0
-        };
-        // Fit check: for LMK we use anonymous; for "will it load" include soft pressure + full
-        // weights when comparing to "model + KV" operator intuition.
-        let load_estimate_mb = if policy.mmap && !policy.mlock {
-            soft_weight_pressure
-                .saturating_add(kv_cache_mb)
-                .saturating_add(compute_buffer_mb)
-        } else {
-            required
-        };
-
-        // Also compare classic model_file + kv for Exceeds when mmap would still OOM total.
-        let classic_mb = weights_mb
+        // Dense fit counts the whole weight file. `weights_resident_mb` stays 0
+        // under mmap without mlock: that field is anonymous RSS, not the verdict.
+        let load_estimate_mb = weights_mb
             .saturating_add(kv_cache_mb)
             .saturating_add(compute_buffer_mb);
 
@@ -172,15 +153,9 @@ impl MemoryPlan {
         } else if policy.kv_dtype == KvCacheDtype::F16 {
             let q8_kv = gguf.exact_kv_cache_bytes_dtype(policy.context_size, KvCacheDtype::Q8_0)
                 / (1024 * 1024);
-            let q8_load = if policy.mmap && !policy.mlock {
-                soft_weight_pressure
-                    .saturating_add(q8_kv)
-                    .saturating_add(compute_buffer_mb)
-            } else {
-                weights_mb
-                    .saturating_add(q8_kv)
-                    .saturating_add(compute_buffer_mb)
-            };
+            let q8_load = weights_mb
+                .saturating_add(q8_kv)
+                .saturating_add(compute_buffer_mb);
             if q8_load <= budget_mb {
                 remediations.push(Remediation::QuantizeKv {
                     dtype: "q8_0".into(),
@@ -195,10 +170,8 @@ impl MemoryPlan {
                     peer_hint: "rpc-worker".into(),
                 });
                 Verdict::FitsWithOffload
-            } else if classic_mb > budget_mb {
-                suggest_ctx_remediation(gguf, policy, budget_mb, &mut remediations);
-                Verdict::Exceeds
             } else {
+                suggest_ctx_remediation(gguf, policy, budget_mb, &mut remediations);
                 Verdict::Exceeds
             }
         } else if gguf.streamable_moe() {
@@ -228,7 +201,6 @@ impl MemoryPlan {
             }
         }
 
-        let _ = classic_mb; // retained for future UI breakdown
         MemoryPlan {
             weights_mb,
             weights_resident_mb,
@@ -271,13 +243,9 @@ fn suggest_ctx_remediation(
     while ctx > 512 {
         ctx /= 2;
         let kv = gguf.exact_kv_cache_bytes_dtype(ctx, policy.kv_dtype) / (1024 * 1024);
-        let soft = if policy.mmap && !policy.mlock {
-            (gguf.weights_bytes() / (1024 * 1024) / 10).max(1)
-        } else {
-            gguf.weights_bytes() / (1024 * 1024)
-        };
+        let weights_mb = gguf.weights_bytes() / (1024 * 1024);
         let compute = 256u64;
-        if soft.saturating_add(kv).saturating_add(compute) <= budget_mb {
+        if weights_mb.saturating_add(kv).saturating_add(compute) <= budget_mb {
             remediations.push(Remediation::ReduceCtx { to: ctx });
             return;
         }
@@ -323,44 +291,50 @@ mod tests {
     }
 
     #[test]
-    fn one_point_five_b_fits_with_mmap_not_rejected_by_heuristic() {
-        let gguf = tiny_1p5b();
-        let profile = SystemProfile {
-            total_ram_mb: 12_000,
-            available_ram_mb: 8_000,
-            detected_backend: AccelerationBackend::Vulkan,
-            recommended_threads: 4,
+    fn dense_mmap_counts_full_weights() {
+        let mut heavy = tiny_1p5b();
+        heavy.file_size_bytes = 4_500 * 1024 * 1024;
+        let mut light = tiny_1p5b();
+        light.file_size_bytes = 900 * 1024 * 1024;
+        let cpu = SystemProfile {
+            total_ram_mb: 6_000,
+            available_ram_mb: 4_096,
+            detected_backend: AccelerationBackend::X86Baseline,
+            recommended_threads: 2,
         };
         let policy = MemoryPolicy {
             max_ram_usage_percent: 75,
             mmap: true,
             mlock: false,
             kv_dtype: KvCacheDtype::F16,
-            context_size: 4096,
+            context_size: 512,
             batch_size: 512,
         };
-        // Heuristic would claim 800 MB KV + 953 MB weights = 1753 MB against 6000 MB budget —
-        // but more importantly on a tight phone budget the heuristic kills small models.
-        let tight = SystemProfile {
-            total_ram_mb: 4_000,
-            available_ram_mb: 2_000,
-            detected_backend: AccelerationBackend::X86Baseline,
-            recommended_threads: 2,
-        };
-        // 75% of 2000 = 1500 MB. Heuristic: 953+800=1753 > 1500 → reject.
-        // Exact KV ~672 MB + soft weight + compute should fit better with mmap.
-        assert!(!tight.can_safely_load(gguf.file_size_bytes, 4096));
-        let plan = MemoryPlan::from_gguf(&gguf, &tight, &policy, false);
-        // With exact KV (~672) + soft weights + compute(~256) ≈ under or near budget
-        assert!(
-            matches!(plan.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv),
-            "expected fit for 1.5B, got {:?} kv={} soft_pressure path headroom={}",
-            plan.verdict,
-            plan.kv_cache_mb,
-            plan.headroom_mb
+        let rejected = MemoryPlan::from_gguf(&heavy, &cpu, &policy, false);
+        assert_eq!(
+            rejected.verdict,
+            Verdict::Exceeds,
+            "headroom {}",
+            rejected.headroom_mb
         );
-        assert!(plan.kv_cache_mb < 800);
-        let _ = profile;
+        let accepted = MemoryPlan::from_gguf(&light, &cpu, &policy, false);
+        assert!(
+            matches!(accepted.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv),
+            "{:?}",
+            accepted.verdict
+        );
+        let phone = SystemProfile {
+            total_ram_mb: 16_000,
+            available_ram_mb: 12_000,
+            detected_backend: AccelerationBackend::Vulkan,
+            recommended_threads: 4,
+        };
+        let on_phone = MemoryPlan::from_gguf(&heavy, &phone, &policy, false);
+        assert!(
+            matches!(on_phone.verdict, Verdict::Fits | Verdict::FitsIfQuantizedKv),
+            "{:?}",
+            on_phone.verdict
+        );
     }
 
     #[test]

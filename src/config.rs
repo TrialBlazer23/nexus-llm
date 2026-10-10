@@ -1,5 +1,6 @@
 use crate::node_identity::NodeIdentity;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -198,6 +199,64 @@ impl NexusConfig {
         }
         // No global 1800 MB ceiling — worker caps are per-node (Phase 11 §3.3).
         self.inference.moe.validate()?;
+        self.validate_appliance_and_adb()?;
+        Ok(())
+    }
+
+    /// Appliance orchestrator path, burst idle, battery action, and ADB host ports.
+    fn validate_appliance_and_adb(&self) -> Result<(), ConfigError> {
+        let orchestrator = &self.inference.appliance.orchestrator;
+        if !orchestrator_path_allowed(orchestrator) {
+            return Err(ConfigError::Invalid(format!(
+                "inference.appliance.orchestrator must be empty, a file name, or an absolute path (got {orchestrator})"
+            )));
+        }
+        if self.inference.appliance.burst_idle_secs < 1 {
+            return Err(ConfigError::Invalid(
+                "inference.appliance.burst_idle_secs must be >= 1".into(),
+            ));
+        }
+        if self.cluster.adb.max_devices < 1 {
+            return Err(ConfigError::Invalid(
+                "cluster.adb.max_devices must be >= 1".into(),
+            ));
+        }
+        let action = self.hardware.safety.battery_action.as_str();
+        if !matches!(action, "decline" | "throttle" | "ignore") {
+            return Err(ConfigError::Invalid(format!(
+                "hardware.safety.battery_action must be decline, throttle, or ignore (got {action})"
+            )));
+        }
+        self.validate_adb_host_ports()
+    }
+
+    /// Each device takes a host API port and the next port for control.
+    fn validate_adb_host_ports(&self) -> Result<(), ConfigError> {
+        let base = u32::from(self.cluster.adb.host_port_base);
+        let reserved = [
+            self.network.api_port,
+            self.network.control_port,
+            self.network.gateway_port,
+            self.network.discovery_port,
+            self.cluster.rpc_port,
+        ];
+        for i in 0..u32::from(self.cluster.adb.max_devices) {
+            let host_api = base + i * 2;
+            let host_control = host_api + 1;
+            if host_api > u32::from(u16::MAX) || host_control > u32::from(u16::MAX) {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.adb.host_port_base {base} does not fit device ports in u16"
+                )));
+            }
+            for reserved_port in reserved {
+                let reserved_port = u32::from(reserved_port);
+                if host_api == reserved_port || host_control == reserved_port {
+                    return Err(ConfigError::Invalid(format!(
+                        "cluster.adb.host_port_base {base} collides with reserved port {reserved_port}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -364,6 +423,100 @@ pub struct InferenceConfig {
     /// MoE flash-streaming backend (BigMoeOnEdge `bmoe-cli`). Phase 16.
     #[serde(default)]
     pub moe: MoeConfig,
+
+    /// Local orchestrator and interactive-floor policy for the edge appliance.
+    #[serde(default)]
+    pub appliance: ApplianceConfig,
+}
+
+/// Edge-appliance routing knobs (`[inference.appliance]`).
+///
+/// `interactive_floor_millis` is milli-tokens/sec so the struct stays `Eq`.
+/// TOML reads and writes the same value as `interactive_floor_tok_s`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplianceConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub orchestrator: String,
+
+    #[serde(
+        rename = "interactive_floor_tok_s",
+        default = "default_interactive_floor_millis",
+        deserialize_with = "deserialize_interactive_floor_millis",
+        serialize_with = "serialize_interactive_floor_millis"
+    )]
+    pub interactive_floor_millis: u32,
+
+    #[serde(default = "default_burst_idle_secs")]
+    pub burst_idle_secs: u64,
+}
+
+impl Default for ApplianceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            orchestrator: String::new(),
+            interactive_floor_millis: default_interactive_floor_millis(),
+            burst_idle_secs: default_burst_idle_secs(),
+        }
+    }
+}
+
+impl ApplianceConfig {
+    /// Interactive floor in tokens/sec (`interactive_floor_millis / 1000`).
+    pub fn floor_tok_s(&self) -> f32 {
+        self.interactive_floor_millis as f32 / 1000.0
+    }
+}
+
+fn default_interactive_floor_millis() -> u32 {
+    3000
+}
+
+fn default_burst_idle_secs() -> u64 {
+    600
+}
+
+fn deserialize_interactive_floor_millis<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let tok_s = f64::deserialize(deserializer)?;
+    if !tok_s.is_finite() || tok_s <= 0.0 || tok_s >= 10_000.0 {
+        return Err(D::Error::custom(
+            "interactive_floor_tok_s must be finite, greater than 0, and less than 10000",
+        ));
+    }
+    let millis = (tok_s * 1000.0).round();
+    if !millis.is_finite() || millis < 1.0 || millis > f64::from(u32::MAX) {
+        return Err(D::Error::custom(
+            "interactive_floor_tok_s is out of range after rounding to millis",
+        ));
+    }
+    Ok(millis as u32)
+}
+
+fn serialize_interactive_floor_millis<S>(millis: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_f64(f64::from(*millis) / 1000.0)
+}
+
+/// Empty, absolute, or a single normal path component (a file name, no parent directory).
+fn orchestrator_path_allowed(orchestrator: &str) -> bool {
+    if orchestrator.is_empty() {
+        return true;
+    }
+    let path = Path::new(orchestrator);
+    if path.is_absolute() {
+        return true;
+    }
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// Which side of the MoE budget to protect when context and cache cannot both fit.
@@ -999,6 +1152,37 @@ pub struct ClusterConfig {
 
     #[serde(default = "default_true")]
     pub prefer_adb_tunnel: bool,
+
+    /// USB forward allocator (`[cluster.adb]`).
+    #[serde(default)]
+    pub adb: AdbConfig,
+}
+
+/// Host-side ADB port block for USB-linked devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdbConfig {
+    #[serde(default = "default_host_port_base")]
+    pub host_port_base: u16,
+
+    #[serde(default = "default_adb_max_devices")]
+    pub max_devices: u8,
+}
+
+impl Default for AdbConfig {
+    fn default() -> Self {
+        Self {
+            host_port_base: default_host_port_base(),
+            max_devices: default_adb_max_devices(),
+        }
+    }
+}
+
+fn default_host_port_base() -> u16 {
+    18080
+}
+
+fn default_adb_max_devices() -> u8 {
+    8
 }
 
 impl Default for ClusterConfig {
@@ -1009,6 +1193,7 @@ impl Default for ClusterConfig {
             max_rpc_ram_mb: default_max_rpc_ram_mb(),
             auto_offload: true,
             prefer_adb_tunnel: true,
+            adb: AdbConfig::default(),
         }
     }
 }
@@ -1152,5 +1337,85 @@ pub fn expand_tilde<P: AsRef<Path>>(path: P) -> PathBuf {
         PathBuf::from(home).join(stripped)
     } else {
         p.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appliance_defaults_parse_from_empty_toml() {
+        let cfg: NexusConfig = toml::from_str("").expect("empty toml");
+        assert!(cfg.inference.appliance.enabled);
+        assert_eq!(cfg.inference.appliance.orchestrator, "");
+        assert_eq!(cfg.inference.appliance.interactive_floor_millis, 3000);
+        assert!((cfg.inference.appliance.floor_tok_s() - 3.0).abs() < 0.001);
+        assert_eq!(cfg.inference.appliance.burst_idle_secs, 600);
+        assert_eq!(cfg.cluster.adb.host_port_base, 18080);
+        assert_eq!(cfg.cluster.adb.max_devices, 8);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn floor_toml_float_round_trips() {
+        let raw = "\
+[inference.appliance]
+interactive_floor_tok_s = 3.5
+";
+        let cfg: NexusConfig = toml::from_str(raw).expect("parse");
+        assert_eq!(cfg.inference.appliance.interactive_floor_millis, 3500);
+        let out = toml::to_string(&cfg).expect("serialize");
+        assert!(out.contains("interactive_floor_tok_s = 3.5"), "{out}");
+    }
+
+    #[test]
+    fn rejects_bad_orchestrator_and_port_base() {
+        let mut cfg = NexusConfig::default();
+        cfg.inference.appliance.orchestrator = "nested/model.gguf".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("nested/model.gguf"), "{err}");
+
+        cfg.inference.appliance.orchestrator.clear();
+        cfg.cluster.adb.host_port_base = 8090;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("18080") || err.contains("8090"), "{err}");
+
+        cfg.cluster.adb.host_port_base = 18080;
+        cfg.hardware.safety.battery_action = "sleep".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sleep"), "{err}");
+    }
+
+    #[test]
+    fn rejects_floor_bounds_idle_and_device_limits() {
+        for raw_value in ["0.0", "10000.0", "-1.5"] {
+            let raw = format!("[inference.appliance]\ninteractive_floor_tok_s = {raw_value}\n");
+            let err = toml::from_str::<NexusConfig>(&raw)
+                .expect_err(raw_value)
+                .to_string();
+            assert!(
+                err.contains("interactive_floor_tok_s"),
+                "{raw_value}: {err}"
+            );
+        }
+
+        let mut cfg = NexusConfig::default();
+        cfg.inference.appliance.orchestrator = "model.gguf".into();
+        assert!(cfg.validate().is_ok());
+        cfg.inference.appliance.orchestrator = "/var/models/model.gguf".into();
+        assert!(cfg.validate().is_ok());
+
+        cfg.inference.appliance.orchestrator.clear();
+        cfg.inference.appliance.burst_idle_secs = 0;
+        assert!(cfg.validate().is_err());
+        cfg.inference.appliance.burst_idle_secs = 600;
+
+        cfg.cluster.adb.max_devices = 0;
+        assert!(cfg.validate().is_err());
+        cfg.cluster.adb.max_devices = 2;
+        cfg.cluster.adb.host_port_base = 65534;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("host_port_base"), "{err}");
     }
 }

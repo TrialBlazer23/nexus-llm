@@ -358,6 +358,109 @@ impl SystemProfile {
     }
 }
 
+/// Host power source advertised on the control plane.
+///
+/// Serde names are `ac`, `battery`, and `unknown`. Missing JSON uses [`Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PowerSource {
+    #[serde(rename = "ac")]
+    Ac,
+    #[serde(rename = "battery")]
+    Battery,
+    #[default]
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+/// Battery percent and power source from power-supply sysfs triples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerReading {
+    pub battery_percent: Option<u8>,
+    pub power_source: PowerSource,
+}
+
+fn status_is_ac(status: &str) -> bool {
+    matches!(status.trim(), "Charging" | "Full" | "Not charging")
+}
+
+/// Parse `(type, capacity, status)` triples.
+///
+/// The first type equal to `Battery` (ASCII case-insensitive) supplies the
+/// percent. A non-integer capacity is `None` and does not fail the parse.
+/// A discharging battery is [`PowerSource::Battery`] even when another supply
+/// reports `Charging`, `Full`, or `Not charging`. No entries, and supplies
+/// with no battery, are [`PowerSource::Ac`] with a null percent.
+pub fn parse_power_supply(entries: &[(&str, &str, &str)]) -> PowerReading {
+    if entries.is_empty() {
+        return PowerReading {
+            battery_percent: None,
+            power_source: PowerSource::Ac,
+        };
+    }
+
+    let battery = entries
+        .iter()
+        .find(|(kind, _, _)| kind.trim().eq_ignore_ascii_case("Battery"));
+    let battery_percent = battery.and_then(|(_, capacity, _)| capacity.trim().parse::<u8>().ok());
+    let battery_status = battery.map(|(_, _, status)| status.trim()).unwrap_or("");
+
+    let power_source = if battery_status == "Discharging" {
+        PowerSource::Battery
+    } else if entries.iter().any(|(_, _, status)| status_is_ac(status)) {
+        PowerSource::Ac
+    } else if battery.is_some() {
+        PowerSource::Unknown
+    } else {
+        PowerSource::Ac
+    };
+
+    PowerReading {
+        battery_percent,
+        power_source,
+    }
+}
+
+fn read_power_supply_file(path: &Path) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Read `/sys/class/power_supply` into [`parse_power_supply`].
+///
+/// Unreadable files are skipped. A missing directory is the empty-input
+/// result: AC power and a null percent.
+pub fn probe_power() -> PowerReading {
+    let root = Path::new("/sys/class/power_supply");
+    let Ok(dir) = fs::read_dir(root) else {
+        return parse_power_supply(&[]);
+    };
+
+    let mut supplies: Vec<_> = dir.filter_map(Result::ok).collect();
+    // Stable order so "first Battery" does not follow readdir.
+    supplies.sort_by_key(|entry| entry.file_name());
+
+    let mut owned = Vec::with_capacity(supplies.len());
+    for entry in supplies {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        owned.push((
+            read_power_supply_file(&path.join("type")),
+            read_power_supply_file(&path.join("capacity")),
+            read_power_supply_file(&path.join("status")),
+        ));
+    }
+
+    let borrowed: Vec<(&str, &str, &str)> = owned
+        .iter()
+        .map(|(kind, capacity, status)| (kind.as_str(), capacity.as_str(), status.as_str()))
+        .collect();
+    parse_power_supply(&borrowed)
+}
+
 /// Free disk bytes available on the filesystem that contains `path` (Linux/`statvfs`, Bionic-safe).
 pub fn available_disk_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -458,5 +561,23 @@ mod tests {
         };
         let gguf = streamable_moe_gguf(18);
         assert!(!profile.can_safely_moe_stream_pct(&gguf, 4096, 8000, 75));
+    }
+
+    #[test]
+    fn battery_parse_prefers_battery_type() {
+        use crate::sysinfo::{parse_power_supply, PowerSource};
+        let entries = [("Mains", "", "Charging"), ("Battery", "40", "Discharging")];
+        let reading = parse_power_supply(&entries);
+        assert_eq!(reading.battery_percent, Some(40));
+        assert_eq!(reading.power_source, PowerSource::Battery);
+    }
+
+    #[test]
+    fn ac_when_battery_is_charging_or_absent() {
+        use crate::sysinfo::{parse_power_supply, PowerSource};
+        let charging = [("Battery", "80", "Charging")];
+        assert_eq!(parse_power_supply(&charging).power_source, PowerSource::Ac);
+        assert_eq!(parse_power_supply(&[]).battery_percent, None);
+        assert_eq!(parse_power_supply(&[]).power_source, PowerSource::Ac);
     }
 }

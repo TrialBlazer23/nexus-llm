@@ -106,6 +106,8 @@ fn control_plane_validates_identity_protocol_and_policy() {
         active_model: None,
         loaded_models: Vec::new(),
         signing_public_key: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 

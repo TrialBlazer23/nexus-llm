@@ -1,5 +1,6 @@
 use crate::discovery::{NodeRole, ServiceEndpoint};
 use crate::node_identity::NodeIdentity;
+use crate::sysinfo::{probe_power, PowerSource};
 use crate::trust_auth::{apply_auth_headers, AuthError};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,11 @@ pub struct ControlPlaneState {
     pub loaded_models: Vec<LoadedModelInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_public_key: Option<String>,
+    #[serde(default)]
+    pub battery_percent: Option<u8>,
+    /// Older peers omit this field; missing JSON is [`PowerSource::Unknown`].
+    #[serde(default)]
+    pub power_source: PowerSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +183,7 @@ pub async fn build_control_plane_state_with_host(
             memory_mb: slot.memory_bytes / (1024 * 1024),
         })
         .collect();
+    let power = probe_power();
 
     ControlPlaneState {
         node_id,
@@ -190,6 +197,8 @@ pub async fn build_control_plane_state_with_host(
         active_model,
         loaded_models,
         signing_public_key,
+        battery_percent: power.battery_percent,
+        power_source: power.power_source,
     }
 }
 
@@ -1568,4 +1577,25 @@ pub async fn handle_kb_push(
             error_message: Some(e.to_string()),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn old_state_json_defaults_battery() {
+        use crate::control_plane::ControlPlaneState;
+        let raw = r#"{
+        "node_id": "00000000-0000-0000-0000-000000000001",
+        "protocol_version": 1,
+        "role": 1,
+        "capabilities": [],
+        "ready": true,
+        "inferring": false,
+        "rpc_ready": false,
+        "allocatable_memory_mb": 1000
+    }"#;
+        let state: ControlPlaneState = serde_json::from_str(raw).expect("old peers still parse");
+        assert_eq!(state.battery_percent, None);
+        assert_eq!(state.power_source, crate::sysinfo::PowerSource::Unknown);
+    }
 }

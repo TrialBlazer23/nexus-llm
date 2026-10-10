@@ -190,4 +190,98 @@ fn ranks_local_moe_stream_for_oversize_moe() {
     {
         assert!(moe_idx < dist_idx);
     }
+    // Cold start uses the 2.2 tok/s heuristic when no MoE bench sample exists.
+    assert!(
+        (plans[moe_idx].predicted_tok_s - 2.2).abs() < 0.01,
+        "expected cold-start 2.2, got {}",
+        plans[moe_idx].predicted_tok_s
+    );
+}
+
+#[test]
+fn local_moe_stream_uses_measured_bench_tok_s() {
+    use nexus::bench::{unix_now, BenchSample, BenchStore, BACKEND_MOE_STREAM};
+    use nexus::gguf::GgufTensorInfo;
+
+    let expert = GgufTensorInfo {
+        name: "blk.0.ffn_gate_exps.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 0,
+        nbytes: 12_000_000_000,
+        layer_index: Some(0),
+    };
+    let dense = GgufTensorInfo {
+        name: "blk.0.attn_q.weight".into(),
+        n_dims: 2,
+        dims: [32, 64, 0, 0],
+        ggml_type: 2,
+        offset: 100,
+        nbytes: 800_000_000,
+        layer_index: Some(0),
+    };
+    let gguf = GgufMetadata {
+        version: 3,
+        tensor_count: 2,
+        kv_count: 0,
+        metadata: HashMap::new(),
+        architecture: Some("qwen3moe".into()),
+        model_name: Some("big-moe".into()),
+        context_length: Some(4096),
+        block_count: Some(1),
+        head_count: Some(8),
+        head_count_kv: Some(8),
+        embedding_length: Some(512),
+        expert_count: Some(128),
+        expert_used_count: Some(8),
+        file_size_bytes: 18_000_000_000,
+        tensors: vec![expert, dense],
+        quant_label: Some("Q4_0".into()),
+    };
+    let mut store = BenchStore {
+        version: 1,
+        entries: vec![],
+    };
+    store.record_with_backend_key(
+        "big-moe",
+        "phone",
+        BACKEND_MOE_STREAM,
+        2048,
+        BenchSample {
+            gen_tok_s: 3.5,
+            ttft_ms: None,
+            prompt_tok_s: None,
+            cache_hit_pct: Some(70.0),
+            measured_at: unix_now(),
+        },
+    );
+    let profile = SystemProfile {
+        total_ram_mb: 12_000,
+        available_ram_mb: 10_000,
+        detected_backend: AccelerationBackend::ArmCpuDotProd,
+        recommended_threads: 4,
+    };
+    let req = PlacementRequest {
+        gguf: &gguf,
+        policy: MemoryPolicy::from_safety(75, true, false, 2048),
+        local_profile: profile,
+        local_name: "phone".into(),
+        local_gpu_layers: 0,
+        enable_rpc: false,
+        bench: Some(&store),
+        moe_stream_enabled: true,
+        moe_cache_ceil_mb: 3500,
+        candidates: vec![],
+    };
+    let plans = rank_execution_plans(&req).expect("plans");
+    let moe = plans
+        .iter()
+        .find(|p| matches!(p.target, PlanTarget::LocalMoeStream { .. }))
+        .expect("LocalMoeStream plan");
+    assert!(
+        (moe.predicted_tok_s - 3.5).abs() < 0.01,
+        "expected measured 3.5, got {}",
+        moe.predicted_tok_s
+    );
 }

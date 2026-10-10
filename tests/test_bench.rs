@@ -56,6 +56,7 @@ fn bench_store_round_trip_and_lookup() {
             gen_tok_s: 42.0,
             ttft_ms: Some(120),
             prompt_tok_s: Some(80.0),
+            cache_hit_pct: None,
             measured_at: unix_now(),
         },
     );
@@ -140,6 +141,7 @@ fn ranker_prefers_measured_tok_s_over_heuristic() {
             gen_tok_s: 500.0,
             ttft_ms: Some(10),
             prompt_tok_s: Some(200.0),
+            cache_hit_pct: None,
             measured_at: unix_now(),
         },
     );

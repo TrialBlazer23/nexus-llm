@@ -20,6 +20,10 @@ const STORE_VERSION: u32 = 1;
 const MAX_SAMPLES: usize = 8;
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 
+/// BenchStore backend key for BigMoeOnEdge flash-stream sessions (not an
+/// `AccelerationBackend` — that enum is reserved for hardware probe).
+pub const BACKEND_MOE_STREAM: &str = "moe-stream";
+
 #[derive(Debug, Error)]
 pub enum BenchError {
     #[error("I/O error in bench store: {0}")]
@@ -61,6 +65,9 @@ pub struct BenchSample {
     pub ttft_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tok_s: Option<f32>,
+    /// MoE expert-cache hit rate from `BMOE_DONE` (percent), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_pct: Option<f32>,
     /// Unix seconds since epoch.
     pub measured_at: u64,
 }
@@ -77,6 +84,9 @@ pub struct BenchEntry {
     pub ttft_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tok_s: Option<f32>,
+    /// Rolling average of MoE expert-cache hit percent samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_pct: Option<f32>,
     pub measured_at: u64,
     #[serde(default)]
     pub samples: Vec<BenchSample>,
@@ -142,7 +152,18 @@ impl BenchStore {
         backend: AccelerationBackend,
         context_size: usize,
     ) -> Option<f32> {
-        self.find_entry(model_id, node_id, backend, context_size)
+        self.lookup_gen_tok_s_by_key(model_id, node_id, backend_key(backend), context_size)
+    }
+
+    /// Lookup by free-form backend key (e.g. [`BACKEND_MOE_STREAM`]).
+    pub fn lookup_gen_tok_s_by_key(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        backend: &str,
+        context_size: usize,
+    ) -> Option<f32> {
+        self.find_entry_by_key(model_id, node_id, backend, context_size)
             .map(|e| e.gen_tok_s)
     }
 
@@ -153,7 +174,16 @@ impl BenchStore {
         backend: AccelerationBackend,
         context_size: usize,
     ) -> Option<f32> {
-        let backend = backend_key(backend);
+        self.lookup_gen_tok_s_any_node_by_key(model_id, backend_key(backend), context_size)
+    }
+
+    /// Any-node lookup for a free-form backend key.
+    pub fn lookup_gen_tok_s_any_node_by_key(
+        &self,
+        model_id: &str,
+        backend: &str,
+        context_size: usize,
+    ) -> Option<f32> {
         let mut best: Option<&BenchEntry> = None;
         for e in &self.entries {
             if !model_ids_match(&e.model_id, model_id) {
@@ -177,7 +207,16 @@ impl BenchStore {
         backend: AccelerationBackend,
         context_size: usize,
     ) -> Option<&BenchEntry> {
-        let backend = backend_key(backend);
+        self.find_entry_by_key(model_id, node_id, backend_key(backend), context_size)
+    }
+
+    pub fn find_entry_by_key(
+        &self,
+        model_id: &str,
+        node_id: &str,
+        backend: &str,
+        context_size: usize,
+    ) -> Option<&BenchEntry> {
         self.entries.iter().find(|e| {
             model_ids_match(&e.model_id, model_id)
                 && e.node_id == node_id
@@ -195,9 +234,27 @@ impl BenchStore {
         context_size: usize,
         sample: BenchSample,
     ) -> &BenchEntry {
+        self.record_with_backend_key(
+            model_id,
+            node_id,
+            backend_key(backend),
+            context_size,
+            sample,
+        )
+    }
+
+    /// Append a sample under a free-form backend key (e.g. [`BACKEND_MOE_STREAM`]).
+    pub fn record_with_backend_key(
+        &mut self,
+        model_id: impl Into<String>,
+        node_id: impl Into<String>,
+        backend: &str,
+        context_size: usize,
+        sample: BenchSample,
+    ) -> &BenchEntry {
         let model_id = model_id.into();
         let node_id = node_id.into();
-        let backend_s = backend_key(backend).to_string();
+        let backend_s = backend.to_string();
 
         if let Some(idx) = self.entries.iter().position(|e| {
             model_ids_match(&e.model_id, &model_id)
@@ -223,6 +280,7 @@ impl BenchStore {
             gen_tok_s: sample.gen_tok_s,
             ttft_ms: sample.ttft_ms,
             prompt_tok_s: sample.prompt_tok_s,
+            cache_hit_pct: sample.cache_hit_pct,
             measured_at: sample.measured_at,
             samples: vec![sample],
         };
@@ -239,11 +297,28 @@ impl BenchStore {
         context_size: usize,
         sample: BenchSample,
     ) {
+        Self::record_default_best_effort_key(
+            model_id,
+            node_id,
+            backend_key(backend),
+            context_size,
+            sample,
+        );
+    }
+
+    /// Best-effort record under a free-form backend key.
+    pub fn record_default_best_effort_key(
+        model_id: &str,
+        node_id: &str,
+        backend: &str,
+        context_size: usize,
+        sample: BenchSample,
+    ) {
         let path = Self::default_path();
         let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         match Self::load(&path) {
             Ok(mut store) => {
-                store.record(model_id, node_id, backend, context_size, sample);
+                store.record_with_backend_key(model_id, node_id, backend, context_size, sample);
                 if let Err(e) = store.save(&path) {
                     warn!("bench store save failed: {e}");
                 }
@@ -269,6 +344,16 @@ fn recompute_entry(entry: &mut BenchEntry) {
         None
     } else {
         Some(prompt_vals.iter().sum::<f32>() / prompt_vals.len() as f32)
+    };
+    let hit_vals: Vec<f32> = entry
+        .samples
+        .iter()
+        .filter_map(|s| s.cache_hit_pct)
+        .collect();
+    entry.cache_hit_pct = if hit_vals.is_empty() {
+        None
+    } else {
+        Some(hit_vals.iter().sum::<f32>() / hit_vals.len() as f32)
     };
     entry.measured_at = entry
         .samples
@@ -356,6 +441,7 @@ pub async fn measure_once(
         gen_tok_s,
         ttft_ms,
         prompt_tok_s,
+        cache_hit_pct: None,
         measured_at: unix_now(),
     })
 }
@@ -428,6 +514,7 @@ mod unit_tests {
                 gen_tok_s: 10.0,
                 ttft_ms: Some(100),
                 prompt_tok_s: Some(50.0),
+                cache_hit_pct: None,
                 measured_at: 1,
             },
         );
@@ -440,6 +527,7 @@ mod unit_tests {
                 gen_tok_s: 20.0,
                 ttft_ms: Some(80),
                 prompt_tok_s: Some(60.0),
+                cache_hit_pct: None,
                 measured_at: 2,
             },
         );
@@ -451,6 +539,53 @@ mod unit_tests {
         assert_eq!(
             store.lookup_gen_tok_s("m.gguf", "local", AccelerationBackend::Vulkan, 2048),
             Some(e.gen_tok_s)
+        );
+    }
+
+    #[test]
+    fn moe_stream_key_records_cache_hit_average() {
+        let mut store = BenchStore {
+            version: 1,
+            entries: vec![],
+        };
+        store.record_with_backend_key(
+            "qwen-moe.gguf",
+            "local",
+            BACKEND_MOE_STREAM,
+            4096,
+            BenchSample {
+                gen_tok_s: 2.0,
+                ttft_ms: None,
+                prompt_tok_s: None,
+                cache_hit_pct: Some(40.0),
+                measured_at: 1,
+            },
+        );
+        store.record_with_backend_key(
+            "qwen-moe.gguf",
+            "local",
+            BACKEND_MOE_STREAM,
+            4096,
+            BenchSample {
+                gen_tok_s: 3.0,
+                ttft_ms: None,
+                prompt_tok_s: None,
+                cache_hit_pct: Some(60.0),
+                measured_at: 2,
+            },
+        );
+        let e = store
+            .find_entry_by_key("qwen-moe", "local", BACKEND_MOE_STREAM, 4096)
+            .expect("moe entry");
+        assert!((e.gen_tok_s - 2.5).abs() < 0.01);
+        assert_eq!(e.cache_hit_pct, Some(50.0));
+        assert_eq!(
+            store.lookup_gen_tok_s_by_key("qwen-moe.gguf", "local", BACKEND_MOE_STREAM, 4096),
+            Some(2.5)
+        );
+        assert_eq!(
+            store.lookup_gen_tok_s_any_node_by_key("qwen-moe", BACKEND_MOE_STREAM, 4096),
+            Some(2.5)
         );
     }
 }

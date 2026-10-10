@@ -1,6 +1,6 @@
 //! Link-quality probing and predicted-throughput ranking (Phase 11 §3.6 / §3.8).
 
-use crate::bench::BenchStore;
+use crate::bench::{BenchStore, BACKEND_MOE_STREAM};
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
 use std::time::{Duration, Instant};
@@ -251,8 +251,14 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                         cache_ceil_mb: ceil,
                     },
                 );
-                // Flash-I/O-bound phone baseline (~1–3 tok/s class); prefer over RPC.
-                let tok = 2.2_f32;
+                // Prefer measured BMOE_DONE tok/s; cold-start fallback ~1–3 tok/s class.
+                let tok = measured_moe_tok_s(
+                    req.bench,
+                    &model_key,
+                    &req.local_name,
+                    req.policy.context_size,
+                )
+                .unwrap_or(2.2);
                 plans.push(ExecutionPlan {
                     target: PlanTarget::LocalMoeStream {
                         cache_mb,
@@ -453,6 +459,22 @@ fn measured_tok_s(
     store
         .lookup_gen_tok_s(model_id, node_id, backend, context_size)
         .or_else(|| store.lookup_gen_tok_s_any_node(model_id, backend, context_size))
+}
+
+/// Measured BigMoe flash-stream throughput (`BACKEND_MOE_STREAM` key).
+fn measured_moe_tok_s(
+    bench: Option<&BenchStore>,
+    model_id: &str,
+    node_id: &str,
+    context_size: usize,
+) -> Option<f32> {
+    let store = bench?;
+    store
+        .lookup_gen_tok_s_by_key(model_id, node_id, BACKEND_MOE_STREAM, context_size)
+        .or_else(|| {
+            store.lookup_gen_tok_s_any_node_by_key(model_id, BACKEND_MOE_STREAM, context_size)
+        })
+        .filter(|v| *v > 0.0)
 }
 
 fn predict_local_tok_s(

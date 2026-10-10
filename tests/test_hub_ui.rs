@@ -659,6 +659,12 @@ async fn test_cluster_view_interactions() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: std::time::Instant::now(),
     };
     let peer2 = PeerNode {
@@ -677,6 +683,12 @@ async fn test_cluster_view_interactions() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: std::time::Instant::now(),
     };
 
@@ -880,6 +892,12 @@ async fn test_cluster_view_link_quality_visuals() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: std::time::Instant::now(),
     };
     cluster.peers.push(peer);

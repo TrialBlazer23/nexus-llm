@@ -20,6 +20,8 @@ fn endpoint(node_id: Uuid, address: [u8; 4]) -> ServiceEndpoint {
         control_port: 9998,
         display_name: String::new(),
         rpc_port: 50052,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
     }
 }
 
@@ -152,6 +154,12 @@ async fn rpc_selection_requires_policy_and_caps_allocatable_memory() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: now,
     };
     discovery
@@ -221,6 +229,12 @@ async fn primary_compute_resolution_does_not_promote_unpinned_host() {
             display_name: String::new(),
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            link_class: nexus::cluster::LinkClass::Wifi,
+            usb_serial: None,
+            usb_api_endpoint: None,
+            usb_control_endpoint: None,
+            battery_percent: None,
+            power_source: nexus::sysinfo::PowerSource::Unknown,
             last_seen: Instant::now(),
         },
     );

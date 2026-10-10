@@ -194,6 +194,12 @@ async fn test_peer_cache_expiry_and_pruning() {
                 display_name: String::new(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );
@@ -248,6 +254,12 @@ async fn test_find_best_host_scoring() {
                 display_name: String::new(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );
@@ -271,6 +283,12 @@ async fn test_find_best_host_scoring() {
                 display_name: String::new(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );
@@ -294,6 +312,12 @@ async fn test_find_best_host_scoring() {
                 display_name: String::new(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );
@@ -433,6 +457,8 @@ async fn test_record_service_endpoint_merges_mdns() {
         control_port: 9998,
         display_name: "galaxy-s23".to_string(),
         rpc_port: 50052,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
     };
 
     discovery
@@ -474,6 +500,12 @@ fn test_peer_label_prefers_display_name() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: Instant::now(),
     };
     assert_eq!(peer.label(), "Node-aaaaaaaa");
@@ -517,6 +549,12 @@ async fn test_resolve_from_discovery_falls_back_to_best_host() {
             display_name: "lan-host".to_string(),
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            link_class: nexus::cluster::LinkClass::Wifi,
+            usb_serial: None,
+            usb_api_endpoint: None,
+            usb_control_endpoint: None,
+            battery_percent: None,
+            power_source: nexus::sysinfo::PowerSource::Unknown,
             last_seen: Instant::now(),
         },
     );

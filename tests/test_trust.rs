@@ -283,6 +283,12 @@ async fn forged_beacon_does_not_enable_trusted_connect() {
             display_name: "forged".into(),
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            link_class: nexus::cluster::LinkClass::Wifi,
+            usb_serial: None,
+            usb_api_endpoint: None,
+            usb_control_endpoint: None,
+            battery_percent: None,
+            power_source: nexus::sysinfo::PowerSource::Unknown,
             last_seen: Instant::now(),
         },
     );

@@ -25,6 +25,8 @@ fn gateway_test_config() -> NexusConfig {
     cfg.network.api_port = 18080;
     cfg.network.control_port = 19998;
     cfg.network.discovery_port = 19999;
+    // Default host_port_base is 18080 and occupies the next 16 ports.
+    cfg.cluster.adb.host_port_base = 18100;
     cfg.network.security.require_pairing = false;
     cfg.network.discovery.mdns.enabled = false;
     cfg.validate().expect("gateway test config");
@@ -118,6 +120,12 @@ async fn gateway_routes_stream_to_matching_peer() {
         display_name: "peer-a".into(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: Instant::now(),
     };
     let peer_b = PeerNode {
@@ -136,6 +144,12 @@ async fn gateway_routes_stream_to_matching_peer() {
         display_name: "peer-b".into(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        link_class: nexus::cluster::LinkClass::Wifi,
+        usb_serial: None,
+        usb_api_endpoint: None,
+        usb_control_endpoint: None,
+        battery_percent: None,
+        power_source: nexus::sysinfo::PowerSource::Unknown,
         last_seen: Instant::now(),
     };
 
@@ -246,6 +260,12 @@ async fn gateway_prefers_local_over_peer() {
                 display_name: "remote".into(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );
@@ -374,6 +394,12 @@ async fn gateway_skips_untrusted_peer_when_pairing_enforced() {
                 display_name: "untrusted".into(),
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                link_class: nexus::cluster::LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: None,
+                power_source: nexus::sysinfo::PowerSource::Unknown,
                 last_seen: Instant::now(),
             },
         );

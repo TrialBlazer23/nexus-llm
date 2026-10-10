@@ -132,6 +132,8 @@ pub fn endpoint_from_state(
         },
         control_port: endpoint.control_port,
         display_name: endpoint.display_name.clone(),
+        battery_percent: state.battery_percent,
+        power_source: state.power_source,
     }
 }
 

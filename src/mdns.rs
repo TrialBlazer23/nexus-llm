@@ -1,4 +1,5 @@
 use crate::discovery::{BackendHealth, DiscoveryEvent, NodeRole, ServiceEndpoint};
+use crate::sysinfo::PowerSource;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, ToSocketAddrs};
@@ -44,9 +45,15 @@ impl MdnsBackend {
         capabilities: &[String],
         display_name: &str,
         address: IpAddr,
+        battery_percent: Option<u8>,
+        power_source: PowerSource,
     ) -> Result<(), MdnsError> {
         let capability_list = capabilities.join(",");
         let cluster = cluster_id.map(|id| id.to_string()).unwrap_or_default();
+        let bat = match battery_percent {
+            Some(percent) => percent.to_string(),
+            None => String::new(),
+        };
         let properties = HashMap::from([
             ("id".to_string(), node_id.to_string()),
             ("cluster".to_string(), cluster),
@@ -57,6 +64,11 @@ impl MdnsBackend {
             ("rpc".to_string(), rpc_port.to_string()),
             ("ctrl".to_string(), control_port.to_string()),
             ("name".to_string(), display_name.to_string()),
+            ("bat".to_string(), bat),
+            (
+                "pwr".to_string(),
+                power_source_txt(power_source).to_string(),
+            ),
         ]);
         let info = ServiceInfo::new(
             service_type,
@@ -133,6 +145,19 @@ fn endpoint_from_resolved(
 ) -> Result<ServiceEndpoint, MdnsError> {
     let properties: HashMap<String, String> =
         service.txt_properties.clone().into_property_map_str();
+    let mut endpoint = endpoint_from_properties(&properties, service.port)?;
+    endpoint.addresses = (service.host.as_str(), service.port)
+        .to_socket_addrs()
+        .map_err(|e| MdnsError::Resolve(e.to_string()))?
+        .collect();
+    Ok(endpoint)
+}
+
+/// Read advertisement TXT without resolving a host or starting a daemon.
+fn endpoint_from_properties(
+    properties: &HashMap<String, String>,
+    service_port: u16,
+) -> Result<ServiceEndpoint, MdnsError> {
     let node_id = properties
         .get("id")
         .ok_or_else(|| MdnsError::InvalidIdentity("missing id TXT property".to_string()))
@@ -147,14 +172,10 @@ fn endpoint_from_resolved(
     let cluster_id = properties
         .get("cluster")
         .and_then(|id| Uuid::parse_str(id).ok());
-    let addresses = (service.host.as_str(), service.port)
-        .to_socket_addrs()
-        .map_err(|e| MdnsError::Resolve(e.to_string()))?
-        .collect();
     let api_port = properties
         .get("api")
         .and_then(|port| port.parse().ok())
-        .unwrap_or(service.port);
+        .unwrap_or(service_port);
     let rpc_port = properties
         .get("rpc")
         .and_then(|port| port.parse().ok())
@@ -177,6 +198,7 @@ fn endpoint_from_resolved(
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_default();
+    let (battery_percent, power_source) = power_from_txt(properties);
 
     Ok(ServiceEndpoint {
         node_id,
@@ -187,15 +209,78 @@ fn endpoint_from_resolved(
             .unwrap_or(0),
         role,
         capabilities,
-        addresses,
+        addresses: Vec::new(),
         api_port,
         rpc_port,
         control_port,
         display_name,
+        battery_percent,
+        power_source,
     })
+}
+
+/// `bat` is an integer 0–100. `pwr` is `ac`, `battery`, or `unknown`.
+/// A missing or unusable key does not fail the parse.
+fn power_from_txt(properties: &HashMap<String, String>) -> (Option<u8>, PowerSource) {
+    let battery_percent = properties.get("bat").and_then(|value| parse_bat(value));
+    let power_source = properties
+        .get("pwr")
+        .map(|value| parse_pwr(value))
+        .unwrap_or(PowerSource::Unknown);
+    (battery_percent, power_source)
+}
+
+fn parse_bat(value: &str) -> Option<u8> {
+    let percent = value.trim().parse::<u8>().ok()?;
+    if percent <= 100 {
+        Some(percent)
+    } else {
+        None
+    }
+}
+
+fn parse_pwr(value: &str) -> PowerSource {
+    match value.trim() {
+        "ac" => PowerSource::Ac,
+        "battery" => PowerSource::Battery,
+        _ => PowerSource::Unknown,
+    }
+}
+
+fn power_source_txt(source: PowerSource) -> &'static str {
+    match source {
+        PowerSource::Ac => "ac",
+        PowerSource::Battery => "battery",
+        PowerSource::Unknown => "unknown",
+    }
 }
 
 fn node_id_from_fullname(fullname: &str) -> Result<Uuid, MdnsError> {
     let instance = fullname.split('.').next().unwrap_or_default();
     Uuid::parse_str(instance).map_err(|e| MdnsError::InvalidIdentity(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_from_properties;
+    use crate::sysinfo::PowerSource;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn txt_bat_and_pwr_parse_and_missing_keys_leave_percent_none() {
+        let with_power = HashMap::from([
+            ("id".to_string(), Uuid::nil().to_string()),
+            ("bat".to_string(), "40".to_string()),
+            ("pwr".to_string(), "battery".to_string()),
+        ]);
+        let endpoint = endpoint_from_properties(&with_power, 8080).expect("bat and pwr parse");
+        assert_eq!(endpoint.battery_percent, Some(40));
+        assert_eq!(endpoint.power_source, PowerSource::Battery);
+
+        let without = HashMap::from([("id".to_string(), Uuid::nil().to_string())]);
+        let endpoint = endpoint_from_properties(&without, 8080).expect("missing keys are ignored");
+        assert_eq!(endpoint.battery_percent, None);
+        assert_eq!(endpoint.power_source, PowerSource::Unknown);
+    }
 }

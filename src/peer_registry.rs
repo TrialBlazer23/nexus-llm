@@ -257,6 +257,8 @@ fn merge_endpoint(current: &mut ServiceEndpoint, observed: ServiceEndpoint) {
     current.capabilities = observed.capabilities;
     current.api_port = observed.api_port;
     current.rpc_port = observed.rpc_port;
+    current.battery_percent = observed.battery_percent;
+    current.power_source = observed.power_source;
 }
 
 impl From<&PeerRecord> for SocketAddr {

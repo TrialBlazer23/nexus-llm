@@ -4,6 +4,7 @@ use crate::bench::BenchStore;
 use crate::config::MoeConfig;
 use crate::gguf::GgufMetadata;
 use crate::sysinfo::{AccelerationBackend, SystemProfile};
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 use super::memory::{MemoryPlan, MemoryPolicy, Verdict};
@@ -539,10 +540,13 @@ fn moe_stream_execution(
 }
 
 /// Link used when ranking a burst candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Default is Wi-Fi so a disk snapshot written before USB fields existed stays a LAN peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LinkClass {
     Local,
     Usb,
+    #[default]
     Wifi,
 }
 

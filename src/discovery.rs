@@ -1,6 +1,7 @@
+use crate::cluster::LinkClass;
 use crate::config::NexusConfig;
 use crate::peer_registry::{ObservationSource, PeerLifecycle, PeerRegistry};
-use crate::sysinfo::{AccelerationBackend, SystemProfile};
+use crate::sysinfo::{AccelerationBackend, PowerSource, SystemProfile};
 use crate::trust_auth::pairing_enforced;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,6 +40,10 @@ pub struct ServiceEndpoint {
     pub control_port: u16,
     /// Human-readable name from mDNS TXT `name=` (empty when unknown / UDP-only).
     pub display_name: String,
+    /// mDNS TXT `bat`. Missing or non-integer values are `None` and do not fail parse.
+    pub battery_percent: Option<u8>,
+    /// mDNS TXT `pwr` (`ac`, `battery`, `unknown`). A missing key is [`PowerSource::Unknown`].
+    pub power_source: PowerSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +333,24 @@ pub struct PeerNode {
     /// Optional advertised MoE expert-cache ceiling (MiB); 0 = unknown.
     #[serde(default)]
     pub moe_cache_ceil_mb: u32,
+    /// Live path. Wi-Fi until [`Self::apply_usb_probe`]; disk snapshots default to Wi-Fi.
+    #[serde(default)]
+    pub link_class: LinkClass,
+    /// ADB serial for the live USB forward. Not a routing key by itself.
+    #[serde(default)]
+    pub usb_serial: Option<String>,
+    /// `http://127.0.0.1:<host_api>` while the USB forward is the live link.
+    #[serde(default)]
+    pub usb_api_endpoint: Option<String>,
+    /// `http://127.0.0.1:<host_control>` while the USB forward is the live link.
+    #[serde(default)]
+    pub usb_control_endpoint: Option<String>,
+    /// Last known battery percent. Beacons do not carry it; mDNS TXT `bat` does.
+    #[serde(default)]
+    pub battery_percent: Option<u8>,
+    /// Last known power source. Missing TXT and old snapshots are [`PowerSource::Unknown`].
+    #[serde(default)]
+    pub power_source: PowerSource,
     #[serde(skip, default = "Instant::now")]
     pub last_seen: Instant,
 }
@@ -365,11 +388,33 @@ pub struct RpcCandidate {
 
 impl PeerNode {
     pub fn api_endpoint(&self) -> String {
-        format!("http://{}:{}", self.addr.ip(), self.api_port)
+        match (self.link_class, &self.usb_api_endpoint) {
+            (LinkClass::Usb, Some(endpoint)) => endpoint.clone(),
+            _ => format!("http://{}:{}", self.addr.ip(), self.api_port),
+        }
     }
 
     pub fn control_endpoint(&self) -> String {
-        format!("http://{}:{}", self.addr.ip(), self.control_port)
+        match (self.link_class, &self.usb_control_endpoint) {
+            (LinkClass::Usb, Some(endpoint)) => endpoint.clone(),
+            _ => format!("http://{}:{}", self.addr.ip(), self.control_port),
+        }
+    }
+
+    /// Point this UUID at a localhost ADB forward. `addr` stays the Wi-Fi socket.
+    pub fn apply_usb_probe(&mut self, serial: &str, host_api: u16, host_control: u16) {
+        self.link_class = LinkClass::Usb;
+        self.usb_serial = Some(serial.to_string());
+        self.usb_api_endpoint = Some(format!("http://127.0.0.1:{host_api}"));
+        self.usb_control_endpoint = Some(format!("http://127.0.0.1:{host_control}"));
+    }
+
+    /// Drop the USB forward so endpoints fall back to the Wi-Fi address.
+    pub fn clear_usb(&mut self) {
+        self.link_class = LinkClass::Wifi;
+        self.usb_serial = None;
+        self.usb_api_endpoint = None;
+        self.usb_control_endpoint = None;
     }
 
     pub fn is_rpc_ready(&self) -> bool {
@@ -403,6 +448,8 @@ impl PeerNode {
             rpc_port: self.rpc_port,
             control_port: self.control_port,
             display_name: self.display_name.clone(),
+            battery_percent: self.battery_percent,
+            power_source: self.power_source,
         }
     }
 }
@@ -879,6 +926,22 @@ impl DiscoveryService {
                                     let display_name = existing
                                         .map(|p| p.display_name.clone())
                                         .unwrap_or_default();
+                                    // Beacon v1 cannot carry USB or battery. Copy them so a
+                                    // refresh does not clear a live forward or the last TXT reading.
+                                    let link_class = existing
+                                        .map(|peer| peer.link_class)
+                                        .unwrap_or(LinkClass::Wifi);
+                                    let usb_serial =
+                                        existing.and_then(|peer| peer.usb_serial.clone());
+                                    let usb_api_endpoint =
+                                        existing.and_then(|peer| peer.usb_api_endpoint.clone());
+                                    let usb_control_endpoint =
+                                        existing.and_then(|peer| peer.usb_control_endpoint.clone());
+                                    let battery_percent =
+                                        existing.and_then(|peer| peer.battery_percent);
+                                    let power_source = existing
+                                        .map(|peer| peer.power_source)
+                                        .unwrap_or(PowerSource::Unknown);
                                     let peer = PeerNode {
                                         uuid: beacon.uuid,
                                         addr: SocketAddr::new(peer_addr.ip(), beacon.api_port),
@@ -897,6 +960,12 @@ impl DiscoveryService {
                                         moe_cache_ceil_mb: existing
                                             .map(|p| p.moe_cache_ceil_mb)
                                             .unwrap_or(0),
+                                        link_class,
+                                        usb_serial,
+                                        usb_api_endpoint,
+                                        usb_control_endpoint,
+                                        battery_percent,
+                                        power_source,
                                         last_seen: Instant::now(),
                                     };
 
@@ -1189,6 +1258,7 @@ impl DiscoveryService {
         let mut peers = self.peers.write().await;
         let event = if let Some(existing) = peers.get_mut(&endpoint.node_id) {
             existing.role = endpoint.role;
+            // Leave link_class and the USB endpoints untouched.
             if let Some(addr) = endpoint.addresses.first() {
                 existing.addr = *addr;
             }
@@ -1203,6 +1273,8 @@ impl DiscoveryService {
             if endpoint.rpc_port > 0 {
                 existing.status.0 |= StatusFlags::RPC_READY.0;
             }
+            existing.battery_percent = endpoint.battery_percent;
+            existing.power_source = endpoint.power_source;
             existing.last_seen = Instant::now();
             DiscoveryEvent::ServiceUpdated(existing.service_endpoint())
         } else {
@@ -1240,6 +1312,12 @@ impl DiscoveryService {
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case("moe_stream")),
                 moe_cache_ceil_mb: 0,
+                link_class: LinkClass::Wifi,
+                usb_serial: None,
+                usb_api_endpoint: None,
+                usb_control_endpoint: None,
+                battery_percent: endpoint.battery_percent,
+                power_source: endpoint.power_source,
                 last_seen: Instant::now(),
             };
             peers.insert(endpoint.node_id, peer.clone());
@@ -1335,6 +1413,8 @@ impl DiscoveryService {
                 &caps,
                 &display_name,
                 local_ip,
+                None,
+                PowerSource::Unknown,
             ) {
                 warn!("Failed to register mDNS service: {}", e);
                 *this.mdns_health.write().await = BackendHealth::Failed;
@@ -1497,4 +1577,54 @@ pub fn get_local_ip() -> std::net::IpAddr {
     }
 
     std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::LinkClass;
+    use crate::sysinfo::{AccelerationBackend, PowerSource};
+    use std::time::Instant;
+    use uuid::Uuid;
+
+    fn usb_fixture() -> PeerNode {
+        PeerNode {
+            uuid: Uuid::from_u128(7),
+            addr: "192.168.1.20:9999".parse().unwrap(),
+            role: NodeRole::from_str_role("host"),
+            status: StatusFlags::READY,
+            api_port: 8080,
+            rpc_port: 50052,
+            control_port: 9998,
+            total_ram_mb: 0,
+            free_ram_mb: 0,
+            backend: AccelerationBackend::Vulkan,
+            thermal_index: 0,
+            active_model: String::new(),
+            display_name: "node-a".into(),
+            moe_stream: false,
+            moe_cache_ceil_mb: 0,
+            last_seen: Instant::now(),
+            link_class: LinkClass::Wifi,
+            usb_serial: None,
+            usb_api_endpoint: None,
+            usb_control_endpoint: None,
+            battery_percent: None,
+            power_source: PowerSource::Unknown,
+        }
+    }
+
+    #[test]
+    fn usb_probe_and_beacon_share_one_endpoint_rule() {
+        let mut peer = usb_fixture();
+        peer.apply_usb_probe("serial-a", 18080, 18081);
+        assert_eq!(peer.api_endpoint(), "http://127.0.0.1:18080");
+        assert_eq!(peer.control_endpoint(), "http://127.0.0.1:18081");
+        assert_eq!(peer.link_class, LinkClass::Usb);
+        peer.free_ram_mb = 4000;
+        assert_eq!(peer.api_endpoint(), "http://127.0.0.1:18080");
+        peer.clear_usb();
+        assert_eq!(peer.link_class, LinkClass::Wifi);
+        assert_eq!(peer.api_endpoint(), "http://192.168.1.20:8080");
+    }
 }

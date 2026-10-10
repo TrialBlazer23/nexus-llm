@@ -6,8 +6,8 @@
 //! `control_port` (signed control plane).
 
 use crate::appliance::{
-    catalog_lists_digest, cold_predict_tok_s, decide_appliance, format_route_header,
-    front_door_tags, link_header_token, load_presets, observe_stream_done, pantry_load_name,
+    catalog_filename_for_digest, cold_predict_tok_s, decide_appliance, format_route_header,
+    front_door_tags, link_header_token, load_presets, observe_stream_done,
     pantry_reverse_device_port, pantry_source_base, peer_lost_sse, plan_front_door,
     preset_tags_for_file, score_burst_candidate, tier2_model_id, warn_front_door_once,
     ApplianceDecision, BurstActivity, RouteStay, PANTRY_CATALOG_INTERVAL, PANTRY_CATALOG_WAIT,
@@ -2176,13 +2176,14 @@ async fn ensure_peer_model(
     let client = reqwest::Client::new();
     let control = peer.control_endpoint();
     let catalog = fetch_models(&client, &control).await.map_err(|_| ())?;
-    let pairs: Vec<(&str, &str)> = catalog
+    let rows: Vec<(&str, &str)> = catalog
         .models
         .iter()
         .map(|entry| (entry.filename.as_str(), entry.digest.as_str()))
         .collect();
-    let mut listed = catalog_lists_digest(pairs, &chosen.digest);
-    if !listed {
+    let load_name = if let Some(name) = catalog_filename_for_digest(rows, &chosen.digest) {
+        name
+    } else {
         if chosen.digest.is_empty() {
             return Err(());
         }
@@ -2217,11 +2218,9 @@ async fn ensure_peer_model(
         if !response.accepted {
             return Err(());
         }
-        // `accepted` only queues the write of `{digest}.gguf`. Wait until the catalog lists it.
-        poll_catalog_for_digest(&client, &control, &chosen.digest).await?;
-        listed = true;
-    }
-    let load_name = pantry_load_name(&chosen.digest, &chosen.filename, true, listed).ok_or(())?;
+        // `accepted` only queues the write. Load the filename the catalog shows after it lands.
+        poll_catalog_for_digest(&client, &control, &chosen.digest).await?
+    };
     let request = ModelLoadRequest {
         protocol_version: CONTROL_PLANE_VERSION,
         requester_id: ctx.node_id,
@@ -2257,22 +2256,22 @@ async fn ensure_peer_model(
     Ok((api, load_name))
 }
 
-/// Poll the peer catalog until `{digest}.gguf` is listed, or the wait elapses.
+/// Poll the peer catalog until `digest` has a filename, or the wait elapses.
 async fn poll_catalog_for_digest(
     client: &reqwest::Client,
     control: &str,
     digest: &str,
-) -> Result<(), ()> {
+) -> Result<String, ()> {
     let deadline = tokio::time::Instant::now() + PANTRY_CATALOG_WAIT;
     loop {
         let catalog = fetch_models(client, control).await.map_err(|_| ())?;
-        let pairs: Vec<(&str, &str)> = catalog
+        let rows: Vec<(&str, &str)> = catalog
             .models
             .iter()
             .map(|entry| (entry.filename.as_str(), entry.digest.as_str()))
             .collect();
-        if catalog_lists_digest(pairs, digest) {
-            return Ok(());
+        if let Some(name) = catalog_filename_for_digest(rows, digest) {
+            return Ok(name);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(());

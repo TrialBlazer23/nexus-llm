@@ -259,37 +259,55 @@ pub fn pantry_source_base(
     }
 }
 
-/// True when the peer catalog already has this digest or the written file name.
-pub fn catalog_lists_digest<'a, I>(entries: I, digest: &str) -> bool
+/// Catalog filename for `digest`. A matching digest wins over a `{digest}.gguf` name.
+pub fn catalog_filename_for_digest<'a, I>(entries: I, digest: &str) -> Option<String>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     let digest = digest.trim();
     if digest.is_empty() {
-        return false;
+        return None;
     }
     let written = format!("{}.gguf", digest.to_lowercase());
-    entries.into_iter().any(|(filename, entry_digest)| {
-        (!entry_digest.is_empty() && entry_digest.eq_ignore_ascii_case(digest))
-            || filename.eq_ignore_ascii_case(&written)
-    })
+    let mut by_written_name = None;
+    for (filename, entry_digest) in entries {
+        let filename = filename.trim();
+        if filename.is_empty() {
+            continue;
+        }
+        if !entry_digest.is_empty() && entry_digest.eq_ignore_ascii_case(digest) {
+            return Some(filename.to_string());
+        }
+        if by_written_name.is_none() && filename.eq_ignore_ascii_case(&written) {
+            by_written_name = Some(filename.to_string());
+        }
+    }
+    by_written_name
 }
 
-/// Load name after a pantry fetch. `accepted` does not select `source_filename`.
-/// The name is `{digest}.gguf` only once the catalog lists that digest.
+/// True when the peer catalog already has this digest or the written file name.
+pub fn catalog_lists_digest<'a, I>(entries: I, digest: &str) -> bool
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    catalog_filename_for_digest(entries, digest).is_some()
+}
+
+/// The digest is not in the catalog, so a fetch is required before load.
+pub fn pantry_needs_fetch(digest: &str, catalog: &[(&str, &str)]) -> bool {
+    catalog_filename_for_digest(catalog.iter().copied(), digest).is_none()
+}
+
+/// Load name for a digest. `accepted` does not select `source_filename`.
+/// The name is the catalog row's filename once that row lists the digest.
 pub fn pantry_load_name(
     digest: &str,
     source_filename: &str,
     accepted: bool,
-    catalog_lists: bool,
+    catalog: &[(&str, &str)],
 ) -> Option<String> {
-    let digest = digest.trim().to_lowercase();
-    if digest.is_empty() || !catalog_lists {
-        let _queued_source = (accepted, source_filename);
-        return None;
-    }
-    let _source = source_filename;
-    Some(format!("{digest}.gguf"))
+    let _queued_source = (accepted, source_filename);
+    catalog_filename_for_digest(catalog.iter().copied(), digest)
 }
 
 /// Burst peers only. The front door never goes idle from this check.
@@ -911,17 +929,25 @@ mod tests {
     fn accepted_fetch_does_not_choose_source_filename() {
         let digest = "abCDef";
         let source = "coder-7b.gguf";
-        assert_eq!(pantry_load_name(digest, source, true, false), None);
-        assert_eq!(
-            pantry_load_name(digest, source, true, true).as_deref(),
-            Some("abcdef.gguf")
-        );
+        assert_eq!(pantry_load_name(digest, source, true, &[]), None);
         assert_ne!(
-            pantry_load_name(digest, source, true, true).as_deref(),
+            pantry_load_name(digest, source, true, &[]).as_deref(),
             Some(source)
         );
-        let rows = [("coder-7b.gguf", "abcdef")];
-        assert!(catalog_lists_digest(rows, digest));
+
+        let already = [("coder-7b.gguf", "abcdef")];
+        assert_eq!(
+            pantry_load_name(digest, source, false, &already).as_deref(),
+            Some("coder-7b.gguf")
+        );
+        assert!(!pantry_needs_fetch(digest, &already));
+
+        let written = [("abcdef.gguf", "abcdef")];
+        assert_eq!(
+            pantry_load_name(digest, source, true, &written).as_deref(),
+            Some("abcdef.gguf")
+        );
+        assert!(catalog_lists_digest(already, digest));
         assert!(!catalog_lists_digest([("coder-7b.gguf", "other")], digest));
         assert!(catalog_lists_digest([("abcdef.gguf", "")], digest));
     }

@@ -1,4 +1,8 @@
+use crate::appliance::cold_predict_tok_s;
+use crate::cluster::{fit_badge, plan_fit_ladder, plan_moe_spawn, MemoryPolicy, MoeCacheCap};
+use crate::config::MoeConfig;
 use crate::control_plane::ModelCatalogResponse;
+use crate::gguf::GgufMetadata;
 use crate::sysinfo::SystemProfile;
 use crate::ui::models::{scan_models_dir, ModelEntry};
 use ratatui::{
@@ -24,6 +28,8 @@ pub struct CatalogRow {
     pub holders: Vec<String>,
     /// Peer control endpoints that advertise this digest (for [T] pull).
     pub peer_endpoints: Vec<String>,
+    /// False when the only passing ladder or MoE plan is below the interactive floor.
+    pub interactive: bool,
 }
 
 /// Mode of the Models tab (Local mesh catalog vs Hugging Face explorer).
@@ -56,6 +62,9 @@ pub struct ModelsView {
     pub hf_is_searching: bool,
     pub hf_loading: bool,
     pub corrupted_models: Vec<PathBuf>,
+    /// Tokens/sec below which a fitting plan is the `batch` badge.
+    pub interactive_floor_tok_s: f32,
+    pub max_ram_usage_percent: u8,
 }
 
 impl ModelsView {
@@ -76,9 +85,23 @@ impl ModelsView {
             hf_is_searching: false,
             hf_loading: false,
             corrupted_models: Vec::new(),
+            interactive_floor_tok_s: 3.0,
+            max_ram_usage_percent: 75,
         };
         view.refresh();
         view
+    }
+
+    /// Floor and RAM percent used by [`fit_badge`]. Rescans when either value changes.
+    pub fn set_fit_policy(&mut self, floor: f32, percent: u8) {
+        let percent = percent.clamp(1, 100);
+        let changed = (self.interactive_floor_tok_s - floor).abs() > f32::EPSILON
+            || self.max_ram_usage_percent != percent;
+        self.interactive_floor_tok_s = floor;
+        self.max_ram_usage_percent = percent;
+        if changed {
+            self.refresh();
+        }
     }
 
     pub fn refresh_profile(&mut self) {
@@ -87,15 +110,19 @@ impl ModelsView {
 
     pub fn refresh(&mut self) {
         self.models = scan_models_dir(&self.models_dir);
-        self.rebuild_catalog_local_only();
         self.corrupted_models = crate::import::find_corrupted_models(&self.models_dir);
         self.refresh_profile();
+        self.rebuild_catalog_local_only();
         if self.selected_index >= self.catalog.len() && !self.catalog.is_empty() {
             self.selected_index = self.catalog.len() - 1;
         }
     }
 
     fn rebuild_catalog_local_only(&mut self) {
+        let profile = self.cached_profile.clone();
+        let floor = self.interactive_floor_tok_s;
+        let context = self.selected_context;
+        let percent = self.max_ram_usage_percent;
         self.catalog = self
             .models
             .iter()
@@ -108,6 +135,7 @@ impl ModelsView {
                 local: Some(m.clone()),
                 holders: vec!["local".to_string()],
                 peer_endpoints: Vec::new(),
+                interactive: passing_plan_is_interactive(m, &profile, floor, context, percent),
             })
             .collect();
     }
@@ -117,6 +145,10 @@ impl ModelsView {
         // remotes: (label, control_endpoint, catalog)
         let mut by_key: HashMap<String, CatalogRow> = HashMap::new();
 
+        let profile = self.cached_profile.clone();
+        let floor = self.interactive_floor_tok_s;
+        let context = self.selected_context;
+        let percent = self.max_ram_usage_percent;
         for m in &self.models {
             let key = if m.digest.is_empty() {
                 format!("name:{}", m.filename)
@@ -134,6 +166,7 @@ impl ModelsView {
                     local: Some(m.clone()),
                     holders: vec!["local".to_string()],
                     peer_endpoints: Vec::new(),
+                    interactive: passing_plan_is_interactive(m, &profile, floor, context, percent),
                 },
             );
         }
@@ -158,6 +191,7 @@ impl ModelsView {
                     local: None,
                     holders: Vec::new(),
                     peer_endpoints: Vec::new(),
+                    interactive: true,
                 });
                 if !row.holders.iter().any(|h| h == label) {
                     row.holders.push(label.clone());
@@ -310,14 +344,22 @@ impl ModelsView {
                 .map(|(i, m)| {
                     let is_selected = i == self.selected_index;
                     let has_local = m.local.is_some();
-                    let (badge_text, badge_color) = if has_local {
-                        if m.local.as_ref().map(|e| e.lmk_compatible).unwrap_or(false) {
-                            ("[OK]", Color::Green)
-                        } else {
-                            ("[RPC]", Color::Yellow)
-                        }
+                    let verdict = if !has_local {
+                        "[NET]"
+                    } else if m.local.as_ref().map(|e| e.lmk_compatible).unwrap_or(false) {
+                        "[OK]"
                     } else {
-                        ("[NET]", Color::Cyan)
+                        "[RPC]"
+                    };
+                    let badge_text = fit_badge(m.interactive, verdict);
+                    let badge_color = if !has_local {
+                        Color::Cyan
+                    } else if badge_text == "batch" {
+                        Color::Yellow
+                    } else if verdict == "[OK]" {
+                        Color::Green
+                    } else {
+                        Color::Yellow
                     };
 
                     let prefix = if is_selected { " > " } else { "   " };
@@ -748,6 +790,56 @@ impl ModelsView {
                     .block(Block::default().title(" Details ").borders(Borders::ALL));
             frame.render_widget(empty_widget, area);
         }
+    }
+}
+
+/// True unless a passing dense ladder or MoE plan is below the interactive floor.
+fn passing_plan_is_interactive(
+    entry: &ModelEntry,
+    profile: &SystemProfile,
+    floor: f32,
+    context: usize,
+    percent: u8,
+) -> bool {
+    let Ok(meta) = GgufMetadata::open(&entry.path) else {
+        return true;
+    };
+    let context = context.max(512);
+    if meta.streamable_moe() {
+        let key = crate::cluster::moe_model_key(&meta);
+        let moe = MoeConfig::default();
+        if let Some(plan) = plan_moe_spawn(
+            &meta,
+            profile,
+            &moe,
+            percent,
+            context,
+            None,
+            &key,
+            "local",
+            MoeCacheCap::None,
+        ) {
+            return plan.predicted_tok_s >= floor;
+        }
+    }
+    let policy = MemoryPolicy::from_safety(percent, false, false, context);
+    match plan_fit_ladder(
+        std::slice::from_ref(&meta),
+        profile,
+        &policy,
+        floor,
+        |_, _, meta| {
+            cold_predict_tok_s(
+                profile.detected_backend,
+                meta.weights_bytes(),
+                0,
+                meta.quant_label.as_deref(),
+                None,
+            )
+        },
+    ) {
+        Some(choice) => choice.interactive,
+        None => true,
     }
 }
 

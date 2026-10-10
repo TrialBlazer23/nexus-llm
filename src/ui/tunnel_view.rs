@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use std::collections::HashMap;
 
 pub struct TunnelView {
     pub api_port: u16,
@@ -13,6 +14,8 @@ pub struct TunnelView {
     pub devices: Vec<AdbDeviceInfo>,
     pub status: Option<TunnelStatus>,
     pub status_message: Option<(String, Color)>,
+    /// `PeerNode::label` by ADB serial. The `model:` token is not stored here.
+    nexus_labels: HashMap<String, String>,
 }
 
 impl TunnelView {
@@ -24,6 +27,28 @@ impl TunnelView {
             devices,
             status: None,
             status_message: None,
+            nexus_labels: HashMap::new(),
+        }
+    }
+
+    /// Remember labels for peers whose live link is USB. Does not copy `adb model:` into the registry.
+    pub fn remember_peer_labels(&mut self, peers: &[crate::discovery::PeerNode]) {
+        self.nexus_labels.clear();
+        for peer in peers {
+            if peer.link_class != crate::cluster::LinkClass::Usb {
+                continue;
+            }
+            let Some(serial) = peer.usb_serial.as_deref() else {
+                continue;
+            };
+            if serial.is_empty() {
+                continue;
+            }
+            let label = peer.label();
+            if label.is_empty() {
+                continue;
+            }
+            self.nexus_labels.insert(serial.to_string(), label);
         }
     }
 
@@ -94,27 +119,21 @@ impl TunnelView {
         ];
 
         for d in &self.devices {
-            let auth_str = if d.authorized {
-                "Authorized"
-            } else {
-                "Unauthorized (Check Phone Prompt)"
-            };
-            let auth_color = if d.authorized {
+            let line = tunnel_row_line(
+                &d.serial,
+                d.authorized,
+                d.model.as_deref(),
+                self.nexus_labels.get(&d.serial).map(String::as_str),
+            );
+            let color = if d.authorized && self.nexus_labels.contains_key(&d.serial) {
                 Color::Green
             } else {
                 Color::Yellow
             };
-            device_lines.push(Line::from(vec![
-                Span::styled(
-                    format!("   - Serial: {:<16}", d.serial),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("Model: {:<18}", d.model.as_deref().unwrap_or("unknown")),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(format!("[{}]", auth_str), Style::default().fg(auth_color)),
-            ]));
+            device_lines.push(Line::from(Span::styled(
+                format!("   {line}"),
+                Style::default().fg(color),
+            )));
         }
 
         let dev_block = Paragraph::new(device_lines).block(
@@ -189,5 +208,40 @@ impl TunnelView {
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
         frame.render_widget(footer_block, chunks[2]);
+    }
+}
+
+/// One Tunnel-tab row. The ADB model is only the parenthetical subtitle.
+pub fn tunnel_row_line(
+    serial: &str,
+    authorized: bool,
+    adb_model: Option<&str>,
+    nexus_label: Option<&str>,
+) -> String {
+    if !authorized {
+        return format!("{serial}  unauthorized");
+    }
+    let label = nexus_label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or("Nexus not answering");
+    match adb_model.map(str::trim).filter(|model| !model.is_empty()) {
+        Some(model) => format!("{serial}  {label}  ({model})"),
+        None => format!("{serial}  {label}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tunnel_row_line;
+
+    #[test]
+    fn tunnel_row_keeps_adb_model_out_of_the_node_name() {
+        let line = tunnel_row_line("serial-a", true, Some("Bar"), None);
+        assert_eq!(line, "serial-a  Nexus not answering  (Bar)");
+        let denied = tunnel_row_line("serial-c", false, None, None);
+        assert_eq!(denied, "serial-c  unauthorized");
+        let named = tunnel_row_line("serial-b", true, Some("Bar"), Some("node-bbbbbbbb"));
+        assert_eq!(named, "serial-b  node-bbbbbbbb  (Bar)");
     }
 }

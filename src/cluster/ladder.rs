@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_in_budget_returns_none() {
+    fn over_budget_file_returns_none() {
         let files = [geo(3_000 * 1024 * 1024)];
         assert!(
             plan_fit_ladder(&files, &tight_profile(), &tight_policy(), 3.0, |_, _, _| {

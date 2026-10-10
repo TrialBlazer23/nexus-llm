@@ -1,4 +1,6 @@
-use crate::client::{ChatCompletionRequest, ChatMessage, NexusClient};
+use crate::appliance::{format_route_status, link_status_word};
+use crate::client::{ChatCompletionRequest, ChatEvent, ChatMessage, NexusClient};
+use crate::cluster::LinkClass;
 use crate::preset::Preset;
 use crate::sysinfo::AccelerationBackend;
 use crate::ui::markdown::render_markdown;
@@ -24,6 +26,10 @@ use tokio::sync::{mpsc, oneshot};
 
 pub enum StreamMsg {
     Token(String),
+    /// Status-role SSE text. Shown as a notice, not appended to the prompt.
+    Status(String),
+    /// `X-Nexus-Route` header for the in-flight reply.
+    Route(String),
     Done,
     Error(String),
     Abort,
@@ -104,6 +110,16 @@ impl ChatEntry {
         }
     }
 
+    /// Route or peer notice. Role `status` so the next request does not send it back.
+    pub fn status(content: impl Into<String>) -> Self {
+        Self {
+            message: ChatMessage::status(content),
+            kind: EntryKind::Notice,
+            metrics: None,
+            rendered: None,
+        }
+    }
+
     pub fn with_metrics(mut self, metrics: GenerationMetrics) -> Self {
         self.metrics = Some(metrics);
         self
@@ -165,6 +181,10 @@ pub struct ChatApp {
     pub first_token_time: Option<Instant>,
     pub ttft_ms: Option<u64>,
     pub status_message: Option<String>,
+    /// Gateway route header for the reply in flight.
+    pub pending_route: Option<String>,
+    /// Status-role SSE lines waiting until the reply finishes.
+    pub pending_status: Vec<String>,
 
     // Hyperparameters & Preset Configuration
     pub active_preset: Option<Preset>,
@@ -218,6 +238,8 @@ impl ChatApp {
             first_token_time: None,
             ttft_ms: None,
             status_message: None,
+            pending_route: None,
+            pending_status: Vec::new(),
             active_preset: None,
             temperature: 0.7,
             top_p: 0.9,
@@ -454,7 +476,7 @@ impl ChatApp {
             req_messages.push(ChatMessage::system(sys));
         }
         for entry in messages {
-            if entry.is_dialogue() {
+            if entry.is_dialogue() && !entry.message.is_status() {
                 req_messages.push(entry.message.clone());
             }
         }
@@ -659,11 +681,27 @@ impl ChatApp {
                 .push(ChatEntry::assistant(content).with_metrics(metrics));
         }
 
+        self.flush_operator_notices();
+
         self.is_streaming = false;
         self.streaming_rendered = None;
         self.stream_start_time = None;
         self.first_token_time = None;
         self.abort_tx = None;
+    }
+
+    fn flush_operator_notices(&mut self) {
+        for line in std::mem::take(&mut self.pending_status) {
+            let line = line.trim();
+            if !line.is_empty() {
+                self.messages.push(ChatEntry::status(line.to_string()));
+            }
+        }
+        if let Some(header) = self.pending_route.take() {
+            if let Some(line) = route_notice_line(&header, self.tokens_per_sec as f32) {
+                self.messages.push(ChatEntry::status(line));
+            }
+        }
     }
 
     /// Prepare and render the UI frame for full window.
@@ -880,6 +918,8 @@ impl ChatApp {
                     self.stream_start_time = Some(Instant::now());
                     self.first_token_time = None;
                     self.ttft_ms = None;
+                    self.pending_route = None;
+                    self.pending_status.clear();
 
                     let req_messages = Self::clean_conversation_messages(
                         &self.messages,
@@ -902,30 +942,38 @@ impl ChatApp {
                     let tx_clone = tx.clone();
 
                     tokio::spawn(async move {
-                        match client.stream_chat(req).await {
-                            Ok(mut stream) => loop {
-                                tokio::select! {
-                                    _ = &mut abort_rx => {
-                                        let _ = tx_clone.send(StreamMsg::Abort).await;
-                                        break;
-                                    }
-                                    maybe_chunk = stream.next() => {
-                                        match maybe_chunk {
-                                            Some(Ok(token)) => {
-                                                let _ = tx_clone.send(StreamMsg::Token(token)).await;
-                                            }
-                                            Some(Err(e)) => {
-                                                let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
-                                                break;
-                                            }
-                                            None => {
-                                                let _ = tx_clone.send(StreamMsg::Done).await;
-                                                break;
+                        match client.open_chat_stream(req).await {
+                            Ok(mut exchange) => {
+                                if let Some(header) = exchange.route_header {
+                                    let _ = tx_clone.send(StreamMsg::Route(header)).await;
+                                }
+                                loop {
+                                    tokio::select! {
+                                        _ = &mut abort_rx => {
+                                            let _ = tx_clone.send(StreamMsg::Abort).await;
+                                            break;
+                                        }
+                                        maybe_chunk = exchange.events.next() => {
+                                            match maybe_chunk {
+                                                Some(Ok(ChatEvent::Token(token))) => {
+                                                    let _ = tx_clone.send(StreamMsg::Token(token)).await;
+                                                }
+                                                Some(Ok(ChatEvent::Status(text))) => {
+                                                    let _ = tx_clone.send(StreamMsg::Status(text)).await;
+                                                }
+                                                Some(Err(e)) => {
+                                                    let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
+                                                    break;
+                                                }
+                                                None => {
+                                                    let _ = tx_clone.send(StreamMsg::Done).await;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 let _ = tx_clone.send(StreamMsg::Error(e.to_string())).await;
                             }
@@ -1221,6 +1269,12 @@ where
                         app.handle_stream_token(token);
                         app.auto_scroll = true;
                     }
+                    StreamMsg::Status(text) => {
+                        app.pending_status.push(text);
+                    }
+                    StreamMsg::Route(header) => {
+                        app.pending_route = Some(header);
+                    }
                     StreamMsg::Done => {
                         app.finalize_stream();
                         app.auto_scroll = true;
@@ -1250,4 +1304,101 @@ where
     }
 
     Ok(())
+}
+
+/// Operator status line from `X-Nexus-Route`. Link words are `local`, `USB`, and `Wi-Fi`.
+///
+/// The header `model=` field is the GGUF name. This line does not include an ADB `model:` token.
+pub fn route_notice_line(header: &str, tok_s: f32) -> Option<String> {
+    let (label, link_token, model, route) = parse_route_header(header)?;
+    let link_token = link_token.to_ascii_lowercase();
+    let link = match link_token.as_str() {
+        "usb" => link_status_word(LinkClass::Usb),
+        "wifi" => link_status_word(LinkClass::Wifi),
+        _ => link_status_word(LinkClass::Local),
+    };
+    let tag = route.split(';').next().unwrap_or(route.as_str()).trim();
+    let extra = if link_token == "usb" || link_token == "wifi" {
+        Some(format!("escalated, route={tag}"))
+    } else {
+        None
+    };
+    Some(format_route_status(
+        &label,
+        &model,
+        link,
+        tok_s,
+        extra.as_deref(),
+    ))
+}
+
+fn parse_route_header(header: &str) -> Option<(String, String, String, String)> {
+    let mut parts = header.split("; ");
+    let label = parts.next()?.trim();
+    if label.is_empty() || label.contains('=') {
+        return None;
+    }
+    let mut link = None;
+    let mut model = None;
+    let mut route = None;
+    let mut rest = Vec::new();
+    for part in parts {
+        if let Some(value) = part.strip_prefix("link=") {
+            link = Some(value.trim().to_string());
+        } else if let Some(value) = part.strip_prefix("model=") {
+            model = Some(value.trim().to_string());
+        } else if let Some(value) = part.strip_prefix("route=") {
+            route = Some(value.trim().to_string());
+        } else if !part.is_empty() {
+            rest.push(part.to_string());
+        }
+    }
+    let mut route = route?;
+    if !rest.is_empty() {
+        route.push_str("; ");
+        route.push_str(&rest.join("; "));
+    }
+    Some((label.to_string(), link?, model?, route))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_status_notice_uses_link_words_not_adb_model() {
+        let usb = crate::appliance::format_route_header("phone-a", "usb", "coder-7b", "coder");
+        let line = route_notice_line(&usb, 18.2).expect("usb route");
+        assert_eq!(
+            line,
+            "phone-a · coder-7b · USB · 18 tok/s · escalated, route=coder"
+        );
+        assert!(!line.contains("model:"));
+
+        let wifi = crate::appliance::format_route_header("phone-b", "wifi", "coder-7b", "coder");
+        let wifi_line = route_notice_line(&wifi, 16.4).expect("wifi route");
+        assert_eq!(
+            wifi_line,
+            "phone-b · coder-7b · Wi-Fi · 16 tok/s · escalated, route=coder"
+        );
+
+        let local =
+            crate::appliance::format_route_header("macbook", "local", "general-1.7b", "general");
+        let stay = route_notice_line(&local, 6.2).expect("local route");
+        assert_eq!(stay, "macbook · general-1.7b · local · 6 tok/s");
+    }
+
+    #[test]
+    fn status_notice_is_not_sent_back() {
+        let messages = vec![
+            ChatEntry::user("hi"),
+            ChatEntry::assistant("hello"),
+            ChatEntry::status("phone-a · coder-7b · USB · 18 tok/s · escalated, route=coder"),
+        ];
+        let cleaned = ChatApp::clean_conversation_messages(&messages, None);
+        assert_eq!(cleaned.len(), 2);
+        assert!(cleaned.iter().all(|message| !message.is_status()));
+        assert_eq!(cleaned[0].content, "hi");
+        assert_eq!(cleaned[1].content, "hello");
+    }
 }

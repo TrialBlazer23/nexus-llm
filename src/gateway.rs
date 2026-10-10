@@ -1354,6 +1354,7 @@ async fn handle_chat_completions(
             );
         }
     };
+    let body_bytes = strip_status_messages(&body_bytes);
 
     let model = match serde_json::from_slice::<ChatProxyRequest>(&body_bytes) {
         Ok(parsed) => parsed.model,
@@ -1631,6 +1632,32 @@ fn read_appliance_snap(ctx: &GatewayContext) -> Option<ApplianceSnap> {
         threads: cfg.hardware.acceleration.cpu_threads,
         moe: cfg.inference.moe.clone(),
     })
+}
+
+/// Drop `role: status` turns so a route notice is not appended to the model prompt.
+fn strip_status_messages(body: &Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(|item| item.as_array_mut())
+    else {
+        return body.clone();
+    };
+    let before = messages.len();
+    messages.retain(|message| {
+        !message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .is_some_and(|role| role.eq_ignore_ascii_case("status"))
+    });
+    if messages.len() == before {
+        return body.clone();
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
 }
 
 fn user_prompt(body: &serde_json::Value) -> String {
@@ -2567,5 +2594,22 @@ mod unit_tests {
             .as_str()
             .unwrap_or("")
             .contains("coder"));
+    }
+
+    #[test]
+    fn status_role_is_removed_before_the_model_prompt() {
+        let raw = br#"{"model":"default","messages":[{"role":"user","content":"hi"},{"role":"status","content":"phone-a coder-7b USB 18 tok/s"},{"role":"STATUS","content":"peer lost"}]}"#;
+        let stripped = strip_status_messages(&Bytes::from_static(raw));
+        let value: serde_json::Value = serde_json::from_slice(&stripped).unwrap();
+        let roles: Vec<&str> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["role"].as_str())
+            .collect();
+        assert_eq!(roles, vec!["user"]);
+        let text = String::from_utf8_lossy(&stripped);
+        assert!(!text.contains("peer lost"));
+        assert!(!text.contains("USB"));
     }
 }

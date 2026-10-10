@@ -150,6 +150,43 @@ pub fn assistant_delta_text<'a>(role: Option<&str>, content: Option<&'a str>) ->
     content.filter(|text| !text.is_empty())
 }
 
+/// One SSE event from a chat completion. `Status` is operator chrome, not dialogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatEvent {
+    Token(String),
+    Status(String),
+}
+
+/// Streaming chat plus the gateway `X-Nexus-Route` header, when present.
+pub struct ChatExchange {
+    pub route_header: Option<String>,
+    pub events: Pin<Box<dyn Stream<Item = Result<ChatEvent, ClientError>> + Send>>,
+}
+
+fn drop_status_messages(req: &mut ChatCompletionRequest) {
+    req.messages.retain(|message| !message.is_status());
+}
+
+fn chunk_to_event(chunk: &ChatCompletionChunk) -> Option<ChatEvent> {
+    let first = chunk.choices.first()?;
+    let role = first.delta.role.as_deref();
+    let content = first.delta.content.as_deref();
+    if role.is_some_and(|role| role.eq_ignore_ascii_case("status")) {
+        return content
+            .filter(|text| !text.is_empty())
+            .map(|text| ChatEvent::Status(text.to_string()));
+    }
+    if let Some(text) = assistant_delta_text(role, content) {
+        return Some(ChatEvent::Token(text.to_string()));
+    }
+    first
+        .delta
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .map(|text| ChatEvent::Token(text.to_string()))
+}
+
 /// OpenAI-compatible HTTP REST and SSE streaming client for Nexus-LLM.
 #[derive(Debug, Clone)]
 pub struct NexusClient {
@@ -275,6 +312,7 @@ impl NexusClient {
         &self,
         mut req: ChatCompletionRequest,
     ) -> Result<String, ClientError> {
+        drop_status_messages(&mut req);
         req.stream = false;
         let url = format!("{}/v1/chat/completions", self.endpoint);
 
@@ -297,10 +335,29 @@ impl NexusClient {
     }
 
     /// Execute a streaming chat completion request yielding incremental text tokens over SSE.
+    ///
+    /// Status-role deltas are omitted. Use [`Self::open_chat_stream`] to surface them.
     pub async fn stream_chat(
         &self,
-        mut req: ChatCompletionRequest,
+        req: ChatCompletionRequest,
     ) -> Result<TokenStream, ClientError> {
+        let exchange = self.open_chat_stream(req).await?;
+        let tokens = exchange.events.filter_map(|item| async move {
+            match item {
+                Ok(ChatEvent::Token(text)) => Some(Ok(text)),
+                Ok(ChatEvent::Status(_)) => None,
+                Err(err) => Some(Err(err)),
+            }
+        });
+        Ok(Box::pin(tokens))
+    }
+
+    /// Streaming chat that keeps status-role deltas and the route header.
+    pub async fn open_chat_stream(
+        &self,
+        mut req: ChatCompletionRequest,
+    ) -> Result<ChatExchange, ClientError> {
+        drop_status_messages(&mut req);
         req.stream = true;
         let url = format!("{}/v1/chat/completions", self.endpoint);
 
@@ -312,7 +369,15 @@ impl NexusClient {
             });
         }
 
-        let stream = resp
+        let route_header = resp
+            .headers()
+            .get("x-nexus-route")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+
+        let events = resp
             .bytes_stream()
             .eventsource()
             .filter_map(|event_result| async move {
@@ -323,30 +388,7 @@ impl NexusClient {
                             None
                         } else {
                             match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                Ok(chunk) => {
-                                    if let Some(first_choice) = chunk.choices.first() {
-                                        let role = first_choice.delta.role.as_deref();
-                                        if let Some(content) = assistant_delta_text(
-                                            role,
-                                            first_choice.delta.content.as_deref(),
-                                        ) {
-                                            return Some(Ok(content.to_string()));
-                                        }
-                                        if role
-                                            .is_some_and(|role| role.eq_ignore_ascii_case("status"))
-                                        {
-                                            return None;
-                                        }
-                                        if let Some(reasoning) =
-                                            &first_choice.delta.reasoning_content
-                                        {
-                                            if !reasoning.is_empty() {
-                                                return Some(Ok(reasoning.clone()));
-                                            }
-                                        }
-                                    }
-                                    None
-                                }
+                                Ok(chunk) => chunk_to_event(&chunk).map(Ok),
                                 Err(e) => {
                                     if let Ok(err_chunk) =
                                         serde_json::from_str::<SseErrorChunk>(data)
@@ -366,7 +408,10 @@ impl NexusClient {
                 }
             });
 
-        Ok(Box::pin(stream))
+        Ok(ChatExchange {
+            route_header,
+            events: Box::pin(events),
+        })
     }
 
     /// Request float embeddings for `input` using `model`.

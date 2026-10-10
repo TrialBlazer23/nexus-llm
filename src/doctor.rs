@@ -24,6 +24,8 @@ pub struct DoctorCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
+    /// Appliance section from [`doctor_appliance_lines`]. Printed verbatim.
+    pub appliance_lines: Vec<String>,
 }
 
 impl DoctorReport {
@@ -62,6 +64,12 @@ impl DoctorReport {
             };
             println!("[{}] {}: {}", tag, check.name, check.detail);
         }
+        if !self.appliance_lines.is_empty() {
+            println!();
+            for line in &self.appliance_lines {
+                println!("{line}");
+            }
+        }
         println!();
         match self.worst() {
             CheckSeverity::Ok => println!("Doctor summary: all checks passed."),
@@ -98,7 +106,112 @@ pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
         checks.push(check_moe_config(config));
     }
 
-    DoctorReport { checks }
+    DoctorReport {
+        checks,
+        appliance_lines: appliance_lines_for(config),
+    }
+}
+
+/// Appliance section for `nexus doctor`.
+///
+/// `usb` pairs are `(serial, node label)`. `None` means the cable is up and Nexus did not answer.
+/// Wi-Fi entries are [`PeerNode::label`](crate::discovery::PeerNode::label) values, not product names.
+pub fn doctor_appliance_lines(
+    orchestrator: Option<&str>,
+    floor_tok_s: f32,
+    usb: &[(&str, Option<&str>)],
+    wifi_labels: &[&str],
+    skipped_serials: &[&str],
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2 + usb.len() + wifi_labels.len() + skipped_serials.len());
+    match orchestrator.map(str::trim).filter(|file| !file.is_empty()) {
+        Some(file) => lines.push(format!("appliance: {file}")),
+        None => lines.push("appliance: no local model fits".to_string()),
+    }
+    lines.push(format!("interactive floor: {floor_tok_s:.1} tok/s"));
+    for (serial, label) in usb {
+        match label.map(str::trim).filter(|label| !label.is_empty()) {
+            Some(label) => lines.push(format!("usb {serial}: {label}")),
+            None => lines.push(format!("usb {serial}: Nexus not answering")),
+        }
+    }
+    for label in wifi_labels {
+        let label = label.trim();
+        if !label.is_empty() {
+            lines.push(format!("wifi: {label}"));
+        }
+    }
+    for serial in skipped_serials {
+        let serial = serial.trim();
+        if !serial.is_empty() {
+            lines.push(format!("adb skipped: {serial}"));
+        }
+    }
+    lines
+}
+
+fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
+    let orchestrator = crate::appliance::resolve_front_door_name(config);
+    let (usb_rows, skipped) = observe_usb(config);
+    let usb: Vec<(&str, Option<&str>)> = usb_rows
+        .iter()
+        .map(|(serial, label)| (serial.as_str(), label.as_deref()))
+        .collect();
+    let skipped_refs: Vec<&str> = skipped.iter().map(String::as_str).collect();
+    // This process has no peer registry. Wi-Fi labels stay empty rather than inventing names.
+    doctor_appliance_lines(
+        orchestrator.as_deref(),
+        config.inference.appliance.floor_tok_s(),
+        &usb,
+        &[],
+        &skipped_refs,
+    )
+}
+
+/// Authorized forwards, plus serials dropped by `max_devices`.
+///
+/// A label is the cached node id (`Node-<8>`) only when that serial's host control port accepts
+/// a connection. The ADB `model:` token is not a label.
+fn observe_usb(config: &NexusConfig) -> (Vec<(String, Option<String>)>, Vec<String>) {
+    if !crate::tunnel::AdbTunnelSupervisor::is_adb_available() {
+        return (Vec::new(), Vec::new());
+    }
+    let devices = match crate::tunnel::AdbTunnelSupervisor::list_devices() {
+        Ok(devices) => devices,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    let (forwards, skipped) = crate::adb_links::allocate_forwards(
+        &devices,
+        config.cluster.adb.host_port_base,
+        config.cluster.adb.max_devices,
+    );
+    let cache =
+        crate::adb_links::AdbLinkCache::load(&crate::adb_links::AdbLinkCache::default_path())
+            .unwrap_or_default();
+    let usb = forwards
+        .into_iter()
+        .map(|forward| {
+            let label = cache
+                .links
+                .iter()
+                .find(|link| link.serial == forward.serial)
+                .filter(|_| control_port_open(forward.host_control))
+                .map(|link| node_label(link.node_id));
+            (forward.serial, label)
+        })
+        .collect();
+    (usb, skipped)
+}
+
+fn node_label(id: uuid::Uuid) -> String {
+    let text = id.to_string();
+    let short = if text.len() >= 8 { &text[..8] } else { &text };
+    format!("Node-{short}")
+}
+
+fn control_port_open(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
 }
 
 fn check_security(config: &NexusConfig) -> Vec<DoctorCheck> {
@@ -393,6 +506,7 @@ mod tests {
                     detail: "bad".into(),
                 },
             ],
+            appliance_lines: Vec::new(),
         };
         assert_eq!(report.exit_code(), 1);
         assert_eq!(report.worst(), CheckSeverity::Fail);
@@ -406,6 +520,7 @@ mod tests {
                 severity: CheckSeverity::Warn,
                 detail: "missing".into(),
             }],
+            appliance_lines: Vec::new(),
         };
         assert_eq!(report.exit_code(), 0);
     }
@@ -417,5 +532,27 @@ mod tests {
         assert!(!report.checks.is_empty());
         assert!(report.checks.iter().any(|c| c.name == "config"));
         assert!(report.checks.iter().any(|c| c.name == "system_profile"));
+    }
+
+    #[test]
+    fn doctor_lines_name_serials_not_products() {
+        let lines = doctor_appliance_lines(
+            None,
+            3.0,
+            &[("serial-a", None), ("serial-b", Some("node-bbbbbbbb"))],
+            &["node-cccccccc"],
+            &["serial-d"],
+        );
+        assert_eq!(lines[0], "appliance: no local model fits");
+        assert_eq!(lines[1], "interactive floor: 3.0 tok/s");
+        assert!(lines
+            .iter()
+            .any(|l| l == "usb serial-a: Nexus not answering"));
+        assert!(lines.iter().any(|l| l == "usb serial-b: node-bbbbbbbb"));
+        assert!(lines.iter().any(|l| l == "wifi: node-cccccccc"));
+        assert!(lines.iter().any(|l| l == "adb skipped: serial-d"));
+        let named = doctor_appliance_lines(Some("front.gguf"), 3.5, &[], &[], &[]);
+        assert_eq!(named[0], "appliance: front.gguf");
+        assert_eq!(named[1], "interactive floor: 3.5 tok/s");
     }
 }

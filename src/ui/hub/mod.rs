@@ -346,6 +346,10 @@ impl HubApp {
         let layout_mode = crate::ui::layout::LayoutMode::from_str_mode(&config.ui.layout_mode);
         let mut models_view = ModelsView::new(config.node.models_dir.clone());
         models_view.layout_mode = layout_mode;
+        models_view.set_fit_policy(
+            config.inference.appliance.floor_tok_s(),
+            config.hardware.safety.max_ram_usage_percent,
+        );
         let mut cluster_view = ClusterView::new(discovery.clone());
         cluster_view.layout_mode = layout_mode;
         let settings_view = SettingsView::new(config.clone());
@@ -755,7 +759,14 @@ impl HubApp {
             HubTab::Models => self.models_view.render(frame, chunks[1]),
             HubTab::Cluster => self.cluster_view.render(frame, chunks[1]),
             HubTab::Settings => self.settings_view.render(frame, chunks[1]),
-            HubTab::Tunnel => self.tunnel_view.render(frame, chunks[1]),
+            HubTab::Tunnel => {
+                if let Ok(guard) = self.discovery.peers().try_read() {
+                    let peers: Vec<_> = guard.values().cloned().collect();
+                    drop(guard);
+                    self.tunnel_view.remember_peer_labels(&peers);
+                }
+                self.tunnel_view.render(frame, chunks[1]);
+            }
             HubTab::Agents => self.agents_view.render(frame, chunks[1]),
             HubTab::Logs => self.logs_view.render(frame, chunks[1]),
         }
@@ -3615,6 +3626,12 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                     StreamMsg::Token(token) => {
                         hub.chat.handle_stream_token(token);
                         hub.chat.auto_scroll = true;
+                    }
+                    StreamMsg::Status(text) => {
+                        hub.chat.pending_status.push(text);
+                    }
+                    StreamMsg::Route(header) => {
+                        hub.chat.pending_route = Some(header);
                     }
                     StreamMsg::Done => {
                         hub.chat.finalize_stream();

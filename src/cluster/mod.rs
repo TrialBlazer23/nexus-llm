@@ -67,6 +67,15 @@ impl ModelFit {
     }
 }
 
+/// Models-list badge. A plan below the interactive floor is `batch`; otherwise the verdict label.
+pub fn fit_badge<'a>(interactive: bool, verdict_label: &'a str) -> &'a str {
+    if interactive {
+        verdict_label
+    } else {
+        "batch"
+    }
+}
+
 /// Allocatable host budget under an explicit safety percent (1–100).
 pub fn host_lmk_budget_mb(available_ram_mb: u64, percent: u8) -> u64 {
     let pct = u64::from(percent.clamp(1, 100));
@@ -387,6 +396,9 @@ mod fit_tests {
         assert_eq!(ModelFit::classify(5000, 2000, 4000), ModelFit::WontFit);
         assert_eq!(ModelFit::Fits.list_badge(), "[OK]");
         assert_eq!(ModelFit::NeedsRpc.modal_badge(), "⚠️ needs RPC");
+        assert_eq!(fit_badge(false, "[OK]"), "batch");
+        assert_eq!(fit_badge(true, "[OK]"), "[OK]");
+        assert_eq!(fit_badge(true, "[OOM]"), "[OOM]");
     }
 
     #[test]

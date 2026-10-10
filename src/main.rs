@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use nexus::appliance::hub_client_base_url;
 use nexus::bmoe_client::{should_use_bmoe, BmoeSessionConfig};
-use nexus::client::{ChatCompletionRequest, ChatMessage, NexusClient};
+use nexus::client::{ChatCompletionRequest, ChatEvent, ChatMessage, NexusClient};
 use nexus::cluster::{plan_moe_spawn, MoeCacheCap};
 use nexus::config::NexusConfig;
 use nexus::control_plane::{dispatch_pair, PairRequest, CONTROL_PLANE_VERSION};
@@ -17,7 +17,7 @@ use nexus::supervisor::{LlamaServerConfig, SupervisorManager};
 use nexus::sysinfo::SystemProfile;
 use nexus::trust_auth::TrustBootstrap;
 use nexus::tunnel::{AdbTunnelSupervisor, TransportMode};
-use nexus::ui::chat::{run_chat_tui, ChatApp};
+use nexus::ui::chat::{route_notice_line, run_chat_tui, ChatApp};
 use nexus::ui::dashboard::run_dashboard_tui;
 use nexus::ui::hub::{run_hub_tui, HubApp};
 use nexus::ui::models::scan_models_dir;
@@ -1233,16 +1233,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream: true,
                 };
 
-                let mut stream = client.stream_chat(req).await?;
+                let mut exchange = client.open_chat_stream(req).await?;
+                let route_header = exchange.route_header.take();
+                let mut notices = Vec::new();
+                let mut chunks = 0usize;
+                let started = std::time::Instant::now();
                 print!("Response: ");
                 std::io::stdout().flush()?;
 
-                while let Some(chunk) = stream.next().await {
+                while let Some(chunk) = exchange.events.next().await {
                     match chunk {
-                        Ok(text) => {
+                        Ok(ChatEvent::Token(text)) => {
+                            chunks += 1;
                             print!("{}", text);
                             std::io::stdout().flush()?;
                         }
+                        Ok(ChatEvent::Status(text)) => notices.push(text),
                         Err(e) => {
                             eprintln!("\nStreaming error: {}", e);
                             break;
@@ -1250,6 +1256,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 println!();
+                let elapsed = started.elapsed().as_secs_f32().max(0.001);
+                let tok_s = if chunks == 0 {
+                    0.0
+                } else {
+                    chunks as f32 / elapsed
+                };
+                if let Some(header) = route_header.as_deref() {
+                    if let Some(line) = route_notice_line(header, tok_s) {
+                        println!("{line}");
+                    }
+                }
+                for notice in notices {
+                    println!("{notice}");
+                }
             } else {
                 // Interactive split-screen TUI mode
                 let app = ChatApp::new(client, model, sys_prompt);

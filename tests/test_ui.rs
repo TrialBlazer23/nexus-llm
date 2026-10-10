@@ -405,7 +405,7 @@ fn test_markdown_rendering_and_boxed_code() {
 fn test_generation_metrics_and_telemetry_badge() {
     let client = NexusClient::new("http://127.0.0.1:8080");
     let mut app = ChatApp::new(client, "test-model", None);
-    app.set_target_hardware("Galaxy S23 Ultra", "Vulkan Adreno 740 GPU");
+    app.set_target_hardware("edge phone", "Vulkan Adreno 740 GPU");
 
     // Simulate turn
     app.messages.push(ChatEntry::user("Hello"));
@@ -447,7 +447,7 @@ fn test_generation_metrics_and_telemetry_badge() {
     let content = format!("{:?}", buffer);
 
     assert!(
-        content.contains("Galaxy S23 Ultra"),
+        content.contains("edge phone"),
         "Header must include target device"
     );
     assert!(

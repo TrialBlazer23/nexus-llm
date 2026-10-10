@@ -192,7 +192,8 @@ fn test_downloader_sha256_calculation() {
     use sha2::{Digest, Sha256};
     let mut expected_hasher = Sha256::new();
     expected_hasher.update(content);
-    let expected = format!("{:x}", expected_hasher.finalize());
+    let digest = expected_hasher.finalize();
+    let expected: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
     assert_eq!(hash, expected);
 }

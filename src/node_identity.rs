@@ -188,7 +188,7 @@ fn hex_nibble(c: u8) -> Option<u8> {
 pub const PAIRING_CODE_WINDOW_SECS: u64 = 300;
 
 pub fn pairing_code(signing_key: &SigningKey, unix_secs: u64) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
     let window = unix_secs / PAIRING_CODE_WINDOW_SECS;

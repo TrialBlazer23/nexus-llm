@@ -310,7 +310,10 @@ impl BmoeRuntime {
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "moe-model".into()),
-            context_size: ready.n_ctx.map(|c| c as usize).unwrap_or(config.context_size),
+            context_size: ready
+                .n_ctx
+                .map(|c| c as usize)
+                .unwrap_or(config.context_size),
         };
         let listen_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
         // Prefer binding the configured host when it is loopback/unspecified.

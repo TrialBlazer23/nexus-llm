@@ -28,7 +28,7 @@ impl MdnsBackend {
         })
     }
 
-    // Continuous: mDNS TXT fields are intentionally positional; no builder yet.
+    /// Registers the node as an mDNS-SD service with all positional advertisement records.
     #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,

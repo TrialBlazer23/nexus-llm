@@ -1002,7 +1002,7 @@ async fn dispatch_remote(
     }
 }
 
-// Continuous: remote-load progress needs distinct display fields; avoid drive-by struct.
+/// Initiates model loading on a remote cluster peer with progress event forwarding.
 #[allow(clippy::too_many_arguments)]
 async fn run_remote_load(
     ctx: &HubWorkerCtx,

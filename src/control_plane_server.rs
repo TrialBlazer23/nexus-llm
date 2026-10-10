@@ -58,13 +58,13 @@ pub struct ControlPlaneContext {
     pub config: Arc<std::sync::RwLock<NexusConfig>>,
     pub config_path: PathBuf,
     pub nonce_cache: Arc<Mutex<NonceCache>>,
-    pair_attempts: Arc<Mutex<HashMap<SocketAddr, (u32, Instant)>>>,
+    pair_attempts: Arc<Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>>,
     pub task_store: Arc<crate::task::TaskStore>,
     pub kb_store: Arc<crate::kb::KnowledgeStore>,
 }
 
 impl ControlPlaneContext {
-    // Continuous: keep flat ctor; reshaping into a builder is out of scope for hygiene.
+    /// Constructs a new runtime control plane context with explicit configuration parameters.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: Uuid,
@@ -161,6 +161,28 @@ impl ControlPlaneContext {
         self.use_mmap = use_mmap;
         self.memory_budget_percent = memory_budget_percent;
         self
+    }
+
+    /// Safely acquires read access to configuration, recovering from lock poisoning if needed.
+    pub fn read_config(&self) -> std::sync::RwLockReadGuard<'_, NexusConfig> {
+        match self.config.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Config lock was poisoned; recovering inner state safely");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Safely acquires write access to configuration, recovering from lock poisoning if needed.
+    pub fn write_config(&self) -> std::sync::RwLockWriteGuard<'_, NexusConfig> {
+        match self.config.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("Config lock was poisoned; recovering inner state safely");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -342,13 +364,7 @@ async fn handle_blob_get(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "GET",
@@ -465,13 +481,7 @@ async fn handle_blob_fetch(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -574,13 +584,7 @@ async fn handle_state(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -632,13 +636,7 @@ async fn handle_load(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -713,13 +711,7 @@ async fn handle_unload(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -773,13 +765,7 @@ async fn handle_agent_message_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -829,13 +815,7 @@ async fn handle_kb_store_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -878,13 +858,7 @@ async fn handle_kb_query_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -927,13 +901,7 @@ async fn handle_kb_manifest_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -977,13 +945,7 @@ async fn handle_kb_pull_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -1026,13 +988,7 @@ async fn handle_kb_push_route(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     let auth = match verify_control_request(
         &headers,
         "POST",
@@ -1066,13 +1022,28 @@ async fn handle_kb_push_route(
 }
 
 fn allow_pair_attempt(ctx: &ControlPlaneContext, peer: SocketAddr) -> bool {
-    let mut map = ctx.pair_attempts.lock().expect("pair attempts lock");
+    let mut map = match ctx.pair_attempts.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let now = Instant::now();
+    let ip = peer.ip();
     map.retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(60));
-    let entry = map.entry(peer).or_insert((0, now));
+    let entry = map.entry(ip).or_insert((0, now));
+
+    // Hard cutoff at 10 failed attempts within 60 seconds
     if entry.0 >= 10 {
         return false;
     }
+    // Progressive backoff delay: require at least 3 seconds between attempts after 5 failures
+    if entry.0 >= 5 && now.duration_since(entry.1) < Duration::from_secs(3) {
+        return false;
+    }
+    // Require at least 1 second between attempts after 3 failures
+    if entry.0 >= 3 && now.duration_since(entry.1) < Duration::from_secs(1) {
+        return false;
+    }
+
     entry.0 += 1;
     entry.1 = now;
     true
@@ -1106,13 +1077,7 @@ async fn handle_pair(
         }
     };
 
-    let security = ctx
-        .config
-        .read()
-        .expect("config lock")
-        .network
-        .security
-        .clone();
+    let security = ctx.read_config().network.security.clone();
     if let Err(err) = verify_control_request(
         &headers,
         "POST",
@@ -1146,7 +1111,7 @@ async fn handle_pair(
     }
 
     {
-        let mut config = ctx.config.write().expect("config lock");
+        let mut config = ctx.write_config();
         config
             .network
             .security

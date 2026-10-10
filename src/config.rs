@@ -796,6 +796,8 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub require_pairing: bool,
     #[serde(default)]
+    pub allow_unpaired_lan: bool,
+    #[serde(default)]
     pub allowed_peer_ids: Vec<Uuid>,
     #[serde(default)]
     pub paired_peers: Vec<PairedPeer>,
@@ -806,6 +808,7 @@ impl Default for SecurityConfig {
         Self {
             protocol_version: default_security_protocol_version(),
             require_pairing: false,
+            allow_unpaired_lan: true,
             allowed_peer_ids: Vec::new(),
             paired_peers: Vec::new(),
         }

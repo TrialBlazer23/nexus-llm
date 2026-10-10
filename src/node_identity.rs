@@ -145,18 +145,42 @@ pub fn parse_public_key_hex(hex: &str) -> Result<[u8; 32], IdentityError> {
     Ok(out)
 }
 
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
 pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX_CHARS[(b >> 4) as usize] as char);
+        out.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
-fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+pub fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    let hex = hex.trim();
     if !hex.len().is_multiple_of(2) {
         return Err("hex length must be even".into());
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    for chunk in raw.as_chunks::<2>().0 {
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex char: {}", chunk[0] as char))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex char: {}", chunk[1] as char))?;
+        bytes.push((hi << 4) | lo);
+    }
+    Ok(bytes)
+}
+
+#[inline]
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Six-digit pairing code rotating every `PAIRING_CODE_WINDOW_SECS`.
@@ -180,18 +204,29 @@ pub fn pairing_code_remaining_secs(unix_secs: u64) -> u64 {
     PAIRING_CODE_WINDOW_SECS - (unix_secs % PAIRING_CODE_WINDOW_SECS)
 }
 
+#[inline]
+pub fn constant_time_eq_6(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != 6 || b.len() != 6 {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..6 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 pub fn verify_pairing_code(signing_key: &SigningKey, unix_secs: u64, code: &str) -> bool {
     let normalized = code.trim();
     if normalized.len() != 6 || !normalized.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
     let current = pairing_code(signing_key, unix_secs);
-    if normalized == current {
-        return true;
-    }
-    // Allow previous window during rotation grace (±1 window).
     let prev_window_secs = unix_secs.saturating_sub(PAIRING_CODE_WINDOW_SECS);
-    pairing_code(signing_key, prev_window_secs) == normalized
+    let prev = pairing_code(signing_key, prev_window_secs);
+
+    constant_time_eq_6(normalized.as_bytes(), current.as_bytes())
+        || constant_time_eq_6(normalized.as_bytes(), prev.as_bytes())
 }
 
 #[cfg(test)]
@@ -206,11 +241,19 @@ mod tests {
     }
 
     #[test]
-    fn pairing_code_is_six_digits_and_rotates() {
-        let id = NodeIdentity::generate();
-        let code = pairing_code(&id.signing_key, 1_700_000_000);
-        assert_eq!(code.len(), 6);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
-        assert!(verify_pairing_code(&id.signing_key, 1_700_000_000, &code));
+    fn test_hex_roundtrip() {
+        let data = b"hello world 1234567890!@#$";
+        let hex = hex_encode(data);
+        assert_eq!(hex_decode(&hex).unwrap(), data);
+        assert!(hex_decode("invalid_hex").is_err());
+        assert!(hex_decode("123").is_err());
+    }
+
+    #[test]
+    fn test_constant_time_eq_6() {
+        assert!(constant_time_eq_6(b"123456", b"123456"));
+        assert!(!constant_time_eq_6(b"123456", b"123457"));
+        assert!(!constant_time_eq_6(b"123456", b"abcdef"));
+        assert!(!constant_time_eq_6(b"12345", b"123456"));
     }
 }

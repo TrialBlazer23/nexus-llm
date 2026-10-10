@@ -1,7 +1,9 @@
 //! Signed control-plane request authentication (replay protection).
 
 use crate::config::SecurityConfig;
-use crate::node_identity::{hex_encode, parse_public_key_hex, verify_signature, NodeIdentity};
+use crate::node_identity::{
+    hex_decode, hex_encode, parse_public_key_hex, verify_signature, NodeIdentity,
+};
 use ed25519_dalek::SigningKey;
 use http::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -78,7 +80,7 @@ impl NonceCache {
 }
 
 pub fn pairing_enforced(security: &SecurityConfig) -> bool {
-    security.require_pairing || !security.allowed_peer_ids.is_empty()
+    security.pairing_enforced()
 }
 
 pub fn is_loopback(ip: IpAddr) -> bool {
@@ -185,16 +187,6 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AuthErr
         .ok_or_else(|| AuthError::MissingHeader(name.to_string()))
 }
 
-fn hex_decode(hex: &str) -> Result<Vec<u8>, ()> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(());
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| ()))
-        .collect()
-}
-
 pub fn verify_timestamp(timestamp: i64, now: i64) -> Result<(), AuthError> {
     if (timestamp - now).abs() > TIMESTAMP_TOLERANCE_SECS {
         return Err(AuthError::StaleTimestamp);
@@ -216,7 +208,7 @@ pub fn lookup_signer_pubkey(
     Err(AuthError::SignerNotAuthorized)
 }
 
-// Continuous: signature verifies many independent inputs; keep explicit params.
+/// Verifies canonical request signature, timestamp freshness, and nonce replay against security policy.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_control_request(
     headers: &HeaderMap,
@@ -229,7 +221,7 @@ pub fn verify_control_request(
     allow_unsigned_localhost: bool,
     peer_ip: Option<IpAddr>,
 ) -> Result<AuthHeaders, AuthError> {
-    if allow_unsigned_localhost && peer_ip.is_some_and(is_loopback) && !pairing_enforced(security) {
+    if allow_unsigned_localhost && peer_ip.is_some_and(is_loopback) {
         return Ok(AuthHeaders {
             timestamp: unix_timestamp_now(),
             nonce: String::new(),
@@ -253,7 +245,10 @@ pub fn verify_control_request(
     let auth = parse_auth_headers(headers)?;
     verify_timestamp(auth.timestamp, unix_timestamp_now())?;
     {
-        let mut cache = nonce_cache.lock().expect("nonce cache poisoned");
+        let mut cache = match nonce_cache.lock() {
+            Ok(c) => c,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         cache.insert(&auth.nonce)?;
     }
     let pubkey = lookup_signer_pubkey(security, auth.signer_id, body_requester_pubkey_hex)?;

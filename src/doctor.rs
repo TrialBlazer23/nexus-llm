@@ -89,6 +89,7 @@ pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
         check_log_dir(),
         check_display_name(config),
     ];
+    checks.extend(check_security(config));
     if config.inference.moe.enabled {
         checks.push(check_binary_on_path(
             "bmoe-cli",
@@ -98,6 +99,72 @@ pub fn run_doctor(config: &NexusConfig) -> DoctorReport {
     }
 
     DoctorReport { checks }
+}
+
+fn check_security(config: &NexusConfig) -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    if config.network.security.pairing_enforced() {
+        checks.push(DoctorCheck {
+            name: "security_pairing",
+            severity: CheckSeverity::Ok,
+            detail: format!(
+                "enforced (require_pairing={}, {} paired peers)",
+                config.network.security.require_pairing,
+                config.network.security.paired_peers.len()
+            ),
+        });
+    } else {
+        checks.push(DoctorCheck {
+            name: "security_pairing",
+            severity: CheckSeverity::Warn,
+            detail: "permissive / disabled (allow_unpaired_lan=true); unauthenticated LAN control calls accepted".to_string(),
+        });
+    }
+
+    if !config.network.security.pairing_enforced() && config.network.api_host == "0.0.0.0" {
+        checks.push(DoctorCheck {
+            name: "security_binding",
+            severity: CheckSeverity::Warn,
+            detail: "api_host is 0.0.0.0 with pairing disabled (mesh control plane open to LAN)"
+                .to_string(),
+        });
+    } else {
+        checks.push(DoctorCheck {
+            name: "security_binding",
+            severity: CheckSeverity::Ok,
+            detail: format!("api_host bound to {}", config.network.api_host),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let key_path = crate::node_identity::NodeIdentity::default_key_path();
+        if key_path.exists() {
+            if let Ok(meta) = std::fs::metadata(&key_path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode == 0o600 {
+                    checks.push(DoctorCheck {
+                        name: "identity_key_permissions",
+                        severity: CheckSeverity::Ok,
+                        detail: format!("key {:?} permissions 0600 (restricted)", key_path),
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        name: "identity_key_permissions",
+                        severity: CheckSeverity::Warn,
+                        detail: format!(
+                            "key {:?} has permissions {:04o} (expected 0600)",
+                            key_path, mode
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    checks
 }
 
 fn check_moe_config(config: &NexusConfig) -> DoctorCheck {

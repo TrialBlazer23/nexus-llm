@@ -38,6 +38,20 @@ jobs:
       - name: cargo test --locked
         run: cargo test --locked
 
+      - name: nexus doctor smoke check
+        run: cargo run --locked --bin nexus -- doctor
+
+  security-audit:
+    name: Security & License Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo-deny checks
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans
+
   android-check:
     name: Android aarch64 check (best-effort)
     runs-on: ubuntu-latest

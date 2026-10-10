@@ -205,6 +205,7 @@ fn test_config_discovery_security_defaults_are_backward_compatible() {
     assert_eq!(parsed.network.discovery.protocol_version, 1);
     assert_eq!(parsed.network.security.protocol_version, 1);
     assert!(!parsed.network.security.require_pairing);
+    assert!(parsed.network.security.allow_unpaired_lan);
     assert!(parsed.network.discovery.mdns.enabled);
 }
 

@@ -11,7 +11,7 @@ pub enum PresetError {
     Io(#[from] std::io::Error),
 
     #[error("YAML deserialization error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yml::Error),
 
     #[error("Preset '{0}' not found in presets directory")]
     NotFound(String),
@@ -43,6 +43,10 @@ pub struct Preset {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     pub system_prompt: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub route_keywords: Vec<String>,
 }
 
 fn default_temperature() -> f32 {
@@ -61,7 +65,7 @@ impl Preset {
     /// Load preset configuration from a YAML file.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, PresetError> {
         let content = fs::read_to_string(path)?;
-        let preset: Preset = serde_yaml::from_str(&content)?;
+        let preset: Preset = serde_yml::from_str(&content)?;
         debug!("Loaded preset '{}': {:?}", preset.name, preset);
         Ok(preset)
     }
@@ -126,6 +130,11 @@ impl Preset {
             top_p: 0.95,
             max_tokens: 4096,
             system_prompt: "You are an expert systems programmer and Rust engineer. You write concise, performant, and memory-safe code adhering to strict platform constraints.".to_string(),
+            tags: vec!["coder".to_string(), "code".to_string(), "dev".to_string()],
+            route_keywords: vec![
+                "fn ".to_string(), "def ".to_string(), "class ".to_string(), "struct ".to_string(),
+                "impl ".to_string(), "rust".to_string(), "python".to_string(), "quicksort".to_string(),
+            ],
         }
     }
 
@@ -139,6 +148,10 @@ impl Preset {
             top_p: 0.90,
             max_tokens: 2048,
             system_prompt: "You are Nexus, a helpful, precise, and concise AI assistant running on a distributed heterogeneous edge cluster.".to_string(),
+            tags: vec!["general".to_string(), "chat".to_string()],
+            route_keywords: vec![
+                "hello".to_string(), "explain".to_string(), "summary".to_string(),
+            ],
         }
     }
 
@@ -210,7 +223,7 @@ impl Preset {
 
     /// Save preset to a destination path.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), PresetError> {
-        let yaml_str = serde_yaml::to_string(self)?;
+        let yaml_str = serde_yml::to_string(self)?;
         if let Some(parent) = path.as_ref().parent() {
             fs::create_dir_all(parent)?;
         }

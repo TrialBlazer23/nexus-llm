@@ -128,11 +128,39 @@ pub struct OrchestratorChoice {
 
 /// The intelligent two-tier router.
 #[derive(Debug, Clone, Default)]
-pub struct Router;
+pub struct Router {
+    pub custom_keywords: std::collections::HashMap<String, Vec<String>>,
+}
 
 impl Router {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_preset_keywords(mut self, tag: impl Into<String>, keywords: Vec<String>) -> Self {
+        self.custom_keywords.insert(tag.into(), keywords);
+        self
+    }
+
+    pub fn load_presets_dir(&mut self, dir: &std::path::Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "yaml" || ext == "yml")
+                {
+                    if let Ok(preset) = crate::preset::Preset::load_from_file(&path) {
+                        for tag in &preset.tags {
+                            self.custom_keywords
+                                .entry(tag.clone())
+                                .or_default()
+                                .extend(preset.route_keywords.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Strip code blocks or markdown wrapping around JSON output.
@@ -193,9 +221,28 @@ impl Router {
             }
         }
 
-        // 2. Keyword heuristic checks against available tags
+        // 2. Data-driven preset keyword checks
         let lower = prompt.to_lowercase();
+        for (tag, keywords) in &self.custom_keywords {
+            if routes.iter().any(|r| r.matches_tag(tag)) {
+                for kw in keywords {
+                    let kw_lower = kw.to_lowercase();
+                    if lower.contains(&kw_lower) {
+                        if let Some(target) = routes.iter().find(|r| r.matches_tag(tag)) {
+                            return Some(RouteDecision::Direct {
+                                endpoint: target.endpoint.clone(),
+                                model: target.model.clone(),
+                                matched_tag: tag.clone(),
+                                confidence: 95,
+                                clean_prompt: prompt.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
+        // 3. Built-in fallback keywords
         // Coder keywords
         const CODER_KEYWORDS: &[&str] = &[
             "fn ",
@@ -461,5 +508,43 @@ impl Router {
 
         let decision = self.route(&augmented_prompt, routes, orch_client).await;
         (decision, augmented_prompt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_custom_preset_keywords_routing() {
+        let router = Router::new().with_preset_keywords(
+            "finance",
+            vec!["stock".into(), "portfolio".into(), "dividend".into()],
+        );
+        let routes = vec![
+            RouteTarget::new(
+                Uuid::new_v4(),
+                "http://fin-node:8080",
+                "finance-7b",
+                vec!["finance".into()],
+            ),
+            RouteTarget::new(
+                Uuid::new_v4(),
+                "http://gen-node:8080",
+                "general-3b",
+                vec!["general".into()],
+            ),
+        ];
+
+        let decision = router
+            .route_deterministic("what is the dividend yield of this asset?", &routes)
+            .expect("should match custom keyword dividend");
+
+        match decision {
+            RouteDecision::Direct { matched_tag, .. } => {
+                assert_eq!(matched_tag, "finance");
+            }
+            _ => panic!("expected Direct route"),
+        }
     }
 }

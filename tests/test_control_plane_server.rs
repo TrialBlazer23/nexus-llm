@@ -17,7 +17,9 @@ use uuid::Uuid;
 fn test_context(supervisor: SupervisorManager) -> Arc<ControlPlaneContext> {
     let dir = TempDir::new().expect("tempdir");
     let config_path = dir.path().join("config.toml");
-    let config = nexus::config::NexusConfig::default();
+    let mut config = nexus::config::NexusConfig::default();
+    config.network.security.allow_unpaired_lan = true;
+    config.network.security.require_pairing = false;
     config.save_to_path(&config_path).expect("save config");
     std::env::set_var("NEXUS_CONFIG", config_path.to_str().unwrap());
     let trust = TrustBootstrap::load(config).expect("trust bootstrap");
@@ -40,9 +42,12 @@ async fn control_plane_http_state_round_trip() {
     let node_id = Uuid::new_v4();
     let trust_dir = TempDir::new().unwrap();
     let path = trust_dir.path().join("config.toml");
-    NexusConfig::default().save_to_path(&path).unwrap();
+    let mut cfg = NexusConfig::default();
+    cfg.network.security.allow_unpaired_lan = true;
+    cfg.network.security.require_pairing = false;
+    cfg.save_to_path(&path).unwrap();
     std::env::set_var("NEXUS_CONFIG", path.to_str().unwrap());
-    let trust = TrustBootstrap::load(NexusConfig::default()).unwrap();
+    let trust = TrustBootstrap::load(cfg).unwrap();
     let ctx = Arc::new(
         ControlPlaneContext::new(
             node_id,

@@ -25,6 +25,18 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-09 — Security Audit Hardening: Non-Poisoning Locks, Preset Routing, Doctor Probes, and Fuzzing
+- Category: design-decision | bug
+- Context: Addressing external technical audit feedback across security defaults, sync locks in async hyper handlers, dependency drift, pairing rate limiting, and parser attack surfaces.
+- Finding:
+  1. **Security Posture & Pairing Defaults**: Operating an open mesh by default (`require_pairing = false`, `allow_unpaired_lan = true`) enables zero-config setup on trusted LANs, but readers reasonably assumed Ed25519 was unconditionally enforced. Adding explicit `nexus doctor` warnings, startup logging, and a dedicated `SECURITY.md` transparently documents the trust boundary.
+  2. **Async Handler Lock Poisoning**: Calling `.expect("... lock")` across 13 hyper async endpoints created panic cascades if any thread panicked while holding a lock. Adding `read_config()` and `write_config()` helpers with `.unwrap_or_else(|p| p.into_inner())` safely recovers without crashing the executor.
+  3. **Dependency Drift**: `serde_yaml 0.9` was archived upstream; migrating to `serde_yml 0.0.12` cleanly preserved YAML serialization across presets and models.
+  4. **Pairing Oracle Hardening**: Fixed-rate 429 cutoffs on pairing PIN attempts provided an oracle; implementing progressive exponential backoff (1s delay after 3 failures, 3s after 5, lockout after 10) and constant-time PIN comparison (`constant_time_eq_6`) closes timing and enumeration vectors.
+  5. **Parser Robustness**: Testing untrusted byte inputs with `proptest` verified `GgufMetadata::read` safely handles corrupted magic, extreme counts (u64::MAX), and invalid UTF-8 without panicking.
+- Action: Published `SECURITY.md`, created `deny.toml`, configured Dependabot, migrated to `serde_yml`, implemented non-poisoning config helpers, added `check_security()` probe to `nexus doctor`, added `tests/test_gguf_properties.rs`, and refactored `README.md` to lead with Quickstart without marketing hype.
+- Verification: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (249 unit, integration, and property tests passing), `cargo run --locked --bin nexus -- doctor`, and `./scripts/check_penryn_opcodes.sh target/release/nexus`.
+
 ## 2026-10-09 — BigMoe Termux Bionic Build, Wait-for-Ready Deadline, and Host CLI MoE Dispatch
 - Category: bug | environment | design-decision
 - Context: Building `bmoe-cli` natively in Termux and running the 18GB `Qwen3-Coder-30B-A3B-Instruct` model on Android (Galaxy S23 Ultra, Snapdragon 8 Gen 2, 12GB RAM).

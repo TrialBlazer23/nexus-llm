@@ -579,22 +579,64 @@ impl DiscoveryService {
         self.config.read().expect("config lock poisoned")
     }
 
-    /// Read thermal index from Linux thermal zone (0 to 100 scale).
+    /// Read thermal index (0 to 100 scale) as a heuristic indicator for load-balancing.
+    ///
+    /// # Heuristic Design
+    /// Probes Linux `/sys/class/thermal/thermal_zone0/temp` (with fallback to `thermal_zone1`
+    /// or `/sys/class/power_supply/battery/temp`), clamping 40°C–80°C to an index of 0–100.
+    /// Used by discovery scoring to demote thermally throttled devices. Nominal fallback is 0.
     pub fn probe_thermal_index() -> u8 {
-        // Read /sys/class/thermal/thermal_zone0/temp (in millidegrees C)
-        if let Ok(content) = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
-            if let Ok(milli_c) = content.trim().parse::<i64>() {
-                let temp_c = milli_c as f32 / 1000.0;
-                if temp_c <= 40.0 {
-                    return 0;
-                } else if temp_c >= 80.0 {
-                    return 100;
-                } else {
-                    return (((temp_c - 40.0) / 40.0) * 100.0).round() as u8;
+        for path in &[
+            "/sys/class/thermal/thermal_zone0/temp",
+            "/sys/class/thermal/thermal_zone1/temp",
+            "/sys/class/power_supply/battery/temp",
+        ] {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(milli_c) = content.trim().parse::<i64>() {
+                    let temp_c = if milli_c > 1000 {
+                        milli_c as f32 / 1000.0
+                    } else {
+                        milli_c as f32 / 10.0
+                    };
+                    if temp_c <= 40.0 {
+                        return 0;
+                    } else if temp_c >= 80.0 {
+                        return 100;
+                    } else {
+                        return (((temp_c - 40.0) / 40.0) * 100.0).round() as u8;
+                    }
                 }
             }
         }
         0 // Nominal fallback if thermal zone unreadable
+    }
+
+    /// Build a current 64-byte beacon packet reflecting live hardware profile,
+    /// active model, role, status flags, and thermal heuristic.
+    pub async fn create_current_beacon(&self) -> BeaconPacket {
+        let profile = SystemProfile::probe();
+        let thermal_index = Self::probe_thermal_index();
+        let active_model = self.active_model.read().await.clone();
+        let status = *self.status_flags.read().await;
+        let rpc_port = *self.rpc_port.read().await;
+        let cfg = self.cfg();
+        let role = NodeRole::from_str_role(&cfg.node.role);
+        let api_port = cfg.network.api_port;
+
+        BeaconPacket {
+            magic: BEACON_MAGIC,
+            version: BEACON_VERSION,
+            role,
+            status,
+            uuid: self.node_uuid,
+            api_port,
+            rpc_port,
+            total_ram_mb: profile.total_ram_mb as u32,
+            free_ram_mb: profile.available_ram_mb as u32,
+            backend: profile.detected_backend,
+            thermal_index,
+            active_model,
+        }
     }
 
     /// Compute all target addresses (global broadcast, subnet broadcasts, static peers, loopback).
@@ -684,27 +726,7 @@ impl DiscoveryService {
         };
         let _ = socket.set_broadcast(true);
 
-        let profile = SystemProfile::probe();
-        let thermal_index = Self::probe_thermal_index();
-        let active_model = self.active_model.read().await.clone();
-        let status = *self.status_flags.read().await;
-        let rpc_port = *self.rpc_port.read().await;
-
-        let beacon = BeaconPacket {
-            magic: BEACON_MAGIC,
-            version: BEACON_VERSION,
-            role: NodeRole::from_str_role(&self.cfg().node.role),
-            status,
-            uuid: self.node_uuid,
-            api_port: self.cfg().network.api_port,
-            rpc_port,
-            total_ram_mb: profile.total_ram_mb as u32,
-            free_ram_mb: profile.available_ram_mb as u32,
-            backend: profile.detected_backend,
-            thermal_index,
-            active_model,
-        };
-
+        let beacon = self.create_current_beacon().await;
         let packet_bytes = beacon.encode();
         let _ = socket.send_to(&packet_bytes, target).await;
     }
@@ -750,27 +772,7 @@ impl DiscoveryService {
             loop {
                 ticker.tick().await;
 
-                let profile = SystemProfile::probe();
-                let thermal_index = Self::probe_thermal_index();
-                let active_model = self.active_model.read().await.clone();
-                let status = *self.status_flags.read().await;
-                let rpc_port = *self.rpc_port.read().await;
-
-                let beacon = BeaconPacket {
-                    magic: BEACON_MAGIC,
-                    version: BEACON_VERSION,
-                    role: NodeRole::from_str_role(&self.cfg().node.role),
-                    status,
-                    uuid: self.node_uuid,
-                    api_port: self.cfg().network.api_port,
-                    rpc_port,
-                    total_ram_mb: profile.total_ram_mb as u32,
-                    free_ram_mb: profile.available_ram_mb as u32,
-                    backend: profile.detected_backend,
-                    thermal_index,
-                    active_model,
-                };
-
+                let beacon = self.create_current_beacon().await;
                 let packet_bytes = beacon.encode();
                 let targets = self.broadcast_targets().await;
                 for target in targets {
@@ -805,14 +807,9 @@ impl DiscoveryService {
         events: Option<tokio::sync::mpsc::Sender<DiscoveryEvent>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let (discovery_enabled, discovery_port, local_role, local_api_port) = {
+            let (discovery_enabled, discovery_port) = {
                 let cfg = self.config.read().expect("config lock");
-                (
-                    cfg.network.discovery.enabled,
-                    cfg.network.discovery_port,
-                    cfg.node.role.clone(),
-                    cfg.network.api_port,
-                )
+                (cfg.network.discovery.enabled, cfg.network.discovery_port)
             };
             if !discovery_enabled {
                 info!("Discovery listener disabled by configuration");
@@ -950,21 +947,7 @@ impl DiscoveryService {
                                     };
 
                                     if should_reply {
-                                        let profile = SystemProfile::probe();
-                                        let reply_beacon = BeaconPacket {
-                                            magic: BEACON_MAGIC,
-                                            version: BEACON_VERSION,
-                                            role: NodeRole::from_str_role(&local_role),
-                                            status: *self.status_flags.read().await,
-                                            uuid: self.node_uuid,
-                                            api_port: local_api_port,
-                                            rpc_port: *self.rpc_port.read().await,
-                                            total_ram_mb: profile.total_ram_mb as u32,
-                                            free_ram_mb: profile.available_ram_mb as u32,
-                                            backend: profile.detected_backend,
-                                            thermal_index: Self::probe_thermal_index(),
-                                            active_model: self.active_model.read().await.clone(),
-                                        };
+                                        let reply_beacon = self.create_current_beacon().await;
                                         let reply_bytes = reply_beacon.encode();
                                         let _ =
                                             socket.send_to(&reply_bytes, peer_discovery_addr).await;

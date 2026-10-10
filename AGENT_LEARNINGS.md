@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-10 — MoE bench feedback closes LocalMoeStream ranking loop
+- Category: design-decision
+- Context: Implementing Phase 16.5 step 1 — feed BigMoe `BMOE_DONE` metrics into placement ranking.
+- Finding: Dense llama-server already wrote wall-clock SSE rates into `BenchStore`; MoE adapter discarded `tok_s`/`cache_hit_pct`, and `LocalMoeStream` always ranked at hardcoded `2.2`. Chat MoE labels mapped to `GenericCpu` ("cpu"), which would poison dense entries if recorded.
+- Action: Add `BACKEND_MOE_STREAM = "moe-stream"` string-key APIs + optional `cache_hit_pct` on samples; record from bmoe Done paths with `node_id="local"` and real context; rank via measured lookup with `2.2` cold-start fallback; skip chat bench writes when backend label contains `"moe"`.
+- Verification: `cargo test --locked` green (including `local_moe_stream_uses_measured_bench_tok_s`, `moe_stream_key_records_cache_hit_average`, `moe_bench_sample_from_done_filters`); `cargo clippy --locked --all-targets -- -D warnings` clean.
+
 ## 2026-10-10 — Adaptive MoE loading roadmap after 30B-A3B soak
 - Category: research | design-decision
 - Context: Qwen*30B-A3B-class MoE verified on-device via BigMoe flash streaming at >2 tok/s (Phase 16 soak ~2.35 tok/s on S23; operator follow-up with Qwen2.5-30B-A3B). Question: how to make backend model handling more adaptive/smart for larger MoEs.

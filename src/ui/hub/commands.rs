@@ -8,8 +8,9 @@ use super::{HotSwapIntent, TargetExecutionNode, TargetSelectionState};
 use crate::config::NexusConfig;
 use crate::control_plane::ControlPlaneError;
 use crate::control_plane::{
-    blob_url, dispatch_load_model, dispatch_load_model_signed, fetch_models, request_blob_fetch,
-    BlobFetchRequest, ModelLoadRequest, ModelLoadResponse, CONTROL_PLANE_VERSION,
+    blob_url, dispatch_load_model, dispatch_load_model_signed, dispatch_unload_model,
+    dispatch_unload_model_signed, fetch_models, request_blob_fetch, BlobFetchRequest,
+    ModelLoadRequest, ModelLoadResponse, ModelUnloadRequest, CONTROL_PLANE_VERSION,
 };
 use crate::discovery::{DiscoveryService, RpcSelectionPolicy, StatusFlags};
 use crate::downloader::{DownloadAuth, DownloaderError, ModelDownloader};
@@ -58,6 +59,11 @@ pub enum HubCommand {
     },
     Unload {
         active_model_name: String,
+    },
+    /// Ask a peer control plane to unload. Does not stop the local supervisor.
+    UnloadPeer {
+        endpoint: String,
+        name: String,
     },
     RefreshCluster,
     /// WAN download into models_dir.
@@ -131,6 +137,11 @@ pub enum HubEvent {
         unloaded_model: String,
     },
     UnloadNoop,
+    PeerUnloaded {
+        name: String,
+        success: bool,
+        message: String,
+    },
     TargetSelectionReady(TargetSelectionState),
     RemoteLoadSucceeded {
         model_name: String,
@@ -257,6 +268,9 @@ pub fn spawn_hub_worker(
                 }
                 HubCommand::Unload { active_model_name } => {
                     run_unload(&ctx, &evt_tx, active_model_name).await;
+                }
+                HubCommand::UnloadPeer { endpoint, name } => {
+                    run_unload_peer(&ctx, &evt_tx, endpoint, name).await;
                 }
                 HubCommand::RefreshCluster => {
                     // ClusterView.refresh is applied on the UI side after this signal;
@@ -1123,6 +1137,38 @@ async fn run_remote_load(
                 .await;
         }
     }
+}
+
+async fn run_unload_peer(
+    ctx: &HubWorkerCtx,
+    evt_tx: &mpsc::Sender<HubEvent>,
+    endpoint: String,
+    name: String,
+) {
+    let request = ModelUnloadRequest {
+        protocol_version: CONTROL_PLANE_VERSION,
+        requester_id: ctx.config.node_uuid().unwrap_or_else(|_| Uuid::new_v4()),
+        model_path: None,
+    };
+    let client = reqwest::Client::new();
+    let result = if ctx.config.network.security.pairing_enforced() {
+        dispatch_unload_model_signed(&client, &endpoint, &request, &ctx.identity).await
+    } else {
+        dispatch_unload_model(&client, &endpoint, &request).await
+    };
+    let event = match result {
+        Ok(resp) => HubEvent::PeerUnloaded {
+            name,
+            success: resp.success,
+            message: resp.message,
+        },
+        Err(err) => HubEvent::PeerUnloaded {
+            name,
+            success: false,
+            message: err.to_string(),
+        },
+    };
+    let _ = evt_tx.send(event).await;
 }
 
 async fn run_unload(

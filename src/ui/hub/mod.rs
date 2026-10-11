@@ -304,6 +304,10 @@ pub struct HubApp {
     pub kb_store: Arc<crate::kb::KnowledgeStore>,
     pub supervisor: SupervisorManager,
     pub active_model_name: String,
+    /// Chat target host. `"Local"` is the front door; a peer label is a burst.
+    pub chat_host: String,
+    /// Model name shown for the chat target. Independent of `active_model_name`.
+    pub chat_model: String,
     pub pending_hot_swap: Option<HotSwapIntent>,
     pub pending_target_selection: Option<TargetSelectionState>,
     pub status_message: Option<(String, Color)>,
@@ -397,6 +401,8 @@ impl HubApp {
             kb_store,
             supervisor: SupervisorManager::new(),
             active_model_name: "None (Idle)".to_string(),
+            chat_host: "Local".into(),
+            chat_model: "None (Idle)".into(),
             pending_hot_swap: None,
             pending_target_selection: None,
             status_message: None,
@@ -572,6 +578,20 @@ impl HubApp {
         )
     }
 
+    fn session(&mut self) -> status::SessionView {
+        status::SessionView {
+            local_model: self.active_model_name.clone(),
+            chat_host: self.chat_host.clone(),
+            chat_model: self.chat_model.clone(),
+        }
+    }
+
+    fn store_session(&mut self, view: status::SessionView) {
+        self.active_model_name = view.local_model;
+        self.chat_host = view.chat_host;
+        self.chat_model = view.chat_model;
+    }
+
     /// Apply a worker event on the UI thread (no awaits).
     pub fn apply_event(&mut self, event: HubEvent) {
         match event {
@@ -589,7 +609,9 @@ impl HubApp {
                 notice,
             } => {
                 self.load_phase = None;
-                self.active_model_name = model_name.clone();
+                let mut view = self.session();
+                status::on_local_load(&mut view, &model_name);
+                self.store_session(view);
                 let (base, chat_model) = self.chat_target_after_load(&endpoint, &model_name);
                 self.chat.client = NexusClient::new(base);
                 self.chat.model_name = chat_model;
@@ -605,7 +627,9 @@ impl HubApp {
                 self.status_message = Some((message, Color::Red));
             }
             HubEvent::ModelUnloaded { unloaded_model } => {
-                self.active_model_name = "None (Idle)".to_string();
+                let mut view = self.session();
+                status::on_local_unload(&mut view);
+                self.store_session(view);
                 self.chat.model_name = "default".to_string();
                 self.chat.messages.push(ChatEntry::notice(format!(
                     "Model '{}' unloaded. Local inference engine is idle.",
@@ -620,6 +644,25 @@ impl HubApp {
                     Color::Yellow,
                 ));
             }
+            HubEvent::PeerUnloaded {
+                name,
+                success,
+                message,
+            } => {
+                let mut view = self.session();
+                status::on_peer_unloaded(&mut view, &name, success);
+                if success {
+                    self.store_session(view);
+                    let text = if message.is_empty() {
+                        format!("Unloaded model on {name}")
+                    } else {
+                        message
+                    };
+                    self.status_message = Some((text, Color::Cyan));
+                } else {
+                    self.status_message = Some((message, Color::Red));
+                }
+            }
             HubEvent::TargetSelectionReady(state) => {
                 self.pending_target_selection = Some(state);
             }
@@ -631,17 +674,17 @@ impl HubApp {
                 notice,
             } => {
                 self.load_phase = None;
-                self.active_model_name = model_name.clone();
+                let mut view = self.session();
+                status::on_remote_load(&mut view, &name, &model_name);
+                self.store_session(view);
                 let (base, chat_model) = self.chat_target_after_load(&api_endpoint, &model_name);
                 self.chat.client = NexusClient::new(base);
                 self.chat.model_name = chat_model;
                 self.chat.set_target_hardware(&name, backend);
                 self.chat.messages.clear();
                 self.chat.messages.push(ChatEntry::notice(notice));
-                self.status_message = Some((
-                    format!("Active on {}: {}", name, self.active_model_name),
-                    Color::Green,
-                ));
+                self.status_message =
+                    Some((format!("Active on {name}: {model_name}"), Color::Green));
                 self.set_tab(HubTab::Chat);
             }
             HubEvent::RemoteLoadFailed { message } => {
@@ -657,7 +700,9 @@ impl HubApp {
                 code,
                 stderr,
             } => {
-                self.active_model_name = "None (Idle)".to_string();
+                let mut view = self.session();
+                status::on_local_unload(&mut view);
+                self.store_session(view);
                 self.chat.messages.push(ChatEntry::error(format!(
                     "⚠️ Local llama-server process terminated unexpectedly (code: {:?}). Stderr: {}",
                     code, stderr
@@ -1476,23 +1521,17 @@ impl HubApp {
             crate::ui::badges::BADGE_OK.span()
         };
 
-        let model_label =
-            if self.active_model_name.is_empty() || self.active_model_name == "None (Idle)" {
-                "None (Idle)".to_string()
-            } else {
-                self.active_model_name.clone()
-            };
+        let activity_line = status::format_activity_line(&status::Activity {
+            local_model: self.active_model_name.clone(),
+            chat_host: self.chat_host.clone(),
+            chat_model: self.chat_model.clone(),
+        });
 
         let line1 = if is_compact {
-            let short_model = if model_label.len() > 16 {
-                format!("{}…", &model_label[..15])
-            } else {
-                model_label
-            };
             Line::from(vec![
                 Span::styled(" ", Style::default()),
                 Span::styled(
-                    short_model,
+                    activity_line.clone(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -1529,7 +1568,7 @@ impl HubApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    model_label,
+                    activity_line,
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -1881,7 +1920,9 @@ impl HubApp {
             PaletteAction::ConnectPeer(label, ep) => {
                 self.chat.client = NexusClient::new(ep.clone());
                 self.chat.model_name = "cluster-model".to_string();
-                self.active_model_name = "cluster-model".to_string();
+                let mut view = self.session();
+                status::on_remote_load(&mut view, &label, "cluster-model");
+                self.store_session(view);
                 self.chat
                     .set_target_hardware(&label, "Remote RPC".to_string());
                 self.set_tab(HubTab::Chat);
@@ -2230,7 +2271,9 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
         )
         .await
         {
-            hub.active_model_name = name;
+            let mut view = hub.session();
+            status::on_local_load(&mut view, &name);
+            hub.store_session(view);
         }
     }
 
@@ -3395,17 +3438,21 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                                 continue;
                                             }
                                             let ep = peer.api_endpoint();
-                                            hub.discovery.send_direct_probe_to_ip(peer.addr.ip()).await;
+                                            let peer_ip = peer.addr.ip();
                                             let model = if !peer.active_model.is_empty() {
                                                 peer.active_model.clone()
                                             } else {
                                                 "cluster-peer".to_string()
                                             };
+                                            let peer_name = peer.label();
+                                            let backend = peer.backend.to_string();
+                                            hub.discovery.send_direct_probe_to_ip(peer_ip).await;
                                             hub.chat.client = NexusClient::new(ep.clone());
                                             hub.chat.model_name = model.clone();
-                                            hub.active_model_name = model.clone();
-                                            let peer_name = peer.label();
-                                            hub.chat.set_target_hardware(&peer_name, peer.backend.to_string());
+                                            let mut view = hub.session();
+                                            status::on_remote_load(&mut view, &peer_name, &model);
+                                            hub.store_session(view);
+                                            hub.chat.set_target_hardware(&peer_name, backend);
                                             hub.status_message = Some((format!("Connected to peer at {} (probe sent)", ep), Color::Green));
                                             hub.chat.messages.push(crate::ui::chat::ChatEntry::notice(format!(
                                                 "Connected to remote peer '{}' at {}. Ready for chat.",
@@ -3486,9 +3533,30 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
 
                                     }
                                     KeyCode::Char('u') | KeyCode::Char('U') => {
-                                        let _ = cmd_tx.try_send(HubCommand::Unload {
-                                            active_model_name: hub.active_model_name.clone(),
-                                        });
+                                        if let Some(peer) = hub.cluster_view.selected_peer() {
+                                            let local = hub.discovery.node_uuid();
+                                            match crate::ui::hub::status::choose_unload(
+                                                peer.uuid,
+                                                local,
+                                                &peer.control_endpoint(),
+                                            ) {
+                                                crate::ui::hub::status::UnloadChoice::Local => {
+                                                    let _ = cmd_tx.try_send(HubCommand::Unload {
+                                                        active_model_name: hub
+                                                            .active_model_name
+                                                            .clone(),
+                                                    });
+                                                }
+                                                crate::ui::hub::status::UnloadChoice::Peer {
+                                                    endpoint,
+                                                } => {
+                                                    let _ = cmd_tx.try_send(HubCommand::UnloadPeer {
+                                                        endpoint,
+                                                        name: peer.label(),
+                                                    });
+                                                }
+                                            }
+                                        }
                                     }
                                     KeyCode::Char('r') | KeyCode::Char('R') => hub.cluster_view.refresh().await,
                                     KeyCode::Tab => hub.next_tab(),

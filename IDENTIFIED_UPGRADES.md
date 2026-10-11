@@ -43,7 +43,8 @@
 **10. ✅ In-TUI downloads.** ~~Empty Models tab was a dead end.~~
 **Done:** Models `[D]` opens a URL modal; hardened `ModelDownloader` runs with a progress Gauge into `models_dir`; `[T]` pulls by digest from a peer; `[S]` asks a peer to fetch via `POST /blob/fetch`.
 
-**11. ⬜ Model unload parity for remote nodes.** You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`). Add remote unload in the Cluster view, and show the active model + host persistently in the footer — currently `active_model_name` gets overwritten by whichever peer you last chatted with, so the footer can claim a remote model is "the" active model while your local server is also running. *(Deferred past Phase 4 polish.)*
+**11. ✅ Model unload parity for remote nodes.** ~~You have `/cluster/model/unload` in the control plane, but the UI only unloads locally (`u`/`Ctrl+U`).~~
+**Done:** Cluster `u` unloads the selected peer through the control plane while the footer keeps the local model beside the chat target.
 
 **12. ✅ Unify the two remote-dispatch code paths.** ~~Duplicated `ModelLoadRequest` construction.~~
 **Done:** `HubApp::dispatch_remote_load` shared by target-selection Remote arm and Cluster `L`; callers map errors to hub vs cluster status (Cluster keeps connection-refused hint).

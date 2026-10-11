@@ -831,7 +831,8 @@ async fn test_persistent_dock_telemetry_and_gauge() {
     hub.chat.tokens_per_sec = 28.5;
     hub.chat.is_streaming = true;
 
-    let backend = TestBackend::new(120, 30);
+    // Activity line is wider than the old bare filename; 120 clips [STREAM].
+    let backend = TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|f| hub.render(f)).unwrap();

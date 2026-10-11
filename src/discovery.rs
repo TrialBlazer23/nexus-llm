@@ -2217,6 +2217,7 @@ mod tests {
             available_ram_mb: None,
             total_ram_mb: None,
             backend: None,
+            prefill_device: None,
         };
         discovery
             .apply_verified_state(&state, &endpoint)
@@ -2348,6 +2349,7 @@ mod tests {
             available_ram_mb: None,
             total_ram_mb: None,
             backend: None,
+            prefill_device: None,
         }
     }
 

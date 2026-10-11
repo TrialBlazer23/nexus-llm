@@ -51,6 +51,7 @@ async fn control_plane_state_advertises_loaded_models() {
             detected_backend: AccelerationBackend::GenericCpu,
             recommended_threads: 2,
         },
+        &NexusConfig::default(),
     )
     .await;
 

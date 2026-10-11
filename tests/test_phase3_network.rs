@@ -114,6 +114,7 @@ fn control_plane_validates_identity_protocol_and_policy() {
         available_ram_mb: None,
         total_ram_mb: None,
         backend: None,
+        prefill_device: None,
     };
     validate_state(&state, id, CONTROL_PLANE_VERSION, 1800).unwrap();
 

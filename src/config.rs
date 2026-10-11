@@ -551,6 +551,10 @@ pub struct MoeConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Local Hexagon prefill token. Only `HTP0` is accepted; any other value is ignored.
+    #[serde(default = "default_prefill_device")]
+    pub prefill_device: String,
+
     /// Path or PATH name of the BigMoeOnEdge CLI binary (`scripts/setup.sh` writes `~/.nexus/bin/bmoe-cli`).
     #[serde(default = "default_bmoe_binary")]
     pub bmoe_binary: String,
@@ -651,6 +655,7 @@ impl Default for MoeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            prefill_device: default_prefill_device(),
             bmoe_binary: default_bmoe_binary(),
             cache_mb: default_moe_cache_mb(),
             cache_floor_mb: default_moe_cache_floor_mb(),
@@ -782,6 +787,10 @@ impl MoeConfig {
 
 fn default_bmoe_binary() -> String {
     "bmoe-cli".to_string()
+}
+
+fn default_prefill_device() -> String {
+    String::new()
 }
 
 fn default_moe_cache_mb() -> String {
@@ -1417,5 +1426,23 @@ interactive_floor_tok_s = 3.5
         cfg.cluster.adb.host_port_base = 65534;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("host_port_base"), "{err}");
+    }
+
+    #[test]
+    fn moe_prefill_device_round_trips_and_defaults_empty() {
+        let set = "\
+[inference.moe]
+prefill_device = \"HTP0\"
+";
+        let cfg: NexusConfig = toml::from_str(set).expect("parse");
+        assert_eq!(cfg.inference.moe.prefill_device, "HTP0");
+
+        let omitted = "\
+[inference.moe]
+enabled = true
+";
+        let cfg: NexusConfig = toml::from_str(omitted).expect("parse");
+        assert_eq!(cfg.inference.moe.prefill_device, "");
+        assert_eq!(MoeConfig::default().prefill_device, "");
     }
 }

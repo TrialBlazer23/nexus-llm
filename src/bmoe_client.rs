@@ -119,6 +119,10 @@ impl BmoeSessionConfig {
                 }
             }
         }
+        if let Some(device) = accepted_prefill_device(&self.moe.prefill_device) {
+            args.push("--prefill-device".into());
+            args.push(device.into());
+        }
         args
     }
 
@@ -195,6 +199,15 @@ impl BmoeSessionConfig {
             cache_ceil_mb,
             tags,
         }
+    }
+}
+
+/// Accept only the Hexagon prefill token this release forwards.
+pub fn accepted_prefill_device(token: &str) -> Option<&'static str> {
+    if token.trim().eq_ignore_ascii_case("HTP0") {
+        Some("HTP0")
+    } else {
+        None
     }
 }
 
@@ -319,12 +332,17 @@ impl BmoeRuntime {
             config.model_path, args
         );
 
-        let mut child = Command::new(&config.binary_path)
+        let mut child_cmd = Command::new(&config.binary_path);
+        child_cmd
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if accepted_prefill_device(&config.moe.prefill_device).is_some() {
+            child_cmd.env("GGML_HEXAGON_HOSTBUF", "1");
+        }
+        let mut child = child_cmd
             .spawn()
             .map_err(|e| BmoeError::SpawnFailed(e.to_string()))?;
 
@@ -986,6 +1004,48 @@ mod tests {
         assert!(args.contains(&"3500".into()));
         assert!(!args.iter().any(|a| a == "--drop-cold-experts"));
         assert!(!args.iter().any(|a| a == "--route-ahead"));
+    }
+
+    fn session_with(moe: MoeConfig) -> BmoeSessionConfig {
+        BmoeSessionConfig {
+            binary_path: PathBuf::from("bmoe-cli"),
+            model_path: PathBuf::from("/models/qwen.gguf"),
+            context_size: 4096,
+            threads: 4,
+            host: "127.0.0.1".into(),
+            port: 8080,
+            moe,
+            memory_budget_percent: 75,
+            cache_ceil_mb: 3500,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn empty_prefill_device_omits_the_flag() {
+        let cfg = session_with(MoeConfig::default());
+        assert!(!cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
+    }
+
+    #[test]
+    fn htp0_appends_prefill_device_and_rejects_other_tokens() {
+        let cfg = session_with(MoeConfig {
+            prefill_device: "htp0".into(),
+            ..MoeConfig::default()
+        });
+        let args = cfg.build_args();
+        let pos = args
+            .iter()
+            .position(|arg| arg == "--prefill-device")
+            .unwrap();
+        assert_eq!(args[pos + 1], "HTP0");
+        let cfg = session_with(MoeConfig {
+            prefill_device: "cpu".into(),
+            ..MoeConfig::default()
+        });
+        assert!(!cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
+        assert_eq!(accepted_prefill_device(" HTP0 "), Some("HTP0"));
+        assert_eq!(accepted_prefill_device("--prefill-device"), None);
     }
 
     #[test]

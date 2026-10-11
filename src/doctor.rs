@@ -150,6 +150,14 @@ pub fn doctor_appliance_lines(
     lines
 }
 
+/// Doctor line for the local Hexagon prefill opt-in.
+pub fn npu_prefill_line(token: &str) -> String {
+    match crate::bmoe_client::accepted_prefill_device(token) {
+        Some(device) => format!("npu prefill: {device}"),
+        None => "npu prefill: off".into(),
+    }
+}
+
 fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
     let orchestrator = crate::appliance::resolve_front_door_name(config);
     let (usb_rows, skipped) = observe_usb(config);
@@ -166,6 +174,7 @@ fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
         &[],
         &skipped_refs,
     );
+    lines.push(npu_prefill_line(&config.inference.moe.prefill_device));
     if let Ok(cache) =
         crate::adb_links::AdbLinkCache::load(&crate::adb_links::AdbLinkCache::default_path())
     {
@@ -560,5 +569,12 @@ mod tests {
         let named = doctor_appliance_lines(Some("front.gguf"), 3.5, &[], &[], &[]);
         assert_eq!(named[0], "appliance: front.gguf");
         assert_eq!(named[1], "interactive floor: 3.5 tok/s");
+    }
+
+    #[test]
+    fn doctor_reports_npu_prefill_only_for_htp0() {
+        assert!(npu_prefill_line("").contains("off"));
+        assert!(npu_prefill_line("HTP0").contains("HTP0"));
+        assert!(npu_prefill_line("vulkan").contains("off"));
     }
 }

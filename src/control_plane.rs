@@ -57,6 +57,9 @@ pub struct ControlPlaneState {
     /// Bench backend key: `vulkan`, `arm-dotprod`, `x86-sse41`, or `cpu`. Older peers omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Accepted NPU prefill token (`HTP0`). Older peers omit it. Not a load-request field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +173,7 @@ pub async fn build_control_plane_state(
         signing_public_key,
         "127.0.0.1",
         &profile,
+        &crate::config::NexusConfig::default(),
     )
     .await
 }
@@ -186,6 +190,7 @@ pub async fn build_control_plane_state_with_host(
     signing_public_key: Option<String>,
     api_host: &str,
     profile: &SystemProfile,
+    config: &crate::config::NexusConfig,
 ) -> ControlPlaneState {
     let healthy = manager.is_healthy().await;
     let active_model = manager.active_model().await;
@@ -201,6 +206,7 @@ pub async fn build_control_plane_state_with_host(
         })
         .collect();
     let power = probe_power();
+    let moe = &config.inference.moe;
 
     ControlPlaneState {
         node_id,
@@ -220,6 +226,8 @@ pub async fn build_control_plane_state_with_host(
         available_ram_mb: Some(profile.available_ram_mb),
         total_ram_mb: Some(profile.total_ram_mb),
         backend: Some(crate::bench::backend_key(profile.detected_backend).to_string()),
+        prefill_device: crate::bmoe_client::accepted_prefill_device(&moe.prefill_device)
+            .map(str::to_string),
     }
 }
 
@@ -1627,6 +1635,7 @@ mod tests {
         assert_eq!(state.available_ram_mb, None);
         assert_eq!(state.total_ram_mb, None);
         assert_eq!(state.backend, None);
+        assert!(state.prefill_device.is_none());
     }
 
     #[tokio::test]
@@ -1643,6 +1652,8 @@ mod tests {
             detected_backend: AccelerationBackend::Vulkan,
             recommended_threads: 4,
         };
+        let mut config = crate::config::NexusConfig::default();
+        config.inference.moe.prefill_device = "HTP0".into();
         let state = build_control_plane_state_with_host(
             Uuid::from_u128(1),
             NodeRole::HOST,
@@ -1653,6 +1664,7 @@ mod tests {
             None,
             "127.0.0.1",
             &profile,
+            &config,
         )
         .await;
 
@@ -1660,6 +1672,7 @@ mod tests {
         assert_eq!(state.available_ram_mb, Some(12_000));
         assert_eq!(state.total_ram_mb, Some(16_000));
         assert_eq!(state.backend.as_deref(), Some("vulkan"));
+        assert_eq!(state.prefill_device, Some("HTP0".into()));
 
         let raw = serde_json::to_string(&state).expect("serialize");
         let parsed: crate::control_plane::ControlPlaneState =
@@ -1667,5 +1680,22 @@ mod tests {
         assert_eq!(parsed.available_ram_mb, Some(12_000));
         assert_eq!(parsed.total_ram_mb, Some(16_000));
         assert_eq!(parsed.backend.as_deref(), Some("vulkan"));
+        assert_eq!(parsed.prefill_device, Some("HTP0".into()));
+
+        config.inference.moe.prefill_device = "nope".into();
+        let rejected = build_control_plane_state_with_host(
+            Uuid::from_u128(1),
+            NodeRole::HOST,
+            vec!["inference".into()],
+            &SupervisorManager::new(),
+            9_000,
+            false,
+            None,
+            "127.0.0.1",
+            &profile,
+            &config,
+        )
+        .await;
+        assert_eq!(rejected.prefill_device, None);
     }
 }

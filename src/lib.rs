@@ -18,6 +18,7 @@ pub mod kb;
 pub mod logging;
 pub mod mdns;
 pub mod node_identity;
+pub mod npu_prefill;
 pub mod peer_registry;
 pub mod preset;
 pub mod registry_runtime;

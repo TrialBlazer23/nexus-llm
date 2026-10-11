@@ -333,6 +333,9 @@ pub struct PeerNode {
     /// Optional advertised MoE expert-cache ceiling (MiB); 0 = unknown.
     #[serde(default)]
     pub moe_cache_ceil_mb: u32,
+    /// Resolved Hexagon prefill from control-plane state. Beacons do not carry it.
+    #[serde(default)]
+    pub npu_prefill: bool,
     /// Live path. Wi-Fi until [`Self::apply_usb_probe`]; disk snapshots default to Wi-Fi.
     #[serde(default)]
     pub link_class: LinkClass,
@@ -646,6 +649,10 @@ fn stale_seen() -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
+fn advertised_npu_prefill(state: &crate::control_plane::ControlPlaneState) -> bool {
+    state.prefill_device.as_deref() == Some("HTP0")
+}
+
 fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit, hub_ram_percent: u8) {
     let id = hit.state.node_id;
     if let Some(peer) = peers.get_mut(&id) {
@@ -660,6 +667,7 @@ fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit, hub_r
         {
             peer.moe_stream = true;
         }
+        peer.npu_prefill = advertised_npu_prefill(&hit.state);
         peer.battery_percent = hit.state.battery_percent;
         peer.power_source = hit.state.power_source;
         peer.role = hit.state.role;
@@ -711,6 +719,7 @@ fn apply_probe_hit(peers: &mut HashMap<Uuid, PeerNode>, hit: &UsbProbeHit, hub_r
             .iter()
             .any(|cap| cap.eq_ignore_ascii_case("moe_stream")),
         moe_cache_ceil_mb: 0,
+        npu_prefill: advertised_npu_prefill(&hit.state),
         link_class: LinkClass::Wifi,
         usb_serial: None,
         usb_api_endpoint: None,
@@ -886,6 +895,7 @@ fn peer_from_beacon(
         display_name,
         moe_stream: existing.map(|peer| peer.moe_stream).unwrap_or(false),
         moe_cache_ceil_mb: existing.map(|peer| peer.moe_cache_ceil_mb).unwrap_or(0),
+        npu_prefill: existing.map(|peer| peer.npu_prefill).unwrap_or(false),
         link_class: existing
             .map(|peer| peer.link_class)
             .unwrap_or(LinkClass::Wifi),
@@ -1742,6 +1752,7 @@ impl DiscoveryService {
             if let Some(peer) = peers.get_mut(&state.node_id) {
                 peer.battery_percent = state.battery_percent;
                 peer.power_source = state.power_source;
+                peer.npu_prefill = advertised_npu_prefill(state);
             }
         }
         let verified = crate::control_plane::endpoint_from_state(state, endpoint);
@@ -1828,6 +1839,7 @@ impl DiscoveryService {
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case("moe_stream")),
                 moe_cache_ceil_mb: 0,
+                npu_prefill: false,
                 link_class: LinkClass::Wifi,
                 usb_serial: None,
                 usb_api_endpoint: None,
@@ -2276,6 +2288,7 @@ mod tests {
             display_name: "node-a".into(),
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             last_seen: Instant::now(),
             link_class: LinkClass::Wifi,
             usb_serial: None,
@@ -2586,6 +2599,24 @@ mod tests {
         assert_eq!(peer.control_endpoint(), "http://127.0.0.1:18081");
         // 75% of raw 12000. Storing allocatable 9000 would budget 6750.
         assert_eq!(budget_mb(peer, 75), 9_000);
+        assert!(!peer.npu_prefill);
+    }
+
+    #[test]
+    fn usb_probe_copies_resolved_npu_prefill_and_clears_it() {
+        use std::collections::HashMap;
+        let id = Uuid::from_u128(12);
+        let mut on = advertised_state(id);
+        on.prefill_device = Some("HTP0".into());
+        let mut peers = HashMap::new();
+        apply_probe_hit(&mut peers, &hit("serial-a", 18080, on), 75);
+        assert!(peers[&id].npu_prefill);
+        apply_probe_hit(
+            &mut peers,
+            &hit("serial-a", 18080, advertised_state(id)),
+            75,
+        );
+        assert!(!peers[&id].npu_prefill);
     }
 
     #[test]

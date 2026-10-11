@@ -150,12 +150,10 @@ pub fn doctor_appliance_lines(
     lines
 }
 
-/// Doctor line for the local Hexagon prefill opt-in.
-pub fn npu_prefill_line(token: &str) -> String {
-    match crate::bmoe_client::accepted_prefill_device(token) {
-        Some(device) => format!("npu prefill: {device}"),
-        None => "npu prefill: off".into(),
-    }
+/// Doctor line for the local Hexagon prefill switch.
+pub fn npu_prefill_line(config: &NexusConfig) -> String {
+    let mode = config.inference.moe.effective_npu_mode();
+    crate::npu_prefill::npu_prefill_line(mode, crate::npu_prefill::current_host())
 }
 
 fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
@@ -174,7 +172,7 @@ fn appliance_lines_for(config: &NexusConfig) -> Vec<String> {
         &[],
         &skipped_refs,
     );
-    lines.push(npu_prefill_line(&config.inference.moe.prefill_device));
+    lines.push(npu_prefill_line(config));
     if let Ok(cache) =
         crate::adb_links::AdbLinkCache::load(&crate::adb_links::AdbLinkCache::default_path())
     {
@@ -572,9 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_npu_prefill_only_for_htp0() {
-        assert!(npu_prefill_line("").contains("off"));
-        assert!(npu_prefill_line("HTP0").contains("HTP0"));
-        assert!(npu_prefill_line("vulkan").contains("off"));
+    fn doctor_reports_npu_prefill_from_the_local_switch() {
+        let mut config = NexusConfig::default();
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::Off);
+        assert_eq!(npu_prefill_line(&config), "npu prefill: off");
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::On);
+        assert_eq!(npu_prefill_line(&config), "npu prefill: on (HTP0)");
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::Auto);
+        let line = npu_prefill_line(&config);
+        assert!(line == "npu prefill: auto (HTP0)" || line == "npu prefill: auto (off)");
     }
 }

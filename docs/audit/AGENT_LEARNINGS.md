@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-11 — Hexagon prefill qualifies by published part, not by skel files
+- Category: research
+- Context: Turning the NPU prefill note into `inference.moe.npu_prefill` for Android Vulkan phones. The cited 7.8–9.5× speedup was measured while the model still streamed from flash.
+- Finding: Those ratios are prefill wall time on Hexagon v81 (SM8850, 8 Elite Gen 5), Qwen3.6-35B-A3B Q4_0: about 7.8× at 1418 tokens (63.8s CPU, 8.2s NPU) and 9.5× at 1921 tokens (106.5s, 11.2s). A short prompt on that part barely gained. SM8550 (8 Gen 2) is published HTP v73 and qualifies. SM8450 is v69 and does not. SM8735 is absent from the LiteRT `supported_soc.csv` fetched 2026-10-11. The Hexagon build ships `libggml-htp-v73` through `v81` together, so skel files on disk do not identify the phone. Decode stays on the CPU.
+- Action: Keep the part table only in `src/npu_prefill.rs`. `auto` requires aarch64, Vulkan, and generation 73, 75, 79, or 81. Unknown parts stay off until an operator sets `npu_prefill = "on"`, records `Hexagon Arch version` and `prefill_dev_tokens`, then adds the row. Do not add SM8735 before that log. Do not key behavior on product names, RAM, serials, or skel presence. Do not multiply predicted tok/s. Do not call `build_bmoe_hexagon.sh` from `setup.sh`.
+- Verification: `cargo test --locked` on this cloud VM, 371 passed, 0 failed. No phone, so `read_soc_part` and a live `prefill_dev_tokens` stay operator-side.
+
 ## 2026-10-11 — Hub module decomposition, dual licensing, and audit archiving
 - Category: design-decision
 - Context: Refactored monolithic `src/ui/hub/mod.rs` (3,860 lines / 185 KB), added dual MIT/Apache-2.0 licensing, synced GitHub/Cargo metadata, and moved historical root audit reports into `docs/audit/`.

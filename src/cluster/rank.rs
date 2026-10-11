@@ -83,6 +83,8 @@ pub struct ExecutionPlan {
     pub link_notes: Vec<String>,
     pub llama_extra_args: Vec<String>,
     pub gpu_layers: u32,
+    /// Vulkan MoE plan whose node advertised Hexagon prefill. Does not change tok/s.
+    pub npu_prefill: bool,
 }
 
 /// Candidate node for placement.
@@ -101,6 +103,16 @@ pub struct PlacementCandidate {
     pub moe_cache_ceil_mb: u64,
     /// Peer total RAM from discovery (MiB); `0` falls back to allocatable.
     pub total_ram_mb: u64,
+    /// Peer control-plane state resolved Hexagon prefill. Rank uses this only with Vulkan.
+    pub npu_prefill: bool,
+}
+
+/// Same fraction as the USB-versus-Wi-Fi band. An NPU MoE plan may lead other MoE plans inside it.
+const PLACEMENT_SCORE_BAND: f32 = 0.85;
+
+/// Vulkan peers that advertised NPU prefill get the MoE preference. x86 does not.
+pub fn vulkan_npu_prefill(advertised: bool, backend: crate::sysinfo::AccelerationBackend) -> bool {
+    advertised && matches!(backend, crate::sysinfo::AccelerationBackend::Vulkan)
 }
 
 /// Inputs to the placement planner.
@@ -191,6 +203,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     link_notes: vec!["local".into()],
                     llama_extra_args: vec![],
                     gpu_layers: req.local_gpu_layers,
+                    npu_prefill: false,
                 });
             }
         }
@@ -229,6 +242,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 link_notes: vec!["local-cpu".into()],
                 llama_extra_args: vec![],
                 gpu_layers: 0,
+                npu_prefill: false,
             });
         }
     }
@@ -241,6 +255,14 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
             req.policy.max_ram_usage_percent,
         );
         if !dense_fits {
+            let host = crate::npu_prefill::current_host();
+            let local_advertised = crate::npu_prefill::resolve_prefill(
+                req.moe.effective_npu_mode(),
+                host.arch_aarch64,
+                host.vulkan,
+                host.soc_part.as_deref(),
+            )
+            .is_some();
             if let Some(plan) = moe_stream_execution(
                 req,
                 &req.local_profile,
@@ -248,7 +270,13 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 &model_key,
                 MoeCacheCap::None,
                 None,
-                false,
+                MoeStreamSite {
+                    remote: false,
+                    npu_prefill: vulkan_npu_prefill(
+                        local_advertised,
+                        req.local_profile.detected_backend,
+                    ),
+                },
             ) {
                 plans.push(plan);
             }
@@ -284,7 +312,10 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 &model_key,
                 extra,
                 Some(&c.link),
-                true,
+                MoeStreamSite {
+                    remote: true,
+                    npu_prefill: vulkan_npu_prefill(c.npu_prefill, c.backend),
+                },
             ) {
                 plans.push(plan);
             }
@@ -346,6 +377,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                 link_notes: notes,
                 llama_extra_args: vec![],
                 gpu_layers: 99,
+                npu_prefill: false,
             });
         }
     }
@@ -425,6 +457,7 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
                     predicted_tok_s: predicted,
                     link_notes: notes,
                     gpu_layers: req.local_gpu_layers.max(1),
+                    npu_prefill: false,
                 });
             }
             Ok(_) => {}
@@ -467,8 +500,76 @@ pub fn rank_execution_plans(req: &PlacementRequest<'_>) -> Result<Vec<ExecutionP
             o => o,
         }
     });
+    prefer_vulkan_npu_moe(&mut plans);
 
     Ok(plans)
+}
+
+/// Move a Vulkan NPU MoE plan ahead of a faster non-NPU MoE plan when it is inside the band.
+///
+/// Dense and CPU plans stay where tok/s put them. `predicted_tok_s` is not changed.
+pub fn prefer_vulkan_npu_moe(plans: &mut Vec<ExecutionPlan>) {
+    let moe_idxs: Vec<usize> = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, plan)| is_moe_target(&plan.target))
+        .map(|(index, _)| index)
+        .collect();
+    if moe_idxs.len() < 2 {
+        return;
+    }
+    let leader_i = moe_idxs
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            plans[*left]
+                .predicted_tok_s
+                .partial_cmp(&plans[*right].predicted_tok_s)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .expect("moe index");
+    if plans[leader_i].npu_prefill {
+        return;
+    }
+    let leader_tok = plans[leader_i].predicted_tok_s;
+    let Some(npu_i) = moe_idxs
+        .iter()
+        .copied()
+        .filter(|index| {
+            plans[*index].npu_prefill
+                && plans[*index].predicted_tok_s >= PLACEMENT_SCORE_BAND * leader_tok
+        })
+        .max_by(|left, right| {
+            plans[*left]
+                .predicted_tok_s
+                .partial_cmp(&plans[*right].predicted_tok_s)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return;
+    };
+    if npu_i == leader_i {
+        return;
+    }
+    let plan = plans.remove(npu_i);
+    let insert_at = if npu_i < leader_i {
+        leader_i - 1
+    } else {
+        leader_i
+    };
+    plans.insert(insert_at, plan);
+}
+
+fn is_moe_target(target: &PlanTarget) -> bool {
+    matches!(
+        target,
+        PlanTarget::LocalMoeStream { .. } | PlanTarget::RemoteMoeStream { .. }
+    )
+}
+
+struct MoeStreamSite {
+    remote: bool,
+    npu_prefill: bool,
 }
 
 fn moe_stream_execution(
@@ -478,7 +579,7 @@ fn moe_stream_execution(
     model_key: &str,
     extra_cap: MoeCacheCap,
     link: Option<&LinkQuality>,
-    remote: bool,
+    site: MoeStreamSite,
 ) -> Option<ExecutionPlan> {
     let spawn = plan_moe_spawn(
         req.gguf,
@@ -500,7 +601,7 @@ fn moe_stream_execution(
             cache_ceil_mb: spawn.cache_mb,
         },
     );
-    let mut notes = if remote {
+    let mut notes = if site.remote {
         vec![format!("remote moe-stream {node_name}")]
     } else {
         Vec::new()
@@ -515,7 +616,7 @@ fn moe_stream_execution(
             notes.push(format!("RTT {:.0}ms", link.rtt_ms));
         }
     }
-    let target = if remote {
+    let target = if site.remote {
         PlanTarget::RemoteMoeStream {
             peer_name: node_name.to_string(),
             cache_mb: spawn.cache_mb,
@@ -536,6 +637,7 @@ fn moe_stream_execution(
         link_notes: notes,
         llama_extra_args: vec![],
         gpu_layers: 0,
+        npu_prefill: site.npu_prefill,
     })
 }
 
@@ -606,7 +708,7 @@ pub fn select_burst_winner(plans: &[BurstScore]) -> Option<usize> {
         .filter(|plan| plan.eligible && plan.link == LinkClass::Wifi)
         .map(score)
         .fold(0.0, f32::max);
-    let band = 0.85 * best_wifi;
+    let band = PLACEMENT_SCORE_BAND * best_wifi;
     highest_score(plans, |plan| {
         plan.link == LinkClass::Usb && score(plan) >= band
     })
@@ -776,6 +878,7 @@ mod tests {
                 thermal_index: 20,
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                npu_prefill: false,
                 total_ram_mb: 0,
             }],
         };
@@ -787,6 +890,88 @@ mod tests {
             PlanTarget::LocalGpu { .. } | PlanTarget::LocalCpu | PlanTarget::Remote { .. }
         ));
         assert!(plans.iter().any(|p| p.predicted_tok_s > 0.0));
+    }
+
+    fn bare_plan(target: PlanTarget, tok: f32, npu: bool) -> ExecutionPlan {
+        ExecutionPlan {
+            target,
+            memory: MemoryPlan {
+                weights_mb: 1,
+                weights_resident_mb: 1,
+                kv_cache_mb: 1,
+                compute_buffer_mb: 1,
+                headroom_mb: 1,
+                budget_mb: 1,
+                verdict: Verdict::Fits,
+                remediations: Vec::new(),
+                quant_label: None,
+            },
+            split: None,
+            context_size: 512,
+            predicted_tok_s: tok,
+            link_notes: Vec::new(),
+            llama_extra_args: Vec::new(),
+            gpu_layers: 0,
+            npu_prefill: npu,
+        }
+    }
+
+    #[test]
+    fn npu_moe_leads_inside_the_band_without_changing_tok_s() {
+        assert!(!vulkan_npu_prefill(true, AccelerationBackend::X86Baseline));
+        assert!(vulkan_npu_prefill(true, AccelerationBackend::Vulkan));
+        assert!(!vulkan_npu_prefill(false, AccelerationBackend::Vulkan));
+
+        let dense = bare_plan(PlanTarget::LocalGpu { ngl: 99 }, 30.0, false);
+        let cpu_moe = bare_plan(
+            PlanTarget::RemoteMoeStream {
+                peer_name: "cpu".into(),
+                cache_mb: 2000,
+                ceil_mb: 2000,
+            },
+            10.0,
+            false,
+        );
+        let npu_moe = bare_plan(
+            PlanTarget::RemoteMoeStream {
+                peer_name: "npu".into(),
+                cache_mb: 2000,
+                ceil_mb: 2000,
+            },
+            9.0,
+            true,
+        );
+        let mut plans = vec![dense, cpu_moe, npu_moe];
+        let before: Vec<f32> = plans.iter().map(|plan| plan.predicted_tok_s).collect();
+        prefer_vulkan_npu_moe(&mut plans);
+        let after: Vec<f32> = plans.iter().map(|plan| plan.predicted_tok_s).collect();
+        assert_eq!(before, vec![30.0, 10.0, 9.0]);
+        assert_eq!(after, vec![30.0, 9.0, 10.0]);
+        assert!(plans[1].npu_prefill);
+
+        let mut slow = vec![
+            bare_plan(
+                PlanTarget::LocalMoeStream {
+                    cache_mb: 1,
+                    ceil_mb: 1,
+                },
+                10.0,
+                false,
+            ),
+            bare_plan(
+                PlanTarget::RemoteMoeStream {
+                    peer_name: "slow".into(),
+                    cache_mb: 1,
+                    ceil_mb: 1,
+                },
+                8.0,
+                true,
+            ),
+        ];
+        prefer_vulkan_npu_moe(&mut slow);
+        assert!(!slow[0].npu_prefill);
+        assert!((slow[0].predicted_tok_s - 10.0).abs() < 0.01);
+        assert!((slow[1].predicted_tok_s - 8.0).abs() < 0.01);
     }
 
     #[test]

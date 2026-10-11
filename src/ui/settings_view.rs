@@ -34,6 +34,7 @@ pub enum SettingType {
     PreferAdbTunnel,
     // Hardware & Acceleration
     PreferGpu,
+    NpuPrefill,
     GpuLayers,
     CpuThreads,
     // Memory & Android LMK Safeguards
@@ -168,6 +169,12 @@ pub const SETTING_ITEMS: &[SettingItem] = &[
         name: "Prefer Vulkan GPU Acceleration",
         description: "Offload compute layers to Adreno 740 GPU via Vulkan runtime",
         setting_type: SettingType::PreferGpu,
+    },
+    SettingItem {
+        category: "Hardware & Acceleration",
+        name: "Hexagon NPU Prefill",
+        description: "Prefill may use HTP0 while weights stream from flash. Decode stays on the CPU. Auto enables HTP0 on a Vulkan phone whose SoC is a published Hexagon v73 or newer. On requests HTP0 for an unpublished part.",
+        setting_type: SettingType::NpuPrefill,
     },
     SettingItem {
         category: "Hardware & Acceleration",
@@ -436,6 +443,27 @@ impl SettingsView {
                 self.config.hardware.acceleration.prefer_gpu =
                     !self.config.hardware.acceleration.prefer_gpu;
             }
+            SettingType::NpuPrefill => {
+                use crate::config::NpuPrefillMode;
+                const ORDER: [NpuPrefillMode; 3] = [
+                    NpuPrefillMode::Auto,
+                    NpuPrefillMode::On,
+                    NpuPrefillMode::Off,
+                ];
+                let current = self.config.inference.moe.effective_npu_mode();
+                let idx = ORDER.iter().position(|mode| *mode == current).unwrap_or(0);
+                let new_idx = if is_left {
+                    if idx == 0 {
+                        ORDER.len() - 1
+                    } else {
+                        idx - 1
+                    }
+                } else {
+                    (idx + 1) % ORDER.len()
+                };
+                self.config.inference.moe.npu_prefill = Some(ORDER[new_idx]);
+                self.config.inference.moe.prefill_device.clear();
+            }
             SettingType::GpuLayers => {
                 if is_left {
                     self.config.hardware.acceleration.gpu_layers = self
@@ -662,6 +690,15 @@ impl SettingsView {
                             "OFF"
                         }
                     ),
+                    SettingType::NpuPrefill => {
+                        let mode = self.config.inference.moe.effective_npu_mode();
+                        let line = crate::npu_prefill::npu_prefill_line(
+                            mode,
+                            crate::npu_prefill::current_host(),
+                        );
+                        let rest = line.strip_prefix("npu prefill: ").unwrap_or(line.as_str());
+                        format!("[ {rest} ]")
+                    }
                     SettingType::GpuLayers => format!(
                         "[ {} layers ]",
                         self.config.hardware.acceleration.gpu_layers

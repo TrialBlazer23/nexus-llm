@@ -2657,6 +2657,7 @@ mod tests {
             display_name: "phone".into(),
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             link_class: LinkClass::Usb,
             usb_serial: Some("serial-a".into()),
             usb_api_endpoint: Some("http://127.0.0.1:18080".into()),

@@ -7,6 +7,7 @@ use crate::bench::{unix_now, BenchSample, BenchStore, BACKEND_MOE_STREAM};
 use crate::client::{ChatCompletionRequest, ChatMessage};
 use crate::config::MoeConfig;
 use crate::gguf::GgufMetadata;
+use crate::npu_prefill::{prefill_token, NpuHostFacts};
 use crate::sysinfo::SystemProfile;
 use bytes::Bytes;
 use futures_util::stream::unfold;
@@ -71,10 +72,18 @@ pub struct BmoeSessionConfig {
     /// Effective expert cache ceiling used for LMK + `--cache-ceil-mb`.
     pub cache_ceil_mb: u64,
     pub tags: Vec<String>,
+    /// Host facts for `auto`. Production copies [`crate::npu_prefill::current_host`].
+    /// Tests leave this unqualified so the flag does not depend on the machine.
+    pub npu_host: NpuHostFacts,
 }
 
 impl BmoeSessionConfig {
     pub fn build_args(&self) -> Vec<String> {
+        self.build_args_for_quant(None)
+    }
+
+    /// Like [`Self::build_args`], but a known non-NPU quant omits `--prefill-device`.
+    pub fn build_args_for_quant(&self, quant_label: Option<&str>) -> Vec<String> {
         let mut args = vec![
             "-m".into(),
             self.model_path.to_string_lossy().to_string(),
@@ -119,11 +128,15 @@ impl BmoeSessionConfig {
                 }
             }
         }
-        if let Some(device) = accepted_prefill_device(&self.moe.prefill_device) {
+        if let Some(device) = self.resolved_prefill_token(quant_label) {
             args.push("--prefill-device".into());
             args.push(device.into());
         }
         args
+    }
+
+    fn resolved_prefill_token(&self, quant_label: Option<&str>) -> Option<&'static str> {
+        prefill_token(self.moe.effective_npu_mode(), &self.npu_host, quant_label)
     }
 
     /// Build config from Nexus MoE settings + probed profile.
@@ -198,6 +211,7 @@ impl BmoeSessionConfig {
             memory_budget_percent,
             cache_ceil_mb,
             tags,
+            npu_host: crate::npu_prefill::current_host().clone(),
         }
     }
 }
@@ -247,6 +261,9 @@ pub struct BmoeDone {
     pub text: Option<String>,
     pub reasoning: Option<String>,
     pub cache_hit_pct: Option<f64>,
+    /// Tokens the Hexagon prefill path consumed. Older CLIs omit it.
+    #[serde(default)]
+    pub prefill_dev_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +343,18 @@ impl BmoeRuntime {
             }
         }
 
-        let args = config.build_args();
+        let quant_label = gguf.as_ref().and_then(|meta| meta.quant_label.clone());
+        if config.resolved_prefill_token(None).is_some()
+            && config
+                .resolved_prefill_token(quant_label.as_deref())
+                .is_none()
+        {
+            warn!(
+                "omitting --prefill-device; quant {} is not an NPU expert path",
+                quant_label.as_deref().unwrap_or("unknown")
+            );
+        }
+        let args = config.build_args_for_quant(quant_label.as_deref());
         info!(
             "Spawning bmoe-cli --session for {:?} with args {:?}",
             config.model_path, args
@@ -339,7 +367,10 @@ impl BmoeRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if accepted_prefill_device(&config.moe.prefill_device).is_some() {
+        if config
+            .resolved_prefill_token(quant_label.as_deref())
+            .is_some()
+        {
             child_cmd.env("GGML_HEXAGON_HOSTBUF", "1");
         }
         let mut child = child_cmd
@@ -463,6 +494,7 @@ impl BmoeRuntime {
                     if d.id.is_some_and(|i| i != id) {
                         continue;
                     }
+                    note_prefill_dev_tokens(&d);
                     record_moe_bench_sample(
                         &self.model_name(),
                         self.config.context_size,
@@ -633,6 +665,12 @@ struct AdapterState {
     model_name: String,
     context_size: usize,
     cache_mb: u64,
+}
+
+fn note_prefill_dev_tokens(done: &BmoeDone) {
+    if let Some(tokens) = done.prefill_dev_tokens {
+        info!(prefill_dev_tokens = tokens, "bmoe prefill device tokens");
+    }
 }
 
 /// Build a bench sample from `BMOE_DONE` when the generation completed with tok/s.
@@ -816,6 +854,7 @@ async fn collect_generation(state: &AdapterState, id: i64) -> Result<String, Bmo
                 if d.id.is_some_and(|i| i != id) {
                     continue;
                 }
+                note_prefill_dev_tokens(&d);
                 record_moe_bench_sample(&state.model_name, state.context_size, state.cache_mb, &d);
                 if let Some(t) = d.text {
                     if !t.is_empty() {
@@ -870,6 +909,7 @@ fn sse_stream_generation(state: Arc<AdapterState>, id: i64) -> Response<RespBody
                     ))
                 }
                 Some(BmoeEvent::Done(d)) => {
+                    note_prefill_dev_tokens(&d);
                     record_moe_bench_sample(
                         &state.model_name,
                         state.context_size,
@@ -981,7 +1021,7 @@ pub fn should_use_bmoe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MoeQualityMode;
+    use crate::config::{MoeQualityMode, NpuPrefillMode};
 
     #[test]
     fn build_args_lossless_defaults() {
@@ -996,6 +1036,7 @@ mod tests {
             memory_budget_percent: 75,
             cache_ceil_mb: 3500,
             tags: vec![],
+            npu_host: NpuHostFacts::unqualified(),
         };
         let args = cfg.build_args();
         assert!(args.contains(&"--moe-stream".into()));
@@ -1018,6 +1059,7 @@ mod tests {
             memory_budget_percent: 75,
             cache_ceil_mb: 3500,
             tags: vec![],
+            npu_host: NpuHostFacts::unqualified(),
         }
     }
 
@@ -1046,6 +1088,38 @@ mod tests {
         assert!(!cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
         assert_eq!(accepted_prefill_device(" HTP0 "), Some("HTP0"));
         assert_eq!(accepted_prefill_device("--prefill-device"), None);
+    }
+
+    #[test]
+    fn auto_uses_host_facts_and_quant_can_suppress_the_flag() {
+        let mut cfg = session_with(MoeConfig {
+            npu_prefill: Some(NpuPrefillMode::Auto),
+            ..MoeConfig::default()
+        });
+        cfg.npu_host = NpuHostFacts {
+            arch_aarch64: true,
+            vulkan: true,
+            soc_part: Some("SM8550".into()),
+        };
+        assert!(cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
+        cfg.npu_host.soc_part = Some("SM8735".into());
+        assert!(!cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
+
+        cfg.moe.npu_prefill = Some(NpuPrefillMode::On);
+        cfg.npu_host.soc_part = Some("SM8735".into());
+        assert!(cfg
+            .build_args_for_quant(Some("Q4_K_M"))
+            .iter()
+            .any(|arg| arg == "HTP0"));
+        assert!(!cfg
+            .build_args_for_quant(Some("Q3_K_M"))
+            .iter()
+            .any(|arg| arg == "--prefill-device"));
+        cfg.moe.npu_prefill = Some(NpuPrefillMode::Off);
+        assert!(!cfg
+            .build_args_for_quant(Some("Q4_K_M"))
+            .iter()
+            .any(|arg| arg == "--prefill-device"));
     }
 
     #[test]
@@ -1097,6 +1171,7 @@ mod tests {
             memory_budget_percent: 75,
             cache_ceil_mb: 0,
             tags: vec![],
+            npu_host: NpuHostFacts::unqualified(),
         };
         let args = cfg.build_args();
         assert!(args.contains(&"--overlap".into()));
@@ -1123,7 +1198,15 @@ mod tests {
                 assert_eq!(d.text.as_deref(), Some("Hi there"));
                 assert_eq!(d.tok_s, Some(2.35));
                 assert_eq!(d.cache_hit_pct, Some(55.0));
+                assert_eq!(d.prefill_dev_tokens, None);
             }
+            other => panic!("unexpected {other:?}"),
+        }
+        let counted = parse_bmoe_line(
+            r#"BMOE_DONE {"id":2,"tokens":4,"tok_s":1.0,"prefill_dev_tokens":1418}"#,
+        );
+        match counted {
+            Some(BmoeEvent::Done(d)) => assert_eq!(d.prefill_dev_tokens, Some(1418)),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -1139,6 +1222,7 @@ mod tests {
                 text: Some("ok".into()),
                 reasoning: None,
                 cache_hit_pct: Some(62.5),
+                prefill_dev_tokens: None,
             },
             3500,
         )
@@ -1156,6 +1240,7 @@ mod tests {
                 text: None,
                 reasoning: None,
                 cache_hit_pct: None,
+                prefill_dev_tokens: None,
             },
             0
         )
@@ -1170,6 +1255,7 @@ mod tests {
                 text: None,
                 reasoning: None,
                 cache_hit_pct: None,
+                prefill_dev_tokens: None,
             },
             0
         )

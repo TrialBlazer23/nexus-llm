@@ -178,7 +178,7 @@ Burst models unload after `burst_idle_secs` (default 600). The front door stays 
 
 Cluster `u` unloads the selected peer. The footer shows the local model and, when chat is elsewhere, that peer and model.
 
-NPU prefill is opt-in and documented in [docs/hardware/npu-prefill.md](docs/hardware/npu-prefill.md). Low-end roles are documented in [docs/hardware/low-end.md](docs/hardware/low-end.md).
+Hexagon NPU prefill is a per-device switch (`inference.moe.npu_prefill`, default `auto`). `auto` uses HTP0 only on a Vulkan phone whose SoC is a published Hexagon v73 or newer. See [docs/hardware/npu-prefill.md](docs/hardware/npu-prefill.md). Low-end roles are documented in [docs/hardware/low-end.md](docs/hardware/low-end.md).
 
 Fleet checks: `bash scripts/soak/run.sh --dry-run`.
 
@@ -244,6 +244,7 @@ fallback_to_cpu = true
 
 [inference.moe]
 enabled = true
+npu_prefill = "auto"                          # on | off; auto is HTP0 only for a published v73+ Vulkan SoC
 cache_mb = "auto"                             # planner assigns expert cache under the LMK; 0 is off
 cache_ceil_mb = 0                             # 0 = no operator cap; a positive MiB value is a hard ceiling
 

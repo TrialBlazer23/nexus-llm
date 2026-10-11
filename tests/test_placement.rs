@@ -99,6 +99,7 @@ fn ranked_plans_include_predicted_tok_s() {
             thermal_index: 10,
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             total_ram_mb: 28_000,
         }],
     };
@@ -179,6 +180,7 @@ fn ranks_local_moe_stream_for_oversize_moe() {
             thermal_index: 10,
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             total_ram_mb: 0,
         }],
     };
@@ -385,6 +387,7 @@ fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
                 thermal_index: 10,
                 moe_stream: true,
                 moe_cache_ceil_mb: 3500,
+                npu_prefill: false,
                 total_ram_mb: 12_000,
             },
             PlacementCandidate {
@@ -397,6 +400,7 @@ fn ranks_remote_moe_stream_on_capable_peer_when_local_too_small() {
                 thermal_index: 10,
                 moe_stream: false,
                 moe_cache_ceil_mb: 0,
+                npu_prefill: false,
                 total_ram_mb: 0,
             },
         ],
@@ -459,6 +463,7 @@ fn no_remote_moe_stream_without_peer_capability() {
             thermal_index: 10,
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             total_ram_mb: 0,
         }],
     };
@@ -497,6 +502,7 @@ fn no_remote_moe_stream_when_peer_stream_lmk_tight() {
             thermal_index: 10,
             moe_stream: true,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             total_ram_mb: 2_048,
         }],
     };

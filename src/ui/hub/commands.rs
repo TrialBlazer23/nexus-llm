@@ -903,6 +903,7 @@ pub(crate) async fn build_target_selection(
                 moe_stream: p.moe_stream,
                 moe_cache_ceil_mb: p.moe_cache_ceil_mb as u64,
                 total_ram_mb: p.total_ram_mb as u64,
+                npu_prefill: p.npu_prefill,
             });
         }
     }

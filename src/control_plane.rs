@@ -226,8 +226,13 @@ pub async fn build_control_plane_state_with_host(
         available_ram_mb: Some(profile.available_ram_mb),
         total_ram_mb: Some(profile.total_ram_mb),
         backend: Some(crate::bench::backend_key(profile.detected_backend).to_string()),
-        prefill_device: crate::bmoe_client::accepted_prefill_device(&moe.prefill_device)
-            .map(str::to_string),
+        prefill_device: crate::npu_prefill::resolve_prefill(
+            moe.effective_npu_mode(),
+            crate::npu_prefill::current_host().arch_aarch64,
+            crate::npu_prefill::current_host().vulkan,
+            crate::npu_prefill::current_host().soc_part.as_deref(),
+        )
+        .map(str::to_string),
     }
 }
 
@@ -1682,7 +1687,8 @@ mod tests {
         assert_eq!(parsed.backend.as_deref(), Some("vulkan"));
         assert_eq!(parsed.prefill_device, Some("HTP0".into()));
 
-        config.inference.moe.prefill_device = "nope".into();
+        config.inference.moe.prefill_device.clear();
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::Off);
         let rejected = build_control_plane_state_with_host(
             Uuid::from_u128(1),
             NodeRole::HOST,
@@ -1697,5 +1703,48 @@ mod tests {
         )
         .await;
         assert_eq!(rejected.prefill_device, None);
+
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::On);
+        let forced = build_control_plane_state_with_host(
+            Uuid::from_u128(1),
+            NodeRole::HOST,
+            vec!["inference".into()],
+            &SupervisorManager::new(),
+            9_000,
+            false,
+            None,
+            "127.0.0.1",
+            &profile,
+            &config,
+        )
+        .await;
+        assert_eq!(forced.prefill_device, Some("HTP0".into()));
+
+        config.inference.moe.npu_prefill = Some(crate::config::NpuPrefillMode::Auto);
+        let auto = build_control_plane_state_with_host(
+            Uuid::from_u128(1),
+            NodeRole::HOST,
+            vec!["inference".into()],
+            &SupervisorManager::new(),
+            9_000,
+            false,
+            None,
+            "127.0.0.1",
+            &profile,
+            &config,
+        )
+        .await;
+        let host = crate::npu_prefill::current_host();
+        let expected = crate::npu_prefill::resolve_prefill(
+            crate::config::NpuPrefillMode::Auto,
+            host.arch_aarch64,
+            host.vulkan,
+            host.soc_part.as_deref(),
+        )
+        .map(str::to_string);
+        assert_eq!(auto.prefill_device, expected);
+        if !host.arch_aarch64 {
+            assert!(auto.prefill_device.is_none());
+        }
     }
 }

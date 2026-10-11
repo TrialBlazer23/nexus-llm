@@ -292,6 +292,42 @@ fn test_settings_view_navigation_and_mutations() {
     view.toggle_or_adjust(false, false);
     assert!(view.config.hardware.acceleration.prefer_gpu);
 
+    // Hexagon prefill cycles auto → on → off and clears the legacy token.
+    let npu_idx = SettingsView::items()
+        .iter()
+        .position(|i| i.name == "Hexagon NPU Prefill")
+        .expect("npu prefill field must exist");
+    view.selected_index = npu_idx;
+    assert!(!view.is_current_text());
+    assert!(!view
+        .current_item()
+        .description
+        .to_ascii_lowercase()
+        .contains("s23"));
+    assert!(!view
+        .current_item()
+        .description
+        .to_ascii_lowercase()
+        .contains("nothing"));
+    view.config.inference.moe.prefill_device = "HTP0".to_string();
+    view.config.inference.moe.npu_prefill = None;
+    view.toggle_or_adjust(false, true);
+    assert_eq!(
+        view.config.inference.moe.npu_prefill,
+        Some(nexus::config::NpuPrefillMode::Off)
+    );
+    assert!(view.config.inference.moe.prefill_device.is_empty());
+    view.toggle_or_adjust(false, false);
+    assert_eq!(
+        view.config.inference.moe.npu_prefill,
+        Some(nexus::config::NpuPrefillMode::Auto)
+    );
+    view.toggle_or_adjust(true, false);
+    assert_eq!(
+        view.config.inference.moe.npu_prefill,
+        Some(nexus::config::NpuPrefillMode::Off)
+    );
+
     // Find and adjust cpu_threads (numeric adjustments)
     let threads_idx = SettingsView::items()
         .iter()
@@ -660,6 +696,7 @@ async fn test_cluster_view_interactions() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        npu_prefill: false,
         link_class: nexus::cluster::LinkClass::Wifi,
         usb_serial: None,
         usb_api_endpoint: None,
@@ -684,6 +721,7 @@ async fn test_cluster_view_interactions() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        npu_prefill: false,
         link_class: nexus::cluster::LinkClass::Wifi,
         usb_serial: None,
         usb_api_endpoint: None,
@@ -1018,6 +1056,7 @@ async fn test_cluster_view_link_quality_visuals() {
         display_name: String::new(),
         moe_stream: false,
         moe_cache_ceil_mb: 0,
+        npu_prefill: false,
         link_class: nexus::cluster::LinkClass::Wifi,
         usb_serial: None,
         usb_api_endpoint: None,

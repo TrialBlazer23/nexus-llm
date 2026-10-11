@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Edge appliance routing: local front door, context/KV ladder, USB score band, per-serial ADB forwards, battery and thermal gates.
 - Cluster unload of the selected peer, and a footer that keeps the local model visible while chat is on another host.
-- Opt-in Hexagon NPU prefill (`inference.moe.prefill_device = "HTP0"`) for a BigMoeOnEdge v0.28.0 build that contains the Hexagon backend.
+- Per-device Hexagon NPU prefill (`inference.moe.npu_prefill = "auto"|"on"|"off"`) for a BigMoeOnEdge v0.28.0 build that contains the Hexagon backend. `auto` passes `--prefill-device HTP0` only on aarch64 Vulkan whose SoC is a published Hexagon v73, v75, v79, or v81. Legacy `prefill_device = "HTP0"` still means on when the new key is unset. Placement prefers that MoE plan inside the existing 0.85 tok/s band. Decode tok/s is unchanged. The published 7.8–9.5× figure is prefill wall time on Hexagon v81.
 - `scripts/soak` log checker for USB+Wi-Fi, cable yank, battery floor, thermal, 4 GB dense reject, and phone MoE.
 
 ### Changed

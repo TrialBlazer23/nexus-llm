@@ -4,7 +4,7 @@ These notes are operator guidance for the 0.3.0 soak. Product names here are acc
 
 ## Moto Z2
 
-The Moto Z2 is Android 8. Termux bootstrap on that release is often painful. Use it as an RPC worker or a TUI client with a prebuilt `nexus` binary copied onto the device. Do not make it the orchestrator and do not put `prefill_device` on it.
+The Moto Z2 is Android 8. Termux bootstrap on that release is often painful. Use it as an RPC worker or a TUI client with a prebuilt `nexus` binary copied onto the device. Do not make it the orchestrator. Leave `npu_prefill` off.
 
 ## About 4 GB nodes
 

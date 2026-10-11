@@ -217,6 +217,7 @@ fn ranker_without_bench_stays_heuristic() {
             thermal_index: 20,
             moe_stream: false,
             moe_cache_ceil_mb: 0,
+            npu_prefill: false,
             total_ram_mb: 0,
         }],
     };

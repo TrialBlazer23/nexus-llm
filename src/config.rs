@@ -530,6 +530,17 @@ pub enum MoeCachePreference {
     Cache,
 }
 
+/// Per-node Hexagon prefill switch (`inference.moe.npu_prefill`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NpuPrefillMode {
+    Off,
+    On,
+    /// Enable HTP0 only when this process is aarch64 Vulkan and the SoC is published.
+    #[default]
+    Auto,
+}
+
 /// Quality mode for MoE streaming knobs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -551,9 +562,13 @@ pub struct MoeConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Local Hexagon prefill token. Only `HTP0` is accepted; any other value is ignored.
+    /// Legacy spawn token. `HTP0` means [`NpuPrefillMode::On`] when `npu_prefill` is unset.
     #[serde(default = "default_prefill_device")]
     pub prefill_device: String,
+
+    /// Operator switch. Missing means: legacy `HTP0` is on, otherwise auto.
+    #[serde(default)]
+    pub npu_prefill: Option<NpuPrefillMode>,
 
     /// Path or PATH name of the BigMoeOnEdge CLI binary (`scripts/setup.sh` writes `~/.nexus/bin/bmoe-cli`).
     #[serde(default = "default_bmoe_binary")]
@@ -656,6 +671,7 @@ impl Default for MoeConfig {
         Self {
             enabled: true,
             prefill_device: default_prefill_device(),
+            npu_prefill: None,
             bmoe_binary: default_bmoe_binary(),
             cache_mb: default_moe_cache_mb(),
             cache_floor_mb: default_moe_cache_floor_mb(),
@@ -702,6 +718,19 @@ impl MoeConfig {
     /// Whether lossy MoE knobs may be applied.
     pub fn lossy_allowed(&self) -> bool {
         matches!(self.quality_mode, MoeQualityMode::Lossy)
+    }
+
+    /// Explicit `npu_prefill` wins. Legacy `prefill_device = "HTP0"` is on.
+    /// Any other missing switch is auto, which still resolves off on an unknown host.
+    pub fn effective_npu_mode(&self) -> NpuPrefillMode {
+        if let Some(mode) = self.npu_prefill {
+            return mode;
+        }
+        if self.prefill_device.trim().eq_ignore_ascii_case("HTP0") {
+            NpuPrefillMode::On
+        } else {
+            NpuPrefillMode::Auto
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1436,6 +1465,7 @@ prefill_device = \"HTP0\"
 ";
         let cfg: NexusConfig = toml::from_str(set).expect("parse");
         assert_eq!(cfg.inference.moe.prefill_device, "HTP0");
+        assert_eq!(cfg.inference.moe.effective_npu_mode(), NpuPrefillMode::On);
 
         let omitted = "\
 [inference.moe]
@@ -1444,5 +1474,35 @@ enabled = true
         let cfg: NexusConfig = toml::from_str(omitted).expect("parse");
         assert_eq!(cfg.inference.moe.prefill_device, "");
         assert_eq!(MoeConfig::default().prefill_device, "");
+        assert_eq!(cfg.inference.moe.npu_prefill, None);
+        assert_eq!(cfg.inference.moe.effective_npu_mode(), NpuPrefillMode::Auto);
+    }
+
+    #[test]
+    fn npu_prefill_mode_round_trips_and_overrides_legacy_token() {
+        for (raw, mode) in [
+            ("off", NpuPrefillMode::Off),
+            ("on", NpuPrefillMode::On),
+            ("auto", NpuPrefillMode::Auto),
+        ] {
+            let text = format!("[inference.moe]\nnpu_prefill = \"{raw}\"\n");
+            let cfg: NexusConfig = toml::from_str(&text).expect(raw);
+            assert_eq!(cfg.inference.moe.npu_prefill, Some(mode));
+            assert_eq!(cfg.inference.moe.effective_npu_mode(), mode);
+        }
+
+        let both = "\
+[inference.moe]
+prefill_device = \"HTP0\"
+npu_prefill = \"off\"
+";
+        let cfg: NexusConfig = toml::from_str(both).expect("parse");
+        assert_eq!(cfg.inference.moe.effective_npu_mode(), NpuPrefillMode::Off);
+
+        let bad = "\
+[inference.moe]
+npu_prefill = \"cpu\"
+";
+        assert!(toml::from_str::<NexusConfig>(bad).is_err());
     }
 }

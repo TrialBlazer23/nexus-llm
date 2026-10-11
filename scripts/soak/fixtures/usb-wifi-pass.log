@@ -1,0 +1,3 @@
+peer-a; link=usb; model=coder; route=coder
+peer-b; link=wifi; model=coder; route=coder
+hub; link=local; model=front; route=general

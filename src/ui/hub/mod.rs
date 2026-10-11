@@ -630,7 +630,9 @@ impl HubApp {
                 let mut view = self.session();
                 status::on_local_unload(&mut view);
                 self.store_session(view);
-                self.chat.model_name = "default".to_string();
+                if self.chat_host.eq_ignore_ascii_case("local") {
+                    self.chat.model_name = "default".to_string();
+                }
                 self.chat.messages.push(ChatEntry::notice(format!(
                     "Model '{}' unloaded. Local inference engine is idle.",
                     unloaded_model
@@ -649,10 +651,20 @@ impl HubApp {
                 success,
                 message,
             } => {
+                let restore_front_door = success && self.chat_host == name;
                 let mut view = self.session();
                 status::on_peer_unloaded(&mut view, &name, success);
                 if success {
                     self.store_session(view);
+                    if restore_front_door {
+                        let endpoint = format!("http://127.0.0.1:{}", self.config.network.api_port);
+                        let (base, chat_model) =
+                            self.chat_target_after_load(&endpoint, &self.active_model_name);
+                        self.chat.client = NexusClient::new(base);
+                        self.chat.model_name = chat_model;
+                        self.chat
+                            .set_target_hardware("Local Host", "Local".to_string());
+                    }
                     let text = if message.is_empty() {
                         format!("Unloaded model on {name}")
                     } else {

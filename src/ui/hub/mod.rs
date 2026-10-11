@@ -3306,17 +3306,21 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     .find(|p| !p.active_model.is_empty() || p.status.is_ready())
                                 {
                                     let ep = active_peer.api_endpoint();
-                                    hub.discovery.send_direct_probe_to_ip(active_peer.addr.ip()).await;
+                                    let peer_ip = active_peer.addr.ip();
                                     let model = if !active_peer.active_model.is_empty() {
                                         active_peer.active_model.clone()
                                     } else {
                                         "cluster-model".to_string()
                                     };
+                                    let peer_label = active_peer.label();
+                                    let backend = active_peer.backend.to_string();
+                                    hub.discovery.send_direct_probe_to_ip(peer_ip).await;
                                     hub.chat.client = NexusClient::new(ep.clone());
                                     hub.chat.model_name = model.clone();
-                                    hub.active_model_name = model;
-                                    let peer_label = active_peer.label();
-                                    hub.chat.set_target_hardware(&peer_label, active_peer.backend.to_string());
+                                    let mut view = hub.session();
+                                    status::on_remote_load(&mut view, &peer_label, &model);
+                                    hub.store_session(view);
+                                    hub.chat.set_target_hardware(&peer_label, backend);
                                     hub.status_message = Some((
                                         format!("Connected to cluster host at {} (probe sent)", ep),
                                         Color::Green,

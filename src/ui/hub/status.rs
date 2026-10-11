@@ -70,6 +70,12 @@ pub fn on_peer_unloaded(view: &mut SessionView, name: &str, success: bool) {
     }
 }
 
+/// Cluster disconnect. Chat goes home. The local model stays loaded.
+pub fn on_cluster_disconnect(view: &mut SessionView) {
+    view.chat_host = "Local".into();
+    view.chat_model = view.local_model.clone();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +160,29 @@ mod tests {
         assert_eq!(view.chat_model, "general.gguf");
         on_peer_unloaded(&mut view, "other", false);
         assert_eq!(view.chat_host, "Local");
+    }
+
+    #[test]
+    fn cluster_disconnect_returns_chat_home_without_unloading() {
+        let mut view = SessionView {
+            local_model: "general.gguf".into(),
+            chat_host: "peer-a".into(),
+            chat_model: "coder-7b.gguf".into(),
+        };
+        on_cluster_disconnect(&mut view);
+        assert_eq!(view.local_model, "general.gguf");
+        assert_eq!(view.chat_host, "Local");
+        assert_eq!(view.chat_model, "general.gguf");
+
+        let mut already = SessionView {
+            local_model: "general.gguf".into(),
+            chat_host: "Local".into(),
+            chat_model: "coder-7b.gguf".into(),
+        };
+        on_cluster_disconnect(&mut already);
+        assert_eq!(already.local_model, "general.gguf");
+        assert_eq!(already.chat_host, "Local");
+        assert_eq!(already.chat_model, "general.gguf");
     }
 
     #[test]

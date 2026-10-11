@@ -6,11 +6,12 @@
 //! `control_port` (signed control plane).
 
 use crate::appliance::{
-    apply_front_door_rung, catalog_filename_for_digest, cold_predict_tok_s, decide_appliance,
-    format_route_header, front_door_tags, link_header_token, load_presets, observe_stream_done,
-    pantry_reverse_device_port, pantry_source_base, peer_lost_sse, plan_front_door,
-    preset_tags_for_file, score_burst_candidate, tier2_model_id, warn_front_door_once,
-    ApplianceDecision, BurstActivity, RouteStay, PANTRY_CATALOG_INTERVAL, PANTRY_CATALOG_WAIT,
+    apply_front_door_rung, burst_candidate_skip_lines, catalog_filename_for_digest,
+    cold_predict_tok_s, decide_appliance, format_route_header, front_door_tags, link_header_token,
+    load_presets, observe_stream_done, pantry_reverse_device_port, pantry_source_base,
+    peer_lost_sse, plan_front_door, preset_tags_for_file, score_burst_candidate, tier2_model_id,
+    warn_front_door_once, ApplianceDecision, BurstActivity, RouteStay, PANTRY_CATALOG_INTERVAL,
+    PANTRY_CATALOG_WAIT,
 };
 use crate::bench::BenchStore;
 use crate::client::NexusClient;
@@ -2129,6 +2130,17 @@ async fn escalate_chat(
             snap.battery_floor,
             &snap.battery_action,
         );
+        // No plan or a batch-only plan is a different skip. Do not call it battery or thermal.
+        if predicted.is_some() && interactive {
+            for line in burst_candidate_skip_lines(
+                peer.thermal_index,
+                peer.battery_percent,
+                snap.battery_floor,
+                &snap.battery_action,
+            ) {
+                warn!("appliance escalation skip {}: {line}", peer.label());
+            }
+        }
         rows.push((peer, score, best));
     }
 

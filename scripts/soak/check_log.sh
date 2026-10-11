@@ -40,19 +40,19 @@ require_any() {
 
 case "$scenario" in
   usb-wifi)
-    require_all "link=usb" "link=wifi" "route="
+    require_all "USB" "Wi-Fi" "route="
     ;;
   cable-yank)
-    require_all "link=usb" "link=wifi"
+    require_all "USB" "Wi-Fi"
     ;;
   battery-floor)
-    require_all "battery" "decline"
+    require_all "battery decline"
     ;;
   thermal)
-    require_all "thermal"
+    require_all "thermal skip"
     ;;
   dense-4gb)
-    require_any "no local model fits" "Exceeds"
+    require_any "no local model fits" "Exceeds" "exceeds 75% memory ceiling"
     ;;
   moe-phone)
     require_all "moe-stream" "tok/s"

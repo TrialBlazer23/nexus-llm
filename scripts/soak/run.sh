@@ -31,19 +31,19 @@ scenarios:
   moe-phone
 
 usb-wifi
-  Have one USB peer and one Wi-Fi peer up at the same time. Send a prompt from the hub. Keep hub lines that contain link=usb, link=wifi, and route=.
+  Have one USB peer and one Wi-Fi peer up at the same time. Send a prompt from the hub. Keep hub route lines that contain USB, Wi-Fi, and route=. The hub prints those words, not link=usb.
 
 cable-yank
-  start a generation on the USB peer, unplug, confirm the stream ends or errors, then send a new prompt and confirm the route line is Wi-Fi when that peer is still the winner. Unplug flips the peer to Wi-Fi when the beacon is fresh, and an in-flight stream is not migrated. Keep a hub line with link=usb from the start, and a later line with link=wifi for that same session.
+  start a generation on the USB peer, unplug, confirm the stream ends or errors, then send a new prompt and confirm the route line is Wi-Fi when that peer is still the winner. Unplug flips the peer to Wi-Fi when the beacon is fresh, and an in-flight stream is not migrated. Keep a hub line with USB from the start, and a later line with Wi-Fi for that same session. Do not keep link=usb.
 
 battery-floor
-  Drain a peer under the battery floor with battery action decline. Send a new prompt. Keep hub lines that contain battery and decline. That peer must not take the new load.
+  Drain a peer under the battery floor with battery action decline. Send a new prompt. Keep a hub line that contains battery decline. That peer must not take the new load.
 
 thermal
-  Raise a peer above the thermal cutoff. Send a new heavy prompt. Keep a hub line that contains thermal. The next new load skips that peer. An in-flight local reply is not killed.
+  Raise a peer above the thermal cutoff. Send a new heavy prompt. Keep a hub line that contains thermal skip. The next new load skips that peer. An in-flight local reply is not killed.
 
 dense-4gb
-  on the 4 GB node, ask for a dense GGUF whose weights alone exceed 75% of MemAvailable, and keep the log line that reports the reject. The checker accepts either substring: no local model fits, or Exceeds.
+  on the 4 GB node, ask for a dense GGUF whose weights alone exceed 75% of MemAvailable, and keep the log line that reports the reject. The checker accepts any of: no local model fits, Exceeds, or exceeds 75% memory ceiling.
 
 moe-phone
   on a 12–16 GB phone, load a streamable MoE larger than RAM through the hub escalation path and keep a `tok/s` line. The log must also contain moe-stream.

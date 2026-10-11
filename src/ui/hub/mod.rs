@@ -592,6 +592,23 @@ impl HubApp {
         self.chat_model = view.chat_model;
     }
 
+    /// Cluster `d`. Chat goes home. Does not stop the supervisor or unload a peer.
+    pub fn disconnect_chat_target(&mut self) {
+        let mut view = self.session();
+        status::on_cluster_disconnect(&mut view);
+        self.store_session(view);
+        let endpoint = format!("http://127.0.0.1:{}", self.config.network.api_port);
+        let (base, chat_model) = self.chat_target_after_load(&endpoint, &self.active_model_name);
+        self.chat.client = NexusClient::new(base.clone());
+        self.chat.model_name = chat_model;
+        self.chat
+            .set_target_hardware("Local Host", "Local".to_string());
+        self.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
+        self.chat.messages.push(ChatEntry::notice(format!(
+            "Disconnected from peer. Reverted to local endpoint: {base}"
+        )));
+    }
+
     /// Apply a worker event on the UI thread (no awaits).
     pub fn apply_event(&mut self, event: HubEvent) {
         match event {
@@ -3541,12 +3558,7 @@ pub async fn run_hub_tui(mut hub: HubApp) -> Result<(), Box<dyn std::error::Erro
                                     KeyCode::Char('i') | KeyCode::Char('I') => hub.cluster_view.toggle_info_modal(),
                                     KeyCode::Char('a') | KeyCode::Char('A') => hub.cluster_view.start_add_peer(),
                                     KeyCode::Char('d') | KeyCode::Char('D') => {
-                                        let local_ep = format!("http://127.0.0.1:{}", hub.config.network.api_port);
-                                        hub.chat.client = NexusClient::new(local_ep.clone());
-                                        hub.chat.set_target_hardware("Local Host", "Local CPU/GPU");
-                                        hub.status_message = Some(("Reset chat target to local node".to_string(), Color::Green));
-                                        hub.chat.messages.push(crate::ui::chat::ChatEntry::notice(format!("Disconnected from peer. Reverted to local endpoint: {}", local_ep)));
-
+                                        hub.disconnect_chat_target();
                                     }
                                     KeyCode::Char('u') | KeyCode::Char('U') => {
                                         if let Some(peer) = hub.cluster_view.selected_peer() {

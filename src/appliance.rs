@@ -373,6 +373,29 @@ pub fn score_burst_candidate(
     }
 }
 
+/// Skip lines for one candidate. Not used by [`score_burst_candidate`].
+///
+/// `battery decline` only when the gate is [`BatteryGate::Decline`].
+/// `thermal skip` only when the thermal index is above 75.
+/// Throttle, ignore, and a missing percent do not produce a battery line.
+/// Both lines can apply to the same peer.
+pub fn burst_candidate_skip_lines(
+    thermal_index: u8,
+    battery_percent: Option<u8>,
+    battery_floor: u8,
+    battery_action: &str,
+) -> Vec<&'static str> {
+    let mut lines = Vec::with_capacity(2);
+    let gate = crate::cluster::battery_gate(battery_percent, battery_floor, battery_action);
+    if gate == BatteryGate::Decline {
+        lines.push("battery decline");
+    }
+    if !crate::cluster::thermal_eligible(thermal_index) {
+        lines.push("thermal skip");
+    }
+    lines
+}
+
 /// Cold-start tok/s. A positive measurement skips the size scale and quant boost.
 pub fn cold_predict_tok_s(
     backend: AccelerationBackend,
@@ -861,6 +884,30 @@ mod tests {
             Some("http://10.0.0.2:8080".into())
         );
         assert_eq!(hub_client_base_url(None, true, false, 8090), None);
+    }
+
+    #[test]
+    fn burst_skip_lines_are_decline_and_thermal_only() {
+        assert_eq!(
+            burst_candidate_skip_lines(40, Some(10), 20, "decline"),
+            vec!["battery decline"]
+        );
+        assert_eq!(
+            burst_candidate_skip_lines(76, Some(80), 20, "decline"),
+            vec!["thermal skip"]
+        );
+        assert_eq!(
+            burst_candidate_skip_lines(76, Some(10), 20, "decline"),
+            vec!["battery decline", "thermal skip"]
+        );
+        assert!(burst_candidate_skip_lines(75, Some(10), 20, "throttle").is_empty());
+        assert!(burst_candidate_skip_lines(40, Some(10), 20, "ignore").is_empty());
+        assert!(burst_candidate_skip_lines(40, None, 20, "decline").is_empty());
+        assert_eq!(
+            burst_candidate_skip_lines(75, Some(19), 20, "decline"),
+            vec!["battery decline"]
+        );
+        assert!(burst_candidate_skip_lines(75, Some(20), 20, "decline").is_empty());
     }
 
     #[test]

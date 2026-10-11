@@ -847,6 +847,43 @@ async fn unloading_the_current_peer_retargets_chat_to_the_front_door() {
 }
 
 #[tokio::test]
+async fn cluster_disconnect_returns_chat_home() {
+    let config = NexusConfig::default();
+    let discovery = Arc::new(DiscoveryService::new(config.clone(), None));
+    let client = NexusClient::new("http://10.0.0.8:8080");
+    let mut hub = test_hub(config, client, discovery);
+
+    hub.active_model_name = "general.gguf".to_string();
+    hub.chat_host = "peer-a".to_string();
+    hub.chat_model = "coder-7b.gguf".to_string();
+    hub.chat.model_name = "coder-7b.gguf".to_string();
+    hub.chat
+        .set_target_hardware("peer-a", "Remote RPC".to_string());
+
+    let local_endpoint = format!("http://127.0.0.1:{}", hub.config.network.api_port);
+    let (base, chat_model) = nexus::appliance::hub_chat_target_after_load(
+        &local_endpoint,
+        &hub.active_model_name,
+        hub.config.network.default_host.as_deref(),
+        hub.config.inference.appliance.enabled,
+        hub.config.network.gateway_enabled,
+        hub.config.network.gateway_port,
+    );
+
+    hub.disconnect_chat_target();
+
+    assert_eq!(hub.active_model_name, "general.gguf");
+    assert_eq!(hub.chat_host, "Local");
+    assert_eq!(hub.chat_model, "general.gguf");
+    assert_eq!(hub.chat.client.endpoint(), base);
+    assert_eq!(hub.chat.model_name, chat_model);
+    assert_ne!(hub.chat.model_name, "coder-7b.gguf");
+    assert_ne!(hub.chat.client.endpoint(), "http://10.0.0.8:8080");
+    assert_eq!(hub.chat.target_device_name, "Local Host");
+    assert_eq!(hub.chat.target_backend, "Local");
+}
+
+#[tokio::test]
 async fn unloading_a_different_peer_leaves_the_chat_client() {
     let config = NexusConfig::default();
     let discovery = Arc::new(DiscoveryService::new(config.clone(), None));

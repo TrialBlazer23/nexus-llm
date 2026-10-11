@@ -1,3 +1,3 @@
-dense gguf on the 4 GB node
+appliance: no local model fits
+Android LMK Guard: Model size (3500 MB) exceeds 75% memory ceiling (2400 MB of 3200 MB available)
 weights Exceeds safe budget
-reject kept

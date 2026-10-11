@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-11 — v0.3.0 footer, soak tokens, and the tag gate
+- Category: design-decision
+- Context: Whole-branch review of `feat/v0.3.0` after Tasks 1–6. Cluster `d` reset the client to localhost and left `chat_host` on the peer. The soak checker required `link=usb`, `battery`, `decline`, and `thermal`, which the hub does not print. The operator-gate question was declined.
+- Finding: `route_notice_line` prints `USB`, `Wi-Fi`, `route=`, and `tok/s`. Battery decline and thermal skip were not logged. A captured hub log could not pass `check_log.sh`. Disconnect made the new footer name a peer the client had left.
+- Action: Cluster `d` goes through `disconnect_chat_target` and `chat_target_after_load`. The checker matches those notice words, plus `battery decline`, `thermal skip`, and `exceeds 75% memory ceiling`. Log the two skip lines from `escalate_chat` only when the peer already has an interactive plan. Do not edit `score_burst_candidate`. Do not tag `v0.3.0` until the operator soak on the real fleet exits 0.
+- Verification: `cargo test --locked -- --test-threads=8` in the v0.3.0 worktree, 362 passed, 0 failed. No live fleet run.
+
 ## 2026-10-10 — USB probe RAM and backend use beacon units
 - Category: bug
 - Context: After the edge-appliance merge, `apply_probe_hit` stored `ControlPlaneState.allocatable_memory_mb` in `PeerNode.free_ram_mb`. The ladder applies `max_ram_usage_percent` to `free_ram_mb`, so a 75% phone was planned at about 56% of MemAvailable, and a later probe overwrote a good beacon value. A peer created only from USB state became GenericCpu unless capabilities contained `vulkan`, so `peer_offload_layers` sent `gpu_layers` 0. Phone capabilities are feature flags and do not include `vulkan`.

@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod keymap;
+pub mod status;
 
 use crate::appliance::hub_chat_target_after_load;
 use crate::client::NexusClient;

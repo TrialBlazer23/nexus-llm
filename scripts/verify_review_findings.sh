@@ -108,7 +108,7 @@ done
 for field in 'max_ram_usage_percent' 'safety\.mmap' 'enable_rpc' 'prefer_adb_tunnel' \
              'resolved_display_name|display_name'; do
     rule "$field must have behavioral callers outside settings/config"
-    hits=$(search "$field" | grep -Ev '^src/config\.rs|^src/ui/settings_view\.rs|^CAPABILITY_REVIEW|^AGENT_LEARNINGS|^scripts/')
+    hits=$(search "$field" | grep -Ev '^src/config\.rs|^src/ui/settings_view\.rs|^docs/|^CAPABILITY_REVIEW|^AGENT_LEARNINGS|^scripts/')
     if [ -z "$hits" ]; then
         echo "MISSING — expected runtime consumers after Phase 7 remainder"
         FAIL=1

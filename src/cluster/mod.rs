@@ -68,7 +68,7 @@ impl ModelFit {
 }
 
 /// Models-list badge. A plan below the interactive floor is `batch`; otherwise the verdict label.
-pub fn fit_badge<'a>(interactive: bool, verdict_label: &'a str) -> &'a str {
+pub fn fit_badge(interactive: bool, verdict_label: &str) -> &str {
     if interactive {
         verdict_label
     } else {

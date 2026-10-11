@@ -305,3 +305,14 @@ bash scripts/check_penryn_opcodes.sh target/release/nexus
 - **[Georgi Gerganov](https://github.com/ggerganov)** & the **[llama.cpp](https://github.com/ggerganov/llama.cpp)** / **[ggml](https://github.com/ggerganov/ggml)** community for portable local LLM inference and the RPC server.
 - **[Ratatui](https://github.com/ratatui/ratatui)** & **[crossterm](https://github.com/crossterm-rs/crossterm)** for terminal UI infrastructure in Rust.
 - **[redb](https://github.com/cberner/redb)** for the embedded pure-Rust transactional database.
+
+---
+
+## License
+
+Nexus-LLM is dual-licensed under either:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.

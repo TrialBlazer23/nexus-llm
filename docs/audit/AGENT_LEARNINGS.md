@@ -25,6 +25,13 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-11 — Hub module decomposition, dual licensing, and audit archiving
+- Category: design-decision
+- Context: Refactored monolithic `src/ui/hub/mod.rs` (3,860 lines / 185 KB), added dual MIT/Apache-2.0 licensing, synced GitHub/Cargo metadata, and moved historical root audit reports into `docs/audit/`.
+- Finding: Monolithic `mod.rs` combined state machines, modal overlays, command palette, rendering, and terminal event loops in a single file, creating maintainability friction. Additionally, lack of LICENSE and repository topics limited project discoverability and legal clarity.
+- Action: Decomposed `src/ui/hub/` into `modals.rs`, `palette.rs`, `render.rs`, `runner.rs`, and a compact `mod.rs` with re-exports preserving 100% backward compatibility for all test suites. Added `LICENSE`, `LICENSE-MIT`, and `LICENSE-APACHE`. Updated Cargo.toml and GitHub repo description/topics. Archived historical root audit markdown docs to `docs/audit/` and updated `AGENTS.md`.
+- Verification: `cargo test --locked`, `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `bash scripts/verify_review_findings.sh`, and `cargo run --locked --bin nexus -- info` all passed cleanly.
+
 ## 2026-10-11 — v0.3.0 footer, soak tokens, and the tag gate
 - Category: design-decision
 - Context: Whole-branch review of `feat/v0.3.0` after Tasks 1–6. Cluster `d` reset the client to localhost and left `chat_host` on the peer. The soak checker required `link=usb`, `battery`, `decline`, and `thermal`, which the hub does not print. The operator-gate question was declined.

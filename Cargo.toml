@@ -3,6 +3,12 @@ name = "nexus"
 version = "0.3.0"
 edition = "2021"
 authors = ["Nexus-LLM Team"]
+description = "Distributed edge LLM orchestrator & peer mesh in Rust. Run, offload, and flash-stream models across Android (Termux), legacy x86, and PCs."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TrialBlazer23/nexus-llm"
+readme = "README.md"
+keywords = ["llm", "edge-inference", "mesh-networking", "android", "termux"]
+categories = ["command-line-utilities", "science"]
 
 [lib]
 name = "nexus"

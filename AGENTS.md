@@ -56,11 +56,12 @@ Do not introduce complex C/C++ bindings into the Rust codebase; interface with `
 ├── .cargo/
 │   └── config.toml
 ├── AGENTS.md
-├── AGENT_LEARNINGS.md
 ├── DESIGN_SPEC.md
 ├── BUILD_PLAN.md
-├── CAPABILITY_REVIEW.md
-├── NETWORK_EXPANSION_FINDINGS.md
+├── docs/
+│   ├── audit/                    # Archived audits & agent learnings (CAPABILITY_REVIEW, AGENT_LEARNINGS, etc.)
+│   ├── hardware/
+│   └── superpowers/
 ├── scripts/
 │   ├── setup.sh                  # Unified bootstrap → ~/.nexus/bin (+ setup.ps1 for Windows/WSL)
 │   ├── versions.env              # Pinned llama.cpp + BigMoeOnEdge refs
@@ -151,7 +152,7 @@ Every behavior change should include or update focused tests for the success pat
 
 # Agent Learnings
 
-Record durable lessons in [AGENT_LEARNINGS.md](AGENT_LEARNINGS.md). Add an entry when a bug, failed command, environment-specific behavior, research finding, or design decision could prevent future agents from repeating the same mistake. Keep entries concise, factual, and actionable. Do not record secrets, credentials, tokens, personal data, or noisy one-off status updates.
+Record durable lessons in [docs/audit/AGENT_LEARNINGS.md](docs/audit/AGENT_LEARNINGS.md). Add an entry when a bug, failed command, environment-specific behavior, research finding, or design decision could prevent future agents from repeating the same mistake. Keep entries concise, factual, and actionable. Do not record secrets, credentials, tokens, personal data, or noisy one-off status updates.
 
 Use this structure for each entry:
 

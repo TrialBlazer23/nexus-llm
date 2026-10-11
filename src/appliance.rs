@@ -236,6 +236,7 @@ pub fn pantry_reverse_device_port(device_api: u16, device_control: u16, device_r
 
 /// Base URL the peer GETs. Wi-Fi uses the host LAN address. USB uses the
 /// reversed device port on the phone's loopback, not the Mac control port.
+#[allow(clippy::result_unit_err)]
 pub fn pantry_source_base(
     link: LinkClass,
     lan_ip: &str,
@@ -347,6 +348,7 @@ pub fn select_front_door<'a>(pin: &str, files: &'a [FrontDoorFile<'a>]) -> Optio
 
 /// One burst row. `Throttle` integer-divides millis by 2. A missing plan,
 /// a batch-only plan, thermal above 75, or `Decline` clears `eligible`.
+#[allow(clippy::too_many_arguments)]
 pub fn score_burst_candidate(
     name: impl Into<String>,
     link: LinkClass,

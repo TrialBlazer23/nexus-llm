@@ -166,6 +166,24 @@ flowchart TD
 
 ---
 
+## Edge appliance
+
+The machine you type on is the front door, including a 4 GB node. Ordinary chat stays there when the loaded model carries that preset tag.
+
+Heavy presets escalate to the best eligible peer. USB wins over Wi-Fi only inside the 15% predicted tok/s band. Hot, low-battery, or slower USB peers lose.
+
+One ADB forward pair per authorized serial. The same UUID on cable and Wi-Fi is one peer.
+
+Burst models unload after `burst_idle_secs` (default 600). The front door stays loaded.
+
+Cluster `u` unloads the selected peer. The footer shows the local model and, when chat is elsewhere, that peer and model.
+
+NPU prefill is opt-in and documented in [docs/hardware/npu-prefill.md](docs/hardware/npu-prefill.md). Low-end roles are documented in [docs/hardware/low-end.md](docs/hardware/low-end.md).
+
+Fleet checks: `bash scripts/soak/run.sh --dry-run`.
+
+---
+
 ## Security & Network Posture
 
 Nexus-LLM is engineered primarily for trusted local area networks (LANs). Please review our full [SECURITY.md](SECURITY.md) for details on threat modeling and configuration.

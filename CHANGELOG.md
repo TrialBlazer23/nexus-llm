@@ -5,6 +5,17 @@ All notable changes to Nexus-LLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-11
+
+### Added
+- Edge appliance routing: local front door, context/KV ladder, USB score band, per-serial ADB forwards, battery and thermal gates.
+- Cluster unload of the selected peer, and a footer that keeps the local model visible while chat is on another host.
+- Opt-in Hexagon NPU prefill (`inference.moe.prefill_device = "HTP0"`) for a BigMoeOnEdge v0.28.0 build that contains the Hexagon backend.
+- `scripts/soak` log checker for USB+Wi-Fi, cable yank, battery floor, thermal, 4 GB dense reject, and phone MoE.
+
+### Changed
+- Dense fit counts full weights plus KV plus compute buffer. The mmap weight discount is not a verdict.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added

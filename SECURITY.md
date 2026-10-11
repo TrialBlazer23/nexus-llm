@@ -12,7 +12,7 @@ Nexus-LLM is an ultra-lightweight distributed LLM orchestration network designed
 
 ### Operational Assumptions
 1. **Network Boundary:** Nexus-LLM assumes communication occurs across a **Trusted Local Area Network (LAN)** or over an **Encrypted Point-to-Point Overlay Network** (e.g. WireGuard, Tailscale, SSH port forwarding, or ADB USB tunnels).
-2. **Cleartext Transport:** Transport payloads (chat prompt tokens, model generation outputs, document chunks, and model binary blobs) traverse network sockets via **HTTP/1.1 without Transport Layer Security (TLS)**.
+2. **Cleartext Transport:** Transport payloads (chat prompt tokens, model generation outputs, document chunks, and model binary blobs) traverse network sockets via **HTTP/1.1 without Transport Layer Security (TLS)**. ADB forwards land on hub localhost and the phone-side hop is still the phone's own HTTP listener, so the LAN cleartext assumption still applies to Wi-Fi peers.
 3. **Public Network Warning:** Nexus-LLM **must not** be exposed directly to untrusted public networks (the Internet, public Wi-Fi) without a secure tunneling layer or a TLS-terminating reverse proxy.
 
 ---

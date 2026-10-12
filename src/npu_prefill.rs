@@ -1,7 +1,8 @@
 //! Local Hexagon prefill decision.
 //!
-//! The part table is Qualcomm chip ids and published HTP generations from
-//! LiteRT `supported_soc.csv` (2026-10-11). It is not a phone-name list.
+//! The part table is Qualcomm chip ids. Rows with a generation come from
+//! LiteRT `supported_soc.csv` (2026-10-11). `SM8735` is v73 from a device
+//! log on 2026-10-12, not from that CSV. It is not a phone-name list.
 //! Rank and routing read only the resolved token a node advertises.
 
 use crate::config::NpuPrefillMode;
@@ -85,6 +86,7 @@ const HTP_BY_PART: &[(&str, u8)] = &[
     ("SM8550", 73),
     ("SM8635", 73),
     ("SM8650", 75),
+    ("SM8735", 73),
     ("SM8750", 79),
     ("SM8845", 81),
     ("SM8845P", 81),
@@ -261,7 +263,8 @@ mod tests {
         assert_eq!(htp_generation("SM8750"), Some(79));
         assert_eq!(htp_generation("SM8850"), Some(81));
         assert_eq!(htp_generation("SM8450"), Some(69));
-        assert_eq!(htp_generation("SM8735"), None);
+        assert_eq!(htp_generation("SM8735"), Some(73));
+        assert_eq!(htp_generation("SM0000"), None);
         assert!(htp_generation_qualifies(73));
         assert!(!htp_generation_qualifies(69));
     }
@@ -275,6 +278,10 @@ mod tests {
         );
         assert_eq!(
             resolve_prefill(NpuPrefillMode::Auto, true, true, Some("SM8735")),
+            Some("HTP0")
+        );
+        assert_eq!(
+            resolve_prefill(NpuPrefillMode::Auto, true, true, Some("SM0000")),
             None
         );
         assert_eq!(
@@ -290,7 +297,7 @@ mod tests {
             None
         );
         assert_eq!(
-            resolve_prefill(NpuPrefillMode::On, true, true, Some("SM8735")),
+            resolve_prefill(NpuPrefillMode::On, true, true, Some("SM0000")),
             Some("HTP0")
         );
         assert_eq!(
@@ -326,7 +333,8 @@ mod tests {
     #[test]
     fn doctor_lines_follow_mode_and_resolution() {
         let qualified = host(true, true, Some("SM8550"));
-        let unknown = host(true, true, Some("SM8735"));
+        let measured = host(true, true, Some("SM8735"));
+        let unknown = host(true, true, Some("SM0000"));
         assert_eq!(
             npu_prefill_line(NpuPrefillMode::Off, &qualified),
             "npu prefill: off"
@@ -337,6 +345,10 @@ mod tests {
         );
         assert_eq!(
             npu_prefill_line(NpuPrefillMode::Auto, &qualified),
+            "npu prefill: auto (HTP0)"
+        );
+        assert_eq!(
+            npu_prefill_line(NpuPrefillMode::Auto, &measured),
             "npu prefill: auto (HTP0)"
         );
         assert_eq!(

@@ -22,7 +22,7 @@ Published examples:
 | SM8750 | v79 | HTP0 |
 | SM8850 (8 Elite Gen 5) | v81 | HTP0 |
 | SM8450 | v69 | off |
-| SM8735 | unpublished | off until measured |
+| SM8735 | v73, measured 2026-10-12 | HTP0 |
 
 The 7.8–9.5× figures are prefill wall time on a 12 GB Hexagon v81 phone (Qwen3.6-35B-A3B Q4_0 streamed from flash): about 7.8× at 1418 tokens (63.8s CPU, 8.2s NPU) and 9.5× at 1921 tokens (106.5s, 11.2s). A 121-token prompt on that same part barely gained. Do not expect that ratio on v73. Decode tok/s is not multiplied. Placement may prefer a Vulkan MoE plan that advertised HTP0 when its predicted tok/s is at least 0.85× the leading MoE plan.
 
@@ -30,9 +30,9 @@ The 7.8–9.5× figures are prefill wall time on a 12 GB Hexagon v81 phone (Qwen
 
 2. `bash scripts/setup.sh` on Termux still builds the host CLI. That binary has no Hexagon backend. `--prefill-device HTP0` then stays on the CPU, which is the upstream fallback, and decode stays on the CPU either way. Setup does not call `build_bmoe_hexagon.sh`.
 
-3. Hexagon v73 or newer can run prefill on `HTP0` after `NEXUS_BMOE_HEXAGON=1 bash scripts/lib/build_bmoe_hexagon.sh` on an aarch64 machine with Docker. The script refuses `x86_64`.
+3. Hexagon v73 or newer can run prefill on `HTP0`. The BigMoeOnEdge v0.28.0 arm64 release already contains `bmoe-cli` and `libggml-htp-v73.so` through `libggml-htp-v81.so`. Copy those files into one directory on the phone. The Docker build (`NEXUS_BMOE_HEXAGON=1 bash scripts/lib/build_bmoe_hexagon.sh`) is the other way to produce that same set. It refuses `x86_64`. `setup.sh` does not call it.
 
-4. Install `bmoe-cli` and the `libggml-htp-v*.so` files on the phone. The container writes them under `build-hexagon` in the BigMoe checkout (`/workspace/build-hexagon`). Copy those files into one directory on the phone. Export `ADSP_LIBRARY_PATH` to that directory before `nexus` or `nexusd`. Nexus sets `GGML_HEXAGON_HOSTBUF=1` only for a spawn that resolved HTP0.
+4. Export `ADSP_LIBRARY_PATH` to that directory before `nexus` or `nexusd`. Nexus sets `GGML_HEXAGON_HOSTBUF=1` only for a spawn that resolved HTP0. Skel files for several generations ship together, so their presence does not identify the phone. The `Hexagon Arch version vNN` stderr line does.
 
 5. Leave `npu_prefill` at `auto` on a published part. Set `on` only to verify an unpublished part. Set `off` on the Mac, the Windows laptop, and any node that should stay on CPU. A known quant outside Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4, Q4_K, Q5_K, and Q6_K omits the flag even when the switch is `on`. Q3_K and below are not an NPU expert path. An unknown label does not block. Output on the NPU is fp16 and is not bit-identical to CPU. The streamed expert path stays lossless in the sense upstream documents: the routed arena reads only routed experts, and `--no-prefill-routed` is not turned on.
 
@@ -40,6 +40,6 @@ The 7.8–9.5× figures are prefill wall time on a 12 GB Hexagon v81 phone (Qwen
 
 7. Operator check, not this VM. Use a GGUF larger than the phone's RAM and an allowed quant.
 
-   On the 16 GB phone (SM8735): `auto` must doctor `auto (off)` and must not pass the flag. Set `on`. `BMOE_DONE.prefill_dev_tokens` must be greater than 0. Record the `Hexagon Arch version vNN` line. Set `off` and the same prompt must report `prefill_dev_tokens` 0. Only then add `SM8735` → that generation in `src/npu_prefill.rs`.
+   `SM8735` is v73 in `src/npu_prefill.rs`. Measured on Termux, 2026-10-12, Nexus `c21e301`: `getprop ro.soc.model` was `SM8735` (`/sys/devices/soc0/machine` was unreadable) and Vulkan was present. `auto` doctored `auto (off)` and omitted `--prefill-device` (`prefill_dev_tokens=0`). `on` passed `--prefill-device HTP0`, opened `libggml-htp-v73.so`, and logged `Hexagon Arch version v73` after `FASTRPC_GET_DOMAINS` failed with `0x6c`. The same Q4_K_M MoE logged `prefill_dev_tokens=549`. `off` omitted the flag and logged `prefill_dev_tokens=0`. `auto` now resolves HTP0 on this part. An unknown part still stays off until the same pair of lines exists.
 
-   On SM8550 with Vulkan, `auto` should already doctor `auto (HTP0)`. Record the actual prefill ratio. Do not expect 7.8–9.5× on v73.
+   On SM8550 with Vulkan, `auto` should doctor `auto (HTP0)`. Measured on Termux, 2026-10-12, Nexus `c21e301`: `getprop ro.soc.model` was `SM8550` (`/sys/devices/soc0/machine` was unreadable), doctor printed `auto (HTP0)`, and `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M` streamed with `--prefill-device HTP0`. stderr reported `Hexagon Arch version v73` after `FASTRPC_GET_DOMAINS` failed with `0x6c` and static CDSP domains loaded. A 440-word prompt logged `prefill_dev_tokens=724`. Decode stayed on the CPU at about 1.9 tok/s. That run has no CPU-off comparison. Do not expect 7.8–9.5× on v73.

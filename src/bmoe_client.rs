@@ -1103,10 +1103,12 @@ mod tests {
         };
         assert!(cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
         cfg.npu_host.soc_part = Some("SM8735".into());
+        assert!(cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
+        cfg.npu_host.soc_part = Some("SM0000".into());
         assert!(!cfg.build_args().iter().any(|arg| arg == "--prefill-device"));
 
         cfg.moe.npu_prefill = Some(NpuPrefillMode::On);
-        cfg.npu_host.soc_part = Some("SM8735".into());
+        cfg.npu_host.soc_part = Some("SM0000".into());
         assert!(cfg
             .build_args_for_quant(Some("Q4_K_M"))
             .iter()

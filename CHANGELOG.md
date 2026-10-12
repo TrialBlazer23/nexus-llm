@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Dense fit counts full weights plus KV plus compute buffer. The mmap weight discount is not a verdict.
+- `SM8735` is Hexagon v73 in the prefill part table after a 2026-10-12 device log (`Hexagon Arch version v73`, `prefill_dev_tokens=549` with `npu_prefill = "on"`). `auto` on aarch64 Vulkan now resolves HTP0 for that part.
 
 ## [0.2.0] - 2026-10-09
 

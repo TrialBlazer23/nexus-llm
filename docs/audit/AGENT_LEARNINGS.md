@@ -25,6 +25,20 @@ avoid repeating known mistakes.
 - Verification: How the result was confirmed, or what remains unverified.
 ```
 
+## 2026-10-12 — SM8735 measured as Hexagon v73
+- Category: research
+- Context: Nothing Phone 3 follow-up was blocked until an operator log named the HTP generation. Termux, Nexus `c21e301`, same v0.28.0 arm64 Hexagon `bmoe-cli` as the SM8550 run. `getprop ro.soc.model` returned `SM8735`. `/sys/devices/soc0/machine` was unreadable. Vulkan was present. The part was absent from the LiteRT CSV.
+- Finding: `auto` doctored `auto (off)`, omitted `--prefill-device`, and logged `prefill_dev_tokens=0`. The Hexagon CLI still printed `Hexagon Arch version v73` at startup without the flag. `on` passed `--prefill-device HTP0`, opened `libggml-htp-v73.so`, and logged `prefill_dev_tokens=549` on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M`. `off` omitted the flag and logged `prefill_dev_tokens=0`. `FASTRPC_GET_DOMAINS` failed with `0x6c` and static CDSP domains loaded, same as SM8550. 15190 MB of RAM did not change the `auto` result.
+- Action: Add `("SM8735", 73)` to `HTP_BY_PART` only. Keep unknown parts off. Do not key on the product string `A024`. v73 is not the published v81 speedup.
+- Verification: Operator logs `nexus-8417.log`, `nexus-17086.log`, and `nexus-28516.log` on 2026-10-12.
+
+## 2026-10-12 — SM8550 auto prefill ran on Hexagon v73
+- Category: research
+- Context: Galaxy S23 Ultra, Termux, Nexus `c21e301`, `npu_prefill = "auto"`. `/sys/devices/soc0/machine` is unreadable there. `getprop ro.soc.model` returned `SM8550`. Vulkan was detected. The Hexagon `bmoe-cli` and `libggml-htp-v*.so` came from the BigMoeOnEdge v0.28.0 arm64 release, copied into `~/.nexus/bin` with `ADSP_LIBRARY_PATH` set to that directory.
+- Finding: `nexus doctor` printed `npu prefill: auto (HTP0)`. `nexus host` on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (17,697 MB, streamable MoE) passed `--prefill-device HTP0`. stderr reported `Hexagon Arch version v73`. `FASTRPC_GET_DOMAINS` failed with `0x6c`, then static CDSP domains loaded. A 440-word prompt returned HTTP 200 and `prefill_dev_tokens=724`. Decode was `1.901` tok/s. The log also said `0 layer tensors, 0.0 MiB copied; graphs >= 32 tokens run there`, which matches streamed prefill rather than a resident copy. No CPU-off run, so this is not a speedup ratio. v73 is not the published v81 7.8–9.5× result.
+- Action: Treat `auto (HTP0)` plus arch `v73` plus `prefill_dev_tokens > 0` as the SM8550 acceptance. Install the v0.28.0 arm64 release on the phone. Do not require the Docker Hexagon build for that install. Do not add SM8735 from this log. Decode tok/s stays a CPU figure.
+- Verification: Operator log from the S23 Ultra on 2026-10-12. Nothing Phone 3 is still unmeasured.
+
 ## 2026-10-11 — Hexagon prefill qualifies by published part, not by skel files
 - Category: research
 - Context: Turning the NPU prefill note into `inference.moe.npu_prefill` for Android Vulkan phones. The cited 7.8–9.5× speedup was measured while the model still streamed from flash.

@@ -34,6 +34,20 @@ The 7.8–9.5× figures are prefill wall time on a 12 GB Hexagon v81 phone (Qwen
 
 4. Export `ADSP_LIBRARY_PATH` to that directory before `nexus` or `nexusd`. Nexus sets `GGML_HEXAGON_HOSTBUF=1` only for a spawn that resolved HTP0. Skel files for several generations ship together, so their presence does not identify the phone. The `Hexagon Arch version vNN` stderr line does.
 
+   **Direct Termux installation (no Docker host required):**
+   Upstream `BigMoeOnEdge` packages the Hexagon CLI and DSP skels inside `app-dev-release.apk` for each release (e.g. `v0.28.0`). On Android/Termux, operators can extract and install them directly:
+   ```bash
+   curl -sL "https://github.com/Helldez/BigMoeOnEdge/releases/download/v0.28.0/app-dev-release.apk" -o "$TMPDIR/app.apk"
+   unzip -q "$TMPDIR/app.apk" "lib/arm64-v8a/*" -d "$TMPDIR/bmoe-extract"
+   cp "$TMPDIR/bmoe-extract/lib/arm64-v8a/libbmoe-cli.so" ~/.nexus/bin/bmoe-cli
+   cp "$TMPDIR/bmoe-extract/lib/arm64-v8a/"*.so ~/.nexus/bin/
+   chmod +x ~/.nexus/bin/bmoe-cli
+   patchelf --set-rpath '$ORIGIN:/vendor/lib64' ~/.nexus/bin/bmoe-cli
+   for f in ~/.nexus/bin/*.so; do patchelf --set-rpath '$ORIGIN:/vendor/lib64' "$f" 2>/dev/null || true; done
+   rm -rf "$TMPDIR/app.apk" "$TMPDIR/bmoe-extract"
+   export ADSP_LIBRARY_PATH=~/.nexus/bin
+   ```
+
 5. Leave `npu_prefill` at `auto` on a published part. Set `on` only to verify an unpublished part. Set `off` on the Mac, the Windows laptop, and any node that should stay on CPU. A known quant outside Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4, Q4_K, Q5_K, and Q6_K omits the flag even when the switch is `on`. Q3_K and below are not an NPU expert path. An unknown label does not block. Output on the NPU is fp16 and is not bit-identical to CPU. The streamed expert path stays lossless in the sense upstream documents: the routed arena reads only routed experts, and `--no-prefill-routed` is not turned on.
 
 6. `nexus doctor` prints one of `npu prefill: off`, `npu prefill: on (HTP0)`, `npu prefill: auto (HTP0)`, or `npu prefill: auto (off)`. The line has no product name, quant, or part.
